@@ -6,16 +6,17 @@ import datetime
 from kiteconnect import KiteConnect
 from urllib.parse import urlparse, parse_qs
 import logging
+import threading
 
 # Page config
 st.set_page_config(
-    page_title="🚀 TradeFinder R-Factor Scanner (Strict Performance)",
+    page_title="⚡ Intraday R-Factor Scanner",
     page_icon="🎯",
     layout="wide"
 )
 
-st.title("🚀 TradeFinder R-Factor Scanner - Strict Performance Formula")
-st.markdown("> _Only Strong Trending Stocks Get High R-Factors | Auto-Refresh Every 5 Minutes_")
+st.title("⚡ Intraday R-Factor Scanner - Real-Time Stock Selection")
+st.markdown("> _Pre-select strong stocks, then trade intraday setups_")
 
 # =========================
 # SESSION STATE INIT
@@ -44,67 +45,12 @@ if 'nifty_hist_data' not in st.session_state:
     st.session_state.nifty_hist_data = []
 if 'auto_refresh' not in st.session_state:
     st.session_state.auto_refresh = False
-if 'last_scan_results' not in st.session_state:
-    st.session_state.last_scan_results = None
-if 'symbols_to_scan' not in st.session_state:
-    st.session_state.symbols_to_scan = "ADANIENT, KALYANKJIL, ADANIGREEN, IREDA, HDFCBANK, AXISBANK, UNIONBANK, SAIL, DLF, EXIDEIND, ADANIENSOL, RELIANCE, TCS, INFY"
-if 'last_refresh_time' not in st.session_state:
-    st.session_state.last_refresh_time = None
-
-# =========================
-# AUTO-REFRESH FUNCTIONS
-# =========================
-def get_next_5min_candle_time():
-    """Get the next 5-minute candle time aligned with market"""
-    now = datetime.datetime.now()
-    # Round down to nearest 5 minutes
-    minutes = now.minute
-    rounded_minutes = (minutes // 5) * 5
-    next_candle = now.replace(minute=rounded_minutes, second=0, microsecond=0)
-    next_candle += datetime.timedelta(minutes=5)
-    return next_candle
-
-def get_seconds_to_next_candle():
-    """Get seconds remaining to next 5-minute candle"""
-    now = datetime.datetime.now()
-    next_candle = get_next_5min_candle_time()
-    return (next_candle - now).total_seconds()
-
-def is_market_hours():
-    """Check if current time is within market hours"""
-    now = datetime.datetime.now()
-    market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
-    market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
-    
-    # Check if it's a weekday (Monday=0, Sunday=6)
-    if now.weekday() >= 5:  # Saturday or Sunday
-        return False
-    
-    return market_open <= now <= market_close
-
-def should_refresh():
-    """Check if we should refresh based on 5-minute candle alignment"""
-    if not st.session_state.auto_refresh:
-        return False
-    
-    if not is_market_hours():
-        return False
-    
-    now = datetime.datetime.now()
-    
-    # If never refreshed, refresh immediately
-    if st.session_state.last_refresh_time is None:
-        return True
-    
-    # Check if 5 minutes have passed since last refresh
-    time_since_refresh = (now - st.session_state.last_refresh_time).total_seconds()
-    
-    # Refresh if we're within 2 seconds of a 5-minute mark and haven't refreshed recently
-    seconds_to_next = get_seconds_to_next_candle()
-    if seconds_to_next > 298 and time_since_refresh > 290:  # Within 2 seconds of 5-min mark
-        return True
-    
-    return False
+if 'refresh_interval' not in st.session_state:
+    st.session_state.refresh_interval = 5  # minutes
+if 'intraday_alerts' not in st.session_state:
+    st.session_state.intraday_alerts = []
+if 'focus_list' not in st.session_state:
+    st.session_state.focus_list = []
 
 # =========================
 # HELPER FUNCTIONS
@@ -144,8 +90,120 @@ def calculate_rsi(prices, period=14):
     
     return rsi
 
+def get_current_time_category():
+    """Determine current market time category for intraday strategies"""
+    now = datetime.datetime.now().time()
+    
+    if datetime.time(9, 15) <= now < datetime.time(10, 0):
+        return "OPENING_HOUR"
+    elif datetime.time(10, 0) <= now < datetime.time(11, 30):
+        return "TRENDING_HOUR"
+    elif datetime.time(11, 30) <= now < datetime.time(14, 0):
+        return "LUNCH_LULL"
+    elif datetime.time(14, 0) <= now < datetime.time(15, 0):
+        return "POWER_HOUR"
+    elif datetime.time(15, 0) <= now <= datetime.time(15, 15):
+        return "CLOSING_HOUR"
+    else:
+        return "PRE_MARKET"
+
 # =========================
-# STRICT 20-DAY RELATIVE STRENGTH
+# INTRADAY STRENGTH CALCULATION
+# =========================
+def calculate_intraday_strength(kite, symbol, instrument_token):
+    """Calculate intraday-specific strength factors"""
+    try:
+        quote = get_quote_data(kite, symbol, instrument_token)
+        if not quote:
+            return 0, {}
+        
+        ltp = float(quote.get('last_price', 0))
+        ohlc = quote.get('ohlc', {})
+        open_price = float(ohlc.get('open', 0))
+        high = float(ohlc.get('high', 0))
+        low = float(ohlc.get('low', 0))
+        prev_close = float(ohlc.get('close', 0))
+        volume = float(quote.get('volume', 0))
+        
+        # Get historical data for VWAP calculation
+        try:
+            end_date = datetime.datetime.now()
+            start_date = end_date - datetime.timedelta(days=5)
+            hist_data = kite.historical_data(instrument_token, start_date, end_date, "15minute")
+            
+            # Calculate VWAP for today
+            today_data = [d for d in hist_data if d['date'].date() == datetime.date.today()]
+            if today_data:
+                vwap = sum([(d['high'] + d['low'] + d['close']) / 3 * d['volume'] for d in today_data]) / sum([d['volume'] for d in today_data])
+            else:
+                vwap = ltp
+        except:
+            vwap = ltp
+        
+        # 1. Gap Strength
+        gap_percent = ((open_price - prev_close) / prev_close) * 100 if prev_close > 0 else 0
+        
+        # 2. Intraday Performance
+        intraday_change = ((ltp - open_price) / open_price) * 100 if open_price > 0 else 0
+        
+        # 3. Range Analysis
+        if high > low:
+            range_position = ((ltp - low) / (high - low)) * 100  # Where price is in day's range
+        else:
+            range_position = 50
+            
+        # 4. VWAP Position
+        vwap_position = "ABOVE" if ltp > vwap else "BELOW"
+        vwap_distance = ((ltp - vwap) / vwap) * 100 if vwap > 0 else 0
+        
+        # 5. Volume Analysis
+        avg_volume_multiplier = volume / (volume / 6.5) if volume > 0 else 1  # Rough intraday volume estimation
+        
+        # 6. Momentum Score
+        momentum_score = 0
+        if gap_percent > 2 and intraday_change > 0:
+            momentum_score += 2  # Strong gap up continuation
+        elif gap_percent > 0.5 and intraday_change > gap_percent:
+            momentum_score += 1.5  # Gap up with acceleration
+        elif gap_percent < 0 and intraday_change > 1:
+            momentum_score += 1.5  # Recovery from gap down
+        elif intraday_change > 2:
+            momentum_score += 1  # Strong intraday move
+            
+        if vwap_position == "ABOVE" and vwap_distance > 0.5:
+            momentum_score += 0.5
+            
+        if range_position > 70:  # Trading near highs
+            momentum_score += 0.5
+        elif range_position < 30:  # Trading near lows
+            momentum_score -= 0.5
+        
+        # Intraday strength composite (0-5 scale)
+        intraday_strength = min(5.0, max(0, momentum_score))
+        
+        intraday_data = {
+            'gap_percent': round(gap_percent, 2),
+            'intraday_change': round(intraday_change, 2),
+            'range_position': round(range_position, 1),
+            'vwap_position': vwap_position,
+            'vwap_distance': round(vwap_distance, 2),
+            'volume_multiplier': round(avg_volume_multiplier, 1),
+            'momentum_score': round(momentum_score, 2),
+            'intraday_strength': round(intraday_strength, 2),
+            'current_price': ltp,
+            'open_price': open_price,
+            'high': high,
+            'low': low,
+            'vwap': round(vwap, 2)
+        }
+        
+        return intraday_strength, intraday_data
+        
+    except Exception as e:
+        return 0, {}
+
+# =========================
+# BASE R-FACTOR CALCULATION (Kept from original)
 # =========================
 def calculate_20day_relative_strength(kite, symbols):
     """Calculate 20-day relative strength with strict criteria"""
@@ -179,12 +237,10 @@ def calculate_20day_relative_strength(kite, symbols):
             hist_data = kite.historical_data(token, start_date, end_date, "day")
             
             if len(hist_data) >= 20:
-                # Calculate various performance metrics
                 stock_20d_return = ((hist_data[-1]['close'] - hist_data[-20]['close']) / hist_data[-20]['close']) * 100
                 stock_10d_return = ((hist_data[-1]['close'] - hist_data[-10]['close']) / hist_data[-10]['close']) * 100
                 stock_5d_return = ((hist_data[-1]['close'] - hist_data[-5]['close']) / hist_data[-5]['close']) * 100
                 
-                # Relative strength
                 if nifty_20d_return != 0:
                     relative_strength = stock_20d_return / nifty_20d_return
                 else:
@@ -217,9 +273,8 @@ def calculate_20day_relative_strength(kite, symbols):
     
     return relative_strengths
 
-def assign_strict_tiers(relative_strengths):
-    """Assign tiers with STRICT performance criteria"""
-    # Sort by 20-day return (actual performance)
+def assign_intraday_tiers(relative_strengths):
+    """Assign tiers optimized for intraday trading"""
     sorted_symbols = sorted(relative_strengths.items(), 
                           key=lambda x: x[1]['stock_20d_return'], 
                           reverse=True)
@@ -231,29 +286,28 @@ def assign_strict_tiers(relative_strengths):
         stock_10d = data['stock_10d_return']
         stock_5d = data['stock_5d_return']
         
-        # STRICT tier assignment based on actual returns
-        if stock_20d > 25 and stock_10d > 12 and stock_5d > 5:
-            tier = "TIER_1"
-            base_score = 2.0  # Reduced from 2.5
-        elif stock_20d > 15 and stock_10d > 7 and stock_5d > 2:
-            tier = "TIER_2"
-            base_score = 1.7  # Reduced from 2.2
+        # Intraday-focused tier assignment
+        if stock_20d > 20 and stock_10d > 10 and stock_5d > 0:
+            tier = "INTRADAY_TIER_1"  # Best for intraday
+            base_score = 2.5
+        elif stock_20d > 15 and stock_10d > 7 and stock_5d > -2:
+            tier = "INTRADAY_TIER_2"  # Good for intraday
+            base_score = 2.2
         elif stock_20d > 10 and stock_10d > 5:
-            tier = "TIER_3"
-            base_score = 1.4  # Reduced from 2.0
+            tier = "INTRADAY_TIER_3"  # Acceptable for intraday
+            base_score = 1.8
         elif stock_20d > 5:
-            tier = "TIER_4"
-            base_score = 1.2  # Reduced from 1.8
-        elif stock_20d > 0:
-            tier = "TIER_5"
-            base_score = 1.0  # Reduced from 1.6
+            tier = "INTRADAY_TIER_4"  # Watch list only
+            base_score = 1.5
         else:
-            tier = "TIER_6"
-            base_score = 0.8  # Reduced from 1.4
+            tier = "AVOID_INTRADAY"  # Avoid for intraday
+            base_score = 1.0
         
-        # Additional penalty for sideways stocks
-        if abs(stock_20d) < 3:  # Sideways/flat movement
-            base_score *= 0.7  # 30% penalty
+        # Boost for recent momentum (important for intraday)
+        if stock_5d > 3:
+            base_score *= 1.2
+        elif stock_5d < -3:
+            base_score *= 0.8
         
         tier_assignments[symbol] = {
             'tier': tier,
@@ -268,173 +322,12 @@ def assign_strict_tiers(relative_strengths):
     return tier_assignments
 
 # =========================
-# STRICT VOLUME WEIGHT
+# INTRADAY R-FACTOR CALCULATION
 # =========================
-def calculate_strict_volume_weight(kite, symbol, instrument_token, hist_data):
-    """Strict volume weight - only reward significant volume with price movement"""
-    try:
-        quote = get_quote_data(kite, symbol, instrument_token)
-        current_volume = 0
-        
-        if quote:
-            current_volume = float(quote.get('volume', 0))
-            change_percent = float(quote.get('change_percent', 0))
-        else:
-            change_percent = 0
-        
-        if current_volume == 0 and hist_data:
-            current_volume = float(hist_data[-1].get('volume', 0))
-        
-        if len(hist_data) >= 20:
-            volumes = [float(d.get('volume', 0)) for d in hist_data[-21:-1]]
-            avg_volume_20d = np.mean(volumes) if volumes else 1
-        else:
-            avg_volume_20d = current_volume if current_volume > 0 else 1
-        
-        if avg_volume_20d == 0:
-            avg_volume_20d = 1
-            
-        volume_ratio = current_volume / avg_volume_20d if current_volume > 0 else 1.0
-        
-        # STRICT: Only reward volume if accompanied by price movement
-        if abs(change_percent) < 1:  # Flat day
-            volume_weight = 1.0  # No bonus for volume on flat days
-        elif volume_ratio > 2.0 and abs(change_percent) > 2:
-            volume_weight = 1.2  # Only 20% bonus for high volume with movement
-        elif volume_ratio > 1.5 and abs(change_percent) > 1:
-            volume_weight = 1.1
-        elif volume_ratio < 0.5:
-            volume_weight = 0.9  # Penalty for low volume
-        else:
-            volume_weight = 1.0
-        
-        return volume_weight, volume_ratio
-        
-    except Exception as e:
-        return 1.0, 1.0
-
-# =========================
-# STRICT MOMENTUM FACTOR
-# =========================
-def calculate_strict_momentum_factor(kite, symbol, instrument_token, hist_data):
-    """Strict momentum - only reward consistent upward movement"""
-    try:
-        if len(hist_data) < 15:
-            return 0.8, {}  # Penalty for insufficient data
-        
-        quote = get_quote_data(kite, symbol, instrument_token)
-        
-        current_price = float(hist_data[-1]['close'])
-        open_price = float(hist_data[-1]['open'])
-        
-        if quote:
-            current_price = float(quote.get('last_price', current_price))
-            ohlc = quote.get('ohlc', {})
-            if ohlc:
-                open_price = float(ohlc.get('open', open_price))
-        
-        # 1. Intraday momentum - STRICT
-        if open_price > 0:
-            intraday_change = ((current_price - open_price) / open_price) * 100
-        else:
-            intraday_change = 0
-        
-        # Only reward significant positive movement
-        if intraday_change > 3:
-            intraday_momentum = 1.1
-        elif intraday_change > 1.5:
-            intraday_momentum = 1.05
-        elif intraday_change > 0:
-            intraday_momentum = 1.0
-        elif intraday_change > -1:
-            intraday_momentum = 0.95
-        else:
-            intraday_momentum = 0.9
-        
-        # 2. Consistency check - count positive days
-        positive_days = 0
-        for i in range(1, min(10, len(hist_data))):
-            if hist_data[-i]['close'] > hist_data[-i-1]['close']:
-                positive_days += 1
-        
-        consistency_factor = 1.0
-        if positive_days >= 7:
-            consistency_factor = 1.1  # Consistent uptrend
-        elif positive_days >= 5:
-            consistency_factor = 1.0
-        elif positive_days <= 3:
-            consistency_factor = 0.9  # Too many down days
-        
-        # 3. Trend strength
-        if len(hist_data) >= 20:
-            # Check if making higher highs
-            recent_highs = [d['high'] for d in hist_data[-10:]]
-            older_highs = [d['high'] for d in hist_data[-20:-10]]
-            
-            if max(recent_highs) > max(older_highs) * 1.05:
-                trend_factor = 1.1
-            elif max(recent_highs) > max(older_highs):
-                trend_factor = 1.0
-            else:
-                trend_factor = 0.9  # Not making new highs
-        else:
-            trend_factor = 1.0
-        
-        # Combine factors
-        composite_momentum = intraday_momentum * consistency_factor * trend_factor
-        
-        # STRICT bounds
-        composite_momentum = max(0.7, min(1.3, composite_momentum))
-        
-        momentum_breakdown = {
-            "intraday": round(intraday_momentum, 3),
-            "consistency": round(consistency_factor, 3),
-            "trend": round(trend_factor, 3),
-            "intraday_change": round(intraday_change, 2),
-            "positive_days": positive_days
-        }
-        
-        return composite_momentum, momentum_breakdown
-        
-    except Exception as e:
-        return 0.8, {}
-
-# =========================
-# STRICT MARKET REGIME
-# =========================
-def detect_strict_market_regime(kite, relative_strengths):
-    """Strict market regime with minimal multipliers"""
-    try:
-        nifty_20d = st.session_state.nifty_20d_return
-        
-        positive_stocks = sum(1 for s, d in relative_strengths.items() if d['stock_20d_return'] > 5)  # Only count significant gainers
-        breadth = (positive_stocks / len(relative_strengths)) * 100 if relative_strengths else 50
-        
-        # Very conservative multipliers
-        if nifty_20d > 10 and breadth > 70:
-            regime = "STRONG_BULL"
-            multiplier = 1.2  # Max 20% boost
-        elif nifty_20d > 5 and breadth > 50:
-            regime = "MODERATE_BULL"
-            multiplier = 1.1  # 10% boost
-        elif nifty_20d > -2:
-            regime = "NEUTRAL"
-            multiplier = 1.0  # No boost
-        else:
-            regime = "WEAK_BEAR"
-            multiplier = 0.9  # 10% penalty
-        
-        return regime, multiplier, breadth
-        
-    except Exception as e:
-        return "NEUTRAL", 1.0, 50
-
-# =========================
-# STRICT R-FACTOR CALCULATION
-# =========================
-def calculate_strict_rfactor(symbol, kite, instrument_token, tier_data, regime_multiplier, all_stocks_data):
+def calculate_intraday_rfactor(symbol, kite, instrument_token, tier_data, regime_multiplier, all_stocks_data):
     """
-    Strict R-Factor - only trending stocks get high scores
+    Enhanced R-Factor for intraday trading
+    Combines base R-Factor with real-time intraday strength
     """
     try:
         quote = get_quote_data(kite, symbol, instrument_token)
@@ -443,136 +336,157 @@ def calculate_strict_rfactor(symbol, kite, instrument_token, tier_data, regime_m
         if not quote and not hist_data:
             return 0, {}
         
+        # Base R-Factor from swing analysis
+        base_rfactor = tier_data['base_score'] * regime_multiplier
+        
+        # Get intraday strength
+        intraday_strength, intraday_data = calculate_intraday_strength(kite, symbol, instrument_token)
+        
+        # Time-based adjustments
+        time_category = get_current_time_category()
+        time_multiplier = {
+            "PRE_MARKET": 0.8,
+            "OPENING_HOUR": 1.2,  # High volatility, good for trading
+            "TRENDING_HOUR": 1.3,  # Best time for intraday
+            "LUNCH_LULL": 0.7,  # Avoid trading
+            "POWER_HOUR": 1.1,
+            "CLOSING_HOUR": 0.6  # Risk management
+        }.get(time_category, 1.0)
+        
+        # Combine base R-Factor with intraday strength
+        # 60% base strength, 40% intraday performance
+        combined_rfactor = (base_rfactor * 0.6) + (intraday_strength * 0.8)
+        
+        # Apply time multiplier
+        final_rfactor = combined_rfactor * time_multiplier
+        
+        # Intraday-specific caps
+        stock_20d = tier_data['stock_20d_return']
+        if stock_20d < 5:
+            max_rfactor = 2.5  # Conservative cap for weak trends
+        elif stock_20d < 15:
+            max_rfactor = 4.0
+        else:
+            max_rfactor = 6.0  # Strong trends can reach higher
+        
+        # Minimum based on tier
+        if tier_data['tier'] == "AVOID_INTRADAY":
+            min_rfactor = 0.5
+        else:
+            min_rfactor = 1.0
+        
+        final_rfactor = max(min_rfactor, min(max_rfactor, final_rfactor))
+        final_rfactor = round(final_rfactor, 2)
+        
+        # Get basic quote data
         ltp = float(quote.get('last_price', 0)) if quote else hist_data[-1]['close']
         volume = float(quote.get('volume', 0)) if quote else hist_data[-1]['volume']
-        
         change_percent = 0
+        
         if quote and 'ohlc' in quote:
             ohlc = quote['ohlc']
             prev_close = float(ohlc.get('close', 0))
             if prev_close > 0:
                 change_percent = ((ltp - prev_close) / prev_close) * 100
         
-        # Get performance metrics
-        stock_20d = tier_data['stock_20d_return']
-        stock_10d = tier_data['stock_10d_return']
-        stock_5d = tier_data['stock_5d_return']
-        
-        # 1. Base RS Score (already reduced in tier assignment)
-        rs_score = tier_data['base_score']
-        
-        # 2. Performance multiplier (STRICT)
-        performance_multiplier = 1.0
-        
-        # Only boost for strong performers
-        if stock_20d > 30 and stock_10d > 15 and stock_5d > 7:
-            performance_multiplier = 1.5
-        elif stock_20d > 20 and stock_10d > 10 and stock_5d > 5:
-            performance_multiplier = 1.3
-        elif stock_20d > 15 and stock_10d > 7:
-            performance_multiplier = 1.2
-        elif stock_20d > 10 and stock_10d > 5:
-            performance_multiplier = 1.1
-        elif stock_20d > 5:
-            performance_multiplier = 1.0
-        elif stock_20d > 0:
-            performance_multiplier = 0.9
-        else:
-            performance_multiplier = 0.7  # Penalty for negative returns
-        
-        # 3. Market Regime (minimal impact)
-        market_regime = regime_multiplier
-        
-        # 4. Volume Weight (strict)
-        volume_weight, volume_ratio = calculate_strict_volume_weight(
-            kite, symbol, instrument_token, hist_data
-        )
-        
-        # 5. Momentum Factor (strict)
-        momentum_factor, momentum_breakdown = calculate_strict_momentum_factor(
-            kite, symbol, instrument_token, hist_data
-        )
-        
-        # 6. Sideways penalty
-        sideways_penalty = 1.0
-        if abs(stock_20d) < 5 and abs(stock_10d) < 3:  # Sideways movement
-            sideways_penalty = 0.6  # 40% penalty
-        elif abs(stock_20d) < 10 and abs(stock_10d) < 5:
-            sideways_penalty = 0.8  # 20% penalty
-        
-        # 7. Base R-Factor Calculation (multiplicative)
-        base_rfactor = (
-            rs_score * 
-            performance_multiplier *
-            market_regime * 
-            volume_weight * 
-            momentum_factor * 
-            sideways_penalty
-        )
-        
-        # 8. No technical adjustments for sideways stocks
-        technical_adjustment = 0
-        
-        # Only add bonus for clear breakouts with volume
-        if stock_5d > 7 and volume_ratio > 1.5 and change_percent > 2:
-            technical_adjustment = 0.3  # Breakout bonus
-        elif stock_5d < -7 and volume_ratio > 1.5:
-            technical_adjustment = -0.3  # Breakdown penalty
-        
-        # Final R-Factor
-        enhanced_rfactor = base_rfactor + technical_adjustment
-        
-        # STRICT caps based on performance
-        if stock_20d < 5:
-            max_rfactor = 2.0  # Low performers capped at 2.0
-        elif stock_20d < 10:
-            max_rfactor = 3.0
-        elif stock_20d < 20:
-            max_rfactor = 4.0
-        elif stock_20d < 30:
-            max_rfactor = 5.0
-        else:
-            max_rfactor = 6.0  # Only exceptional performers can reach 6.0
-        
-        # Minimum based on performance
-        if stock_20d < 0:
-            min_rfactor = 0.5
-        else:
-            min_rfactor = 1.0
-        
-        enhanced_rfactor = max(min_rfactor, min(max_rfactor, enhanced_rfactor))
-        enhanced_rfactor = round(enhanced_rfactor, 2)
-        
         components = {
             'ltp': ltp,
             'change_percent': round(change_percent, 2),
             'volume': volume,
-            'volume_ratio': volume_ratio,
             'tier': tier_data['tier'],
-            'rs_score': rs_score,
-            'performance_multiplier': performance_multiplier,
-            'sideways_penalty': sideways_penalty,
-            'relative_strength': tier_data['relative_strength'],
-            'stock_20d_return': stock_20d,
-            'stock_10d_return': stock_10d,
-            'stock_5d_return': stock_5d,
+            'base_rfactor': round(base_rfactor, 2),
+            'intraday_strength': intraday_strength,
+            'time_category': time_category,
+            'time_multiplier': time_multiplier,
+            'combined_rfactor': round(combined_rfactor, 2),
+            'stock_20d_return': tier_data['stock_20d_return'],
+            'stock_10d_return': tier_data['stock_10d_return'],
+            'stock_5d_return': tier_data['stock_5d_return'],
             'rank': tier_data['rank'],
-            'market_regime': market_regime,
-            'volume_weight': volume_weight,
-            'momentum_factor': momentum_factor,
-            'momentum_breakdown': momentum_breakdown,
-            'base_rfactor': base_rfactor,
-            'max_allowed': max_rfactor
+            'intraday_data': intraday_data
         }
         
-        return enhanced_rfactor, components
+        return final_rfactor, components
         
     except Exception as e:
-        st.error(f"Error calculating R-Factor for {symbol}: {str(e)}")
+        st.error(f"Error calculating Intraday R-Factor for {symbol}: {str(e)}")
         return 0, {}
 
 # =========================
-# AUTHENTICATION
+# INTRADAY ALERTS SYSTEM
+# =========================
+def generate_intraday_alerts(results_df):
+    """Generate real-time trading alerts for intraday"""
+    alerts = []
+    time_category = get_current_time_category()
+    
+    if time_category in ["LUNCH_LULL", "CLOSING_HOUR"]:
+        return ["⚠️ Low activity period - Avoid new positions"]
+    
+    for _, row in results_df.iterrows():
+        if row['R-Factor'] < 3.0:  # Skip weak stocks
+            continue
+            
+        components = row.get('_components', {})
+        intraday_data = components.get('intraday_data', {})
+        
+        symbol = row['Symbol']
+        gap = intraday_data.get('gap_percent', 0)
+        intraday_change = intraday_data.get('intraday_change', 0)
+        range_pos = intraday_data.get('range_position', 50)
+        vwap_pos = intraday_data.get('vwap_position', 'NEUTRAL')
+        
+        # Gap-up continuation setup
+        if (gap > 1.5 and intraday_change > 0 and 
+            range_pos > 60 and vwap_pos == "ABOVE"):
+            alerts.append(f"🚀 GAP-UP: {symbol} | R-Factor: {row['R-Factor']} | Gap: {gap:+.1f}% | Price: ₹{components.get('ltp', 0):.1f}")
+        
+        # Pullback entry setup
+        elif (row['R-Factor'] > 4.0 and intraday_change < 0 and 
+              intraday_change > -2 and row['20D%'] > 10):
+            alerts.append(f"📈 PULLBACK: {symbol} | R-Factor: {row['R-Factor']} | Dip: {intraday_change:.1f}% | Strong 20D: {row['20D%']:+.1f}%")
+        
+        # Breakout setup
+        elif (intraday_change > 2.5 and range_pos > 80 and 
+              vwap_pos == "ABOVE"):
+            alerts.append(f"💥 BREAKOUT: {symbol} | R-Factor: {row['R-Factor']} | Move: {intraday_change:+.1f}% | Near highs")
+        
+        # Volume spike
+        elif intraday_data.get('volume_multiplier', 1) > 2 and intraday_change > 1:
+            alerts.append(f"📊 VOLUME: {symbol} | R-Factor: {row['R-Factor']} | Vol: {intraday_data.get('volume_multiplier', 1):.1f}x | Move: {intraday_change:+.1f}%")
+    
+    return alerts[:10]  # Limit to top 10 alerts
+
+def detect_market_regime(kite, relative_strengths):
+    """Detect market regime for intraday adjustments"""
+    try:
+        nifty_20d = st.session_state.nifty_20d_return
+        
+        # Count strong performers
+        strong_performers = sum(1 for s, d in relative_strengths.items() if d['stock_20d_return'] > 10)
+        breadth = (strong_performers / len(relative_strengths)) * 100 if relative_strengths else 50
+        
+        # Intraday-focused regime detection
+        if nifty_20d > 8 and breadth > 60:
+            regime = "INTRADAY_BULL"
+            multiplier = 1.3  # More aggressive for intraday
+        elif nifty_20d > 3 and breadth > 40:
+            regime = "INTRADAY_MODERATE"
+            multiplier = 1.1
+        elif nifty_20d > -3:
+            regime = "INTRADAY_NEUTRAL"
+            multiplier = 1.0
+        else:
+            regime = "INTRADAY_WEAK"
+            multiplier = 0.8  # More conservative
+        
+        return regime, multiplier, breadth
+        
+    except Exception as e:
+        return "INTRADAY_NEUTRAL", 1.0, 50
+
+# =========================
+# AUTHENTICATION (Kept same)
 # =========================
 def authenticate_kite(api_key, api_secret, request_token):
     """Authenticate with Kite and return kite object"""
@@ -596,115 +510,6 @@ def load_instruments(kite):
     except Exception as e:
         st.error(f"Failed to load instruments: {str(e)}")
         return {}
-
-# =========================
-# SCANNING FUNCTION
-# =========================
-def perform_scan(symbols_input, show_progress=True):
-    """Perform the actual scanning"""
-    symbols = [s.strip().upper() for s in symbols_input.split(",") if s.strip()]
-    
-    valid_symbols = []
-    invalid_symbols = []
-    
-    for symbol in symbols:
-        if symbol in st.session_state.instruments:
-            valid_symbols.append(symbol)
-        else:
-            invalid_symbols.append(symbol)
-    
-    if invalid_symbols and show_progress:
-        st.warning(f"Invalid symbols removed: {', '.join(invalid_symbols)}")
-    
-    if not valid_symbols:
-        if show_progress:
-            st.error("No valid symbols to scan")
-        return None
-    
-    # Calculate relative strengths
-    if show_progress:
-        with st.spinner("Calculating strict performance rankings..."):
-            relative_strengths = calculate_20day_relative_strength(st.session_state.kite, valid_symbols)
-            tier_assignments = assign_strict_tiers(relative_strengths)
-            
-            regime, multiplier, breadth = detect_strict_market_regime(
-                st.session_state.kite, 
-                relative_strengths
-            )
-            st.session_state.market_regime = regime
-            st.session_state.regime_multiplier = multiplier
-    else:
-        relative_strengths = calculate_20day_relative_strength(st.session_state.kite, valid_symbols)
-        tier_assignments = assign_strict_tiers(relative_strengths)
-        
-        regime, multiplier, breadth = detect_strict_market_regime(
-            st.session_state.kite, 
-            relative_strengths
-        )
-        st.session_state.market_regime = regime
-        st.session_state.regime_multiplier = multiplier
-    
-    # Calculate R-Factors
-    results = []
-    
-    if show_progress:
-        progress = st.progress(0)
-        status = st.empty()
-    
-    for idx, symbol in enumerate(valid_symbols):
-        if show_progress:
-            status.text(f"Calculating Strict R-Factor for {symbol}... ({idx+1}/{len(valid_symbols)})")
-        
-        if symbol in tier_assignments:
-            instrument_token = st.session_state.instruments[symbol]
-            tier_data = tier_assignments[symbol]
-            
-            enhanced_rfactor, components = calculate_strict_rfactor(
-                symbol,
-                st.session_state.kite,
-                instrument_token,
-                tier_data,
-                multiplier,
-                relative_strengths
-            )
-            
-            if enhanced_rfactor > 0:
-                results.append({
-                    'Symbol': symbol,
-                    'R-Factor': enhanced_rfactor,
-                    '20D%': round(tier_data['stock_20d_return'], 2),
-                    '10D%': round(tier_data['stock_10d_return'], 2),
-                    '5D%': round(tier_data['stock_5d_return'], 2),
-                    'Tier': tier_data['tier'],
-                    'Momentum': round(components.get('momentum_factor', 1.0), 2),
-                    'Volume': round(components.get('volume_weight', 1.0), 2),
-                    'LTP': components.get('ltp', 0),
-                    'Change%': components.get('change_percent', 0),
-                    'Vol Ratio': round(components.get('volume_ratio', 1.0), 1),
-                    'Max Cap': components.get('max_allowed', 0),
-                    '_components': components
-                })
-        
-        if show_progress:
-            progress.progress((idx + 1) / len(valid_symbols))
-        time.sleep(0.05)
-    
-    if show_progress:
-        progress.empty()
-        status.empty()
-    
-    # Update last refresh time
-    st.session_state.last_refresh_time = datetime.datetime.now()
-    st.session_state.last_update = datetime.datetime.now()
-    
-    return {
-        'results': results,
-        'regime': regime,
-        'multiplier': multiplier,
-        'breadth': breadth,
-        'valid_symbols': valid_symbols,
-        'invalid_symbols': invalid_symbols
-    }
 
 # =========================
 # SIDEBAR
@@ -773,17 +578,43 @@ with st.sidebar:
         st.success("✅ Connected to Zerodha")
         
         st.markdown("---")
+        st.markdown("### ⚡ Intraday Settings")
+        
+        # Time category display
+        time_cat = get_current_time_category()
+        time_emoji = {
+            "PRE_MARKET": "🌅",
+            "OPENING_HOUR": "🚀",
+            "TRENDING_HOUR": "📈",
+            "LUNCH_LULL": "😴",
+            "POWER_HOUR": "⚡",
+            "CLOSING_HOUR": "🔔"
+        }
+        
+        st.metric("Market Session", f"{time_emoji.get(time_cat, '⏰')} {time_cat.replace('_', ' ')}")
+        
+        # Auto-refresh settings
+        st.markdown("#### Auto-Refresh")
+        auto_refresh = st.checkbox("Enable Auto-Refresh", value=st.session_state.auto_refresh)
+        if auto_refresh:
+            refresh_interval = st.selectbox("Refresh Interval", [2, 5, 10, 15], index=1)
+            st.session_state.refresh_interval = refresh_interval
+            st.session_state.auto_refresh = True
+        else:
+            st.session_state.auto_refresh = False
+        
+        st.markdown("---")
         st.markdown("### 📊 Market Regime")
         
         regime_emoji = {
-            "STRONG_BULL": "🚀",
-            "MODERATE_BULL": "📈",
-            "NEUTRAL": "➡️",
-            "WEAK_BEAR": "📉"
+            "INTRADAY_BULL": "🚀",
+            "INTRADAY_MODERATE": "📈",
+            "INTRADAY_NEUTRAL": "➡️",
+            "INTRADAY_WEAK": "📉"
         }
         
         st.metric(
-            "Current Regime",
+            "Regime",
             f"{regime_emoji.get(st.session_state.market_regime, '⚪')} {st.session_state.market_regime.replace('_', ' ')}",
             f"Multiplier: {st.session_state.regime_multiplier:.2f}x"
         )
@@ -791,61 +622,35 @@ with st.sidebar:
         if st.session_state.nifty_20d_return:
             st.metric("NIFTY 20-Day", f"{st.session_state.nifty_20d_return:+.2f}%")
         
-        st.markdown("---")
-        st.markdown("### ⏰ Auto-Refresh Settings")
-        
-        # Auto-refresh toggle
-        auto_refresh = st.toggle("Enable Auto-Refresh", value=st.session_state.auto_refresh)
-        st.session_state.auto_refresh = auto_refresh
-        
-        if auto_refresh:
-            # Market hours check
-            if is_market_hours():
-                st.success("📈 Market is OPEN")
-                
-                # Next refresh countdown
-                seconds_to_next = get_seconds_to_next_candle()
-                minutes_to_next = int(seconds_to_next // 60)
-                seconds_remaining = int(seconds_to_next % 60)
-                
-                st.info(f"⏱️ Next refresh in: {minutes_to_next}:{seconds_remaining:02d}")
-                
-                # Show next candle time
-                next_candle = get_next_5min_candle_time()
-                st.caption(f"Next 5-min candle: {next_candle.strftime('%H:%M:%S')}")
-            else:
-                st.warning("💤 Market is CLOSED")
-                st.caption("Auto-refresh works only during market hours (9:15 AM - 3:30 PM)")
-        
-        if st.session_state.last_refresh_time:
-            st.caption(f"Last refresh: {st.session_state.last_refresh_time.strftime('%H:%M:%S')}")
-        
-        st.markdown("---")
-        
         if st.button("Logout"):
             st.session_state.authenticated = False
             st.session_state.kite = None
             st.session_state.instruments = {}
             st.session_state.auth_step = 1
-            st.session_state.auto_refresh = False
             st.rerun()
     
     st.markdown("---")
     st.markdown("""
-    ### STRICT Performance Formula
+    ### ⚡ Intraday Strategy
     
-    **Only trending stocks get high R-Factors!**
+    **Two-Stage Process:**
+    1. **Pre-select** strongest stocks (R-Factor 3.5+)
+    2. **Trade setups** on selected stocks only
     
-    #### Strict Criteria:
-    - **20D < 5%**: Max R-Factor = 2.0
-    - **20D < 10%**: Max R-Factor = 3.0
-    - **20D < 20%**: Max R-Factor = 4.0
-    - **20D > 30%**: Can reach 6.0
+    #### Best Time Slots:
+    - **🚀 Opening (9:15-10:00)**: Gap trades
+    - **📈 Trending (10:00-11:30)**: Breakouts
+    - **⚡ Power (14:00-15:00)**: Final moves
     
-    #### Auto-Refresh:
-    - **Aligned with 5-min candles**
-    - **Market hours only**
-    - **Updates every 5 minutes**
+    #### Avoid:
+    - **😴 Lunch (11:30-14:00)**: Low volume
+    - **🔔 Closing (15:00+)**: Exit only
+    
+    #### Entry Criteria:
+    - R-Factor > 3.5
+    - Volume > 1.5x avg
+    - Price above VWAP
+    - Clear setup pattern
     """)
 
 # =========================
@@ -854,154 +659,384 @@ with st.sidebar:
 if not st.session_state.authenticated:
     st.info("👈 Please authenticate with Zerodha to start scanning")
 else:
-    # Auto-refresh check
-    if should_refresh() and st.session_state.symbols_to_scan:
-        scan_data = perform_scan(st.session_state.symbols_to_scan, show_progress=False)
-        if scan_data:
-            st.session_state.last_scan_results = scan_data
-            st.rerun()
-    
-    # Top bar with refresh status
+    # Header controls
     col1, col2, col3, col4 = st.columns([3, 1, 1, 1])
     
     with col1:
         symbols_input = st.text_input(
             "Enter symbols to scan (comma-separated):",
-            value=st.session_state.symbols_to_scan,
+            value="ADANIENT, KALYANKJIL, ADANIGREEN, IREDA, HDFCBANK, AXISBANK, UNIONBANK, SAIL, DLF, EXIDEIND, ADANIENSOL, RELIANCE, TCS, INFY",
             help="Enter NSE symbols without .NS suffix"
         )
-        st.session_state.symbols_to_scan = symbols_input
     
     with col2:
         st.write("")
-        scan_btn = st.button("🔍 SCAN NOW", type="primary", use_container_width=True)
+        scan_btn = st.button("⚡ SCAN", type="primary", use_container_width=True)
     
     with col3:
         st.write("")
-        if st.button("🔄 Force Refresh", use_container_width=True):
-            scan_data = perform_scan(st.session_state.symbols_to_scan)
-            if scan_data:
-                st.session_state.last_scan_results = scan_data
+        if st.button("🔄 Refresh", use_container_width=True):
             st.rerun()
     
     with col4:
         st.write("")
-        # Show auto-refresh status
-        if st.session_state.auto_refresh:
-            if is_market_hours():
-                seconds_to_next = get_seconds_to_next_candle()
-                st.metric("Next Refresh", f"{int(seconds_to_next//60)}:{int(seconds_to_next%60):02d}", "AUTO ON ✅")
+        if st.button("📋 Focus List", use_container_width=True):
+            st.session_state.show_focus_list = not st.session_state.get('show_focus_list', False)
+    
+    # Auto-refresh logic
+    if st.session_state.auto_refresh and st.session_state.authenticated:
+        placeholder = st.empty()
+        with placeholder.container():
+            st.info(f"🔄 Auto-refresh enabled - Next scan in {st.session_state.refresh_interval} minutes")
+        
+        time.sleep(st.session_state.refresh_interval * 60)
+        st.rerun()
+    
+    # Current time and market session info
+    current_time = datetime.datetime.now()
+    time_category = get_current_time_category()
+    
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Current Time", current_time.strftime("%H:%M:%S"))
+    with col2:
+        st.metric("Market Session", time_category.replace('_', ' '))
+    with col3:
+        if st.session_state.last_update:
+            st.metric("Last Scan", st.session_state.last_update.strftime("%H:%M:%S"))
+    with col4:
+        if time_category in ["LUNCH_LULL", "CLOSING_HOUR"]:
+            st.warning("⚠️ Low Activity Period")
+        elif time_category in ["TRENDING_HOUR", "OPENING_HOUR"]:
+            st.success("✅ Active Trading Time")
+    
+    if scan_btn or (st.session_state.auto_refresh and time_category in ["OPENING_HOUR", "TRENDING_HOUR", "POWER_HOUR"]):
+        symbols = [s.strip().upper() for s in symbols_input.split(",") if s.strip()]
+        
+        valid_symbols = []
+        invalid_symbols = []
+        
+        for symbol in symbols:
+            if symbol in st.session_state.instruments:
+                valid_symbols.append(symbol)
             else:
-                st.metric("Auto-Refresh", "Market Closed", "PAUSED ⏸️")
+                invalid_symbols.append(symbol)
+        
+        if invalid_symbols:
+            st.warning(f"Invalid symbols removed: {', '.join(invalid_symbols)}")
+        
+        if not valid_symbols:
+            st.error("No valid symbols to scan")
         else:
-            st.metric("Auto-Refresh", "Disabled", "OFF ❌")
-    
-    # Perform scan if button clicked or display last results
-    if scan_btn:
-        scan_data = perform_scan(symbols_input)
-        if scan_data:
-            st.session_state.last_scan_results = scan_data
-    
-    # Display results
-    if st.session_state.last_scan_results:
-        scan_data = st.session_state.last_scan_results
-        results = scan_data['results']
-        
-        # Market overview
-        st.markdown("### 🌍 Market Overview")
-        overview_col1, overview_col2, overview_col3, overview_col4 = st.columns(4)
-        
-        with overview_col1:
-            st.metric("Market Regime", scan_data['regime'].replace("_", " "), f"×{scan_data['multiplier']:.2f}")
-        with overview_col2:
-            st.metric("NIFTY 20-Day", f"{st.session_state.nifty_20d_return:+.2f}%")
-        with overview_col3:
-            st.metric("Strong Stocks", f"{scan_data['breadth']:.1f}%", ">5% gainers")
-        with overview_col4:
-            if st.session_state.last_refresh_time:
-                st.metric("Last Update", st.session_state.last_refresh_time.strftime("%H:%M:%S"))
-            else:
-                st.metric("Scan Time", datetime.datetime.now().strftime("%H:%M:%S"))
-        
-        if results:
-            df = pd.DataFrame(results)
-            df = df.sort_values('R-Factor', ascending=False)
+            with st.spinner("🔍 Analyzing stocks for intraday opportunities..."):
+                # Calculate base relative strengths
+                relative_strengths = calculate_20day_relative_strength(st.session_state.kite, valid_symbols)
+                tier_assignments = assign_intraday_tiers(relative_strengths)
+                
+                # Detect market regime
+                regime, multiplier, breadth = detect_market_regime(
+                    st.session_state.kite, 
+                    relative_strengths
+                )
+                st.session_state.market_regime = regime
+                st.session_state.regime_multiplier = multiplier
+                st.session_state.last_update = current_time
             
-            # Display results
-            st.markdown("### 📊 Strict Performance R-Factor Results")
+            # Market overview
+            st.markdown("### 🌍 Market Overview")
+            overview_col1, overview_col2, overview_col3, overview_col4 = st.columns(4)
             
-            # Categories
-            col1, col2, col3, col4 = st.columns(4)
+            with overview_col1:
+                st.metric("Market Regime", regime.replace("_", " "), f"×{multiplier:.2f}")
+            with overview_col2:
+                st.metric("NIFTY 20-Day", f"{st.session_state.nifty_20d_return:+.2f}%")
+            with overview_col3:
+                st.metric("Strong Breadth", f"{breadth:.1f}%", ">10% gainers")
+            with overview_col4:
+                st.metric("Scan Time", current_time.strftime("%H:%M:%S"))
             
-            trending_up = len(df[df['20D%'] > 15])
-            moderate_up = len(df[(df['20D%'] > 5) & (df['20D%'] <= 15)])
-            sideways = len(df[(df['20D%'] > -5) & (df['20D%'] <= 5)])
-            trending_down = len(df[df['20D%'] < -5])
+            # Calculate Intraday R-Factors
+            results = []
+            progress = st.progress(0)
+            status = st.empty()
             
-            col1.metric("🚀 Trending Up", trending_up, ">15% in 20D")
-            col2.metric("📈 Moderate Up", moderate_up, "5-15% in 20D")
-            col3.metric("➡️ Sideways", sideways, "-5% to +5%")
-            col4.metric("📉 Down", trending_down, "<-5%")
+            for idx, symbol in enumerate(valid_symbols):
+                status.text(f"⚡ Calculating Intraday R-Factor for {symbol}... ({idx+1}/{len(valid_symbols)})")
+                
+                if symbol in tier_assignments:
+                    instrument_token = st.session_state.instruments[symbol]
+                    tier_data = tier_assignments[symbol]
+                    
+                    enhanced_rfactor, components = calculate_intraday_rfactor(
+                        symbol,
+                        st.session_state.kite,
+                        instrument_token,
+                        tier_data,
+                        multiplier,
+                        relative_strengths
+                    )
+                    
+                    if enhanced_rfactor > 0:
+                        intraday_data = components.get('intraday_data', {})
+                        results.append({
+                            'Symbol': symbol,
+                            'R-Factor': enhanced_rfactor,
+                            '20D%': round(tier_data['stock_20d_return'], 2),
+                            '10D%': round(tier_data['stock_10d_return'], 2),
+                            '5D%': round(tier_data['stock_5d_return'], 2),
+                            'Today%': round(intraday_data.get('intraday_change', 0), 2),
+                            'Gap%': round(intraday_data.get('gap_percent', 0), 2),
+                            'VWAP': intraday_data.get('vwap_position', 'N/A'),
+                            'Range%': round(intraday_data.get('range_position', 50), 1),
+                            'Vol': round(intraday_data.get('volume_multiplier', 1), 1),
+                            'Tier': tier_data['tier'].replace('INTRADAY_', ''),
+                            'LTP': components.get('ltp', 0),
+                            'Intraday_Strength': round(components.get('intraday_strength', 0), 2),
+                            'Time_Cat': components.get('time_category', 'N/A'),
+                            '_components': components
+                        })
+                
+                progress.progress((idx + 1) / len(valid_symbols))
+                time.sleep(0.05)
             
-            # Main table
-            st.markdown("### 📋 Detailed Results")
+            progress.empty()
+            status.empty()
             
-            display_df = df[['Symbol', 'R-Factor', '20D%', '10D%', '5D%', 'Change%', 
-                           'Momentum', 'Volume', 'Tier', 'LTP', 'Vol Ratio', 'Max Cap']].copy()
-            
-            def style_rfactor(val):
-                if val >= 5.0:
-                    return 'background-color: #0d5016; color: white; font-weight: bold'
-                elif val >= 4.0:
-                    return 'background-color: #1f7a1f; color: white; font-weight: bold'
-                elif val >= 3.0:
-                    return 'background-color: #28a745; color: white'
-                elif val >= 2.0:
-                    return 'background-color: #f0ad4e'
+            if results:
+                df = pd.DataFrame(results)
+                df = df.sort_values('R-Factor', ascending=False)
+                
+                # Generate intraday alerts
+                alerts = generate_intraday_alerts(df)
+                st.session_state.intraday_alerts = alerts
+                
+                # Create focus list (R-Factor > 3.5)
+                focus_df = df[df['R-Factor'] > 3.5].copy()
+                st.session_state.focus_list = focus_df['Symbol'].tolist()
+                
+                # Display alerts
+                if alerts:
+                    st.markdown("### 🚨 Real-Time Intraday Alerts")
+                    alert_container = st.container()
+                    with alert_container:
+                        for alert in alerts[:5]:  # Show top 5 alerts
+                            if "GAP-UP" in alert:
+                                st.success(alert)
+                            elif "BREAKOUT" in alert:
+                                st.info(alert)
+                            elif "PULLBACK" in alert:
+                                st.warning(alert)
+                            elif "VOLUME" in alert:
+                                st.info(alert)
+                            else:
+                                st.error(alert)
+                
+                # Focus List Section
+                if focus_df.empty:
+                    st.warning("⚠️ No stocks meet intraday criteria (R-Factor > 3.5)")
                 else:
-                    return 'background-color: #dc3545; color: white'
-            
-            def style_returns(val):
-                if val > 20:
-                    return 'color: #0d5016; font-weight: bold'
-                elif val > 10:
-                    return 'color: #1f7a1f; font-weight: bold'
-                elif val > 5:
-                    return 'color: #28a745'
-                elif val > 0:
-                    return 'color: green'
+                    st.markdown(f"### 🎯 Intraday Focus List ({len(focus_df)} stocks)")
+                    st.success(f"**Trade Only These Stocks Today:** {', '.join(focus_df['Symbol'].head(8).tolist())}")
+                    
+                    # Focus list metrics
+                    focus_col1, focus_col2, focus_col3, focus_col4 = st.columns(4)
+                    
+                    with focus_col1:
+                        avg_rfactor = focus_df['R-Factor'].mean()
+                        st.metric("Avg R-Factor", f"{avg_rfactor:.2f}")
+                    
+                    with focus_col2:
+                        gap_up_count = len(focus_df[focus_df['Gap%'] > 1])
+                        st.metric("Gap-Up Stocks", gap_up_count)
+                    
+                    with focus_col3:
+                        above_vwap = len(focus_df[focus_df['VWAP'] == 'ABOVE'])
+                        st.metric("Above VWAP", above_vwap)
+                    
+                    with focus_col4:
+                        strong_today = len(focus_df[focus_df['Today%'] > 1])
+                        st.metric("Strong Today", strong_today)
+                
+                # Main results table
+                st.markdown("### 📊 Complete Intraday Analysis")
+                
+                # Category breakdown
+                tier1_count = len(df[df['Tier'] == 'TIER_1'])
+                tier2_count = len(df[df['Tier'] == 'TIER_2'])
+                tier3_count = len(df[df['Tier'] == 'TIER_3'])
+                avoid_count = len(df[df['Tier'] == 'AVOID'])
+                
+                category_col1, category_col2, category_col3, category_col4 = st.columns(4)
+                category_col1.metric("🚀 Tier 1", tier1_count, "Best for intraday")
+                category_col2.metric("📈 Tier 2", tier2_count, "Good for intraday")
+                category_col3.metric("⚠️ Tier 3", tier3_count, "Watch only")
+                category_col4.metric("❌ Avoid", avoid_count, "Skip these")
+                
+                # Display table
+                display_df = df[['Symbol', 'R-Factor', '20D%', '5D%', 'Today%', 'Gap%', 
+                               'VWAP', 'Range%', 'Vol', 'Tier', 'LTP', 'Intraday_Strength']].copy()
+                
+                def style_intraday_rfactor(val):
+                    if val >= 5.0:
+                        return 'background-color: #0d5016; color: white; font-weight: bold'
+                    elif val >= 4.0:
+                        return 'background-color: #1f7a1f; color: white; font-weight: bold'
+                    elif val >= 3.5:
+                        return 'background-color: #28a745; color: white'
+                    elif val >= 2.5:
+                        return 'background-color: #f0ad4e'
+                    else:
+                        return 'background-color: #dc3545; color: white'
+                
+                def style_intraday_performance(val):
+                    if val > 3:
+                        return 'color: #0d5016; font-weight: bold'
+                    elif val > 1:
+                        return 'color: #1f7a1f; font-weight: bold'
+                    elif val > 0:
+                        return 'color: #28a745'
+                    elif val > -1:
+                        return 'color: orange'
+                    else:
+                        return 'color: #dc3545'
+                
+                def style_vwap(val):
+                    if val == 'ABOVE':
+                        return 'color: green; font-weight: bold'
+                    elif val == 'BELOW':
+                        return 'color: red'
+                    else:
+                        return 'color: gray'
+                
+                styled_df = display_df.style.applymap(
+                    style_intraday_rfactor, subset=['R-Factor']
+                ).applymap(
+                    style_intraday_performance, subset=['20D%', '5D%', 'Today%', 'Gap%']
+                ).applymap(
+                    style_vwap, subset=['VWAP']
+                ).format({
+                    'R-Factor': '{:.2f}',
+                    '20D%': '{:+.1f}%',
+                    '5D%': '{:+.1f}%',
+                    'Today%': '{:+.1f}%',
+                    'Gap%': '{:+.1f}%',
+                    'Range%': '{:.0f}%',
+                    'Vol': '{:.1f}x',
+                    'LTP': '₹{:.1f}',
+                    'Intraday_Strength': '{:.1f}'
+                })
+                
+                st.dataframe(styled_df, use_container_width=True, hide_index=True)
+                
+                # Detailed analysis for top stocks
+                if not focus_df.empty:
+                    st.markdown("### 📈 Top 3 Intraday Setups - Detailed Analysis")
+                    
+                    top_3 = focus_df.head(3)
+                    for idx, (_, row) in enumerate(top_3.iterrows()):
+                        components = row['_components']
+                        intraday_data = components.get('intraday_data', {})
+                        
+                        with st.expander(f"🎯 #{idx+1}: {row['Symbol']} - R-Factor: {row['R-Factor']}", expanded=(idx==0)):
+                            detail_col1, detail_col2, detail_col3 = st.columns(3)
+                            
+                            with detail_col1:
+                                st.markdown("**📊 Performance**")
+                                st.write(f"20-Day: {row['20D%']:+.1f}%")
+                                st.write(f"5-Day: {row['5D%']:+.1f}%")
+                                st.write(f"Today: {row['Today%']:+.1f}%")
+                                st.write(f"Gap: {row['Gap%']:+.1f}%")
+                            
+                            with detail_col2:
+                                st.markdown("**📈 Technical**")
+                                st.write(f"VWAP: {row['VWAP']}")
+                                st.write(f"Range Position: {row['Range%']:.0f}%")
+                                st.write(f"Volume: {row['Vol']:.1f}x avg")
+                                st.write(f"Current: ₹{row['LTP']:.1f}")
+                            
+                            with detail_col3:
+                                st.markdown("**⚡ Intraday Setup**")
+                                
+                                # Determine setup type
+                                if row['Gap%'] > 1.5 and row['Today%'] > 0:
+                                    setup_type = "🚀 Gap-Up Continuation"
+                                    strategy = "Enter on break of opening range high"
+                                elif row['Today%'] < 0 and row['20D%'] > 10:
+                                    setup_type = "📈 Pullback Entry"
+                                    strategy = "Enter on bounce with volume"
+                                elif row['Today%'] > 2 and row['Range%'] > 70:
+                                    setup_type = "💥 Breakout"
+                                    strategy = "Already breaking out - trail stops"
+                                else:
+                                    setup_type = "👀 Monitor"
+                                    strategy = "Wait for clear signal"
+                                
+                                st.write(f"**Setup:** {setup_type}")
+                                st.write(f"**Strategy:** {strategy}")
+                                st.write(f"**Stop Loss:** ₹{row['LTP'] * 0.98:.1f} (-2%)")
+                                st.write(f"**Target:** ₹{row['LTP'] * 1.04:.1f} (+4%)")
+                
+                # Trading guidelines based on time
+                st.markdown("### ⏰ Time-Based Trading Guidelines")
+                
+                if time_category == "OPENING_HOUR":
+                    st.info("🚀 **Opening Hour Strategy**: Focus on gap-up continuations. Wait for 9:30-9:35 range break. Use 1% stop loss.")
+                elif time_category == "TRENDING_HOUR":
+                    st.success("📈 **Best Trading Time**: Look for breakouts and pullbacks. Full position sizes allowed. Target 2-4% moves.")
+                elif time_category == "LUNCH_LULL":
+                    st.warning("😴 **Lunch Time**: Avoid new positions. Manage existing trades only. Low volume period.")
+                elif time_category == "POWER_HOUR":
+                    st.info("⚡ **Power Hour**: Final momentum moves. Quick scalps preferred. Start exiting by 2:45 PM.")
+                elif time_category == "CLOSING_HOUR":
+                    st.error("🔔 **Closing Time**: EXIT ALL POSITIONS. No new entries. Risk management only.")
                 else:
-                    return 'color: #dc3545'
-            
-            styled_df = display_df.style.applymap(
-                style_rfactor, subset=['R-Factor']
-            ).applymap(
-                style_returns, subset=['20D%', '10D%', '5D%', 'Change%']
-            ).format({
-                'R-Factor': '{:.2f}',
-                '20D%': '{:+.2f}%',
-                '10D%': '{:+.2f}%',
-                '5D%': '{:+.2f}%',
-                'Change%': '{:+.2f}%',
-                'Momentum': '{:.2f}x',
-                'Volume': '{:.2f}x',
-                'Vol Ratio': '{:.1f}x',
-                'LTP': '₹{:.2f}',
-                'Max Cap': '{:.1f}'
-            })
-            
-            st.dataframe(styled_df, use_container_width=True, hide_index=True)
-            
-            # Insights
-            st.markdown("### 🎯 Key Insights")
-            
-            if not df[df['20D%'] > 15].empty:
-                st.success(f"**Strong Performers:** {', '.join(df[df['20D%'] > 15]['Symbol'].head(5).tolist())}")
-            
-            if not df[(df['20D%'] > -5) & (df['20D%'] <= 5)].empty:
-                sideways_stocks = df[(df['20D%'] > -5) & (df['20D%'] <= 5)]
-                st.warning(f"**Sideways Stocks (Low R-Factor):** {', '.join(sideways_stocks['Symbol'].tolist())}")
-                st.caption(f"Average R-Factor for sideways stocks: {sideways_stocks['R-Factor'].mean():.2f} (capped)")
+                    st.info("🌅 **Pre-Market**: Plan your trades. Review focus list. Check overnight gaps.")
+                
+                # Summary insights
+                st.markdown("### 💡 Key Insights")
+                
+                insights = []
+                
+                if tier1_count > 0:
+                    tier1_stocks = df[df['Tier'] == 'TIER_1']['Symbol'].head(3).tolist()
+                    insights.append(f"🎯 **Top Tier Stocks**: {', '.join(tier1_stocks)} - Focus your trades here")
+                
+                gap_stocks = df[df['Gap%'] > 2]['Symbol'].head(3).tolist()
+                if gap_stocks:
+                    insights.append(f"🚀 **Strong Gaps**: {', '.join(gap_stocks)} - Watch for continuation")
+                
+                weak_stocks = df[df['Today%'] < -2]['Symbol'].tolist()
+                if weak_stocks:
+                    insights.append(f"⚠️ **Avoid Today**: {', '.join(weak_stocks[:3])} - Showing weakness")
+                
+                volume_leaders = df[df['Vol'] > 2]['Symbol'].head(3).tolist()
+                if volume_leaders:
+                    insights.append(f"📊 **Volume Leaders**: {', '.join(volume_leaders)} - Institutional activity")
+                
+                for insight in insights:
+                    st.success(insight)
+                
+                if not insights:
+                    st.warning("⚠️ Mixed market conditions. Be selective with trades.")
 
+# Auto-refresh implementation
+if st.session_state.auto_refresh and st.session_state.authenticated:
+    refresh_placeholder = st.empty()
+    
+    # Show countdown timer
+    for i in range(st.session_state.refresh_interval * 60, 0, -1):
+        mins, secs = divmod(i, 60)
+        refresh_placeholder.metric("⏰ Next Auto-Scan", f"{mins:02d}:{secs:02d}")
+        time.sleep(1)
+    
+    refresh_placeholder.empty()
+    st.rerun()
+
+# Footer
 st.markdown("---")
-st.caption("Strict Performance Scanner with Auto-Refresh: Aligned with 5-minute market candles for real-time updates during market hours.")
+st.markdown("""
+<div style='text-align: center; color: gray;'>
+<p>⚡ Intraday R-Factor Scanner - Trade Smart, Trade Strong Stocks Only</p>
+<p>📊 Focus List → Entry Setups → Risk Management → Profit Booking</p>
+</div>
+""", unsafe_allow_html=True)
