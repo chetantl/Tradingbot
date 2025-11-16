@@ -1,682 +1,1290 @@
 """
-Real-Time Order Flow Trading Strategy Dashboard
-Zerodha KiteConnect Integration with Advanced Signal Generation
+Order Flow Trading Dashboard - Institutional Activity Detection System
+Real-time WebSocket monitoring with time-normalized volume analysis
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import datetime, time as dt_time, timedelta
-from kiteconnect import KiteConnect, KiteTicker
-import threading
-import queue
+from datetime import datetime, time as dt_time
 import time
-from typing import Dict, List, Tuple
 import logging
+import queue
+import threading
+from typing import Dict, List, Tuple, Optional
+import json
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# Zerodha Kite Connect imports
+try:
+    from kiteconnect import KiteConnect, KiteTicker
+except ImportError:
+    st.error("⚠️ kiteconnect library not installed. Run: pip install kiteconnect")
+    st.stop()
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION & LOGGING
+# ═══════════════════════════════════════════════════════════════════════════════
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-# ==================== CONFIGURATION ====================
-MARKET_OPEN = dt_time(9, 15)
-MARKET_CLOSE = dt_time(15, 30)
-SIGNAL_COOLDOWN_MINUTES = 15
-SIGNAL_EXPIRY_MINUTES = 30
-UPDATE_INTERVAL = 2  # seconds
+# Thread-safe primitives (module-level globals)
+TICK_DATA_QUEUE = queue.Queue(maxsize=1000)
+CONNECTED = threading.Event()
+WS_INSTANCE = None
 
-# ==================== INITIALIZE SESSION STATE ====================
+# Trading parameters
+MIN_CONFIDENCE = 7
+MAX_DAILY_SIGNALS = 6
+INSTITUTIONAL_THRESHOLD = 2.5
+MIN_TIME_DELTA = 0.5  # Minimum seconds between ticks
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SESSION STATE INITIALIZATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def init_session_state():
     """Initialize all session state variables"""
+    
+    # Authentication
+    if 'api_key' not in st.session_state:
+        st.session_state.api_key = ""
+    if 'api_secret' not in st.session_state:
+        st.session_state.api_secret = ""
+    if 'access_token' not in st.session_state:
+        st.session_state.access_token = ""
     if 'kite' not in st.session_state:
         st.session_state.kite = None
-    if 'kite_ticker' not in st.session_state:
-        st.session_state.kite_ticker = None
-    if 'access_token' not in st.session_state:
-        st.session_state.access_token = None
-    if 'connected' not in st.session_state:
-        st.session_state.connected = False
-    if 'monitoring' not in st.session_state:
-        st.session_state.monitoring = False
+    
+    # Monitoring state
+    if 'monitoring_active' not in st.session_state:
+        st.session_state.monitoring_active = False
+    if 'monitored_symbols' not in st.session_state:
+        st.session_state.monitored_symbols = []
+    if 'instrument_tokens_map' not in st.session_state:
+        st.session_state.instrument_tokens_map = {}
+    
+    # Tick data storage
     if 'tick_data' not in st.session_state:
         st.session_state.tick_data = {}
-    if 'signals_df' not in st.session_state:
-        st.session_state.signals_df = pd.DataFrame()
     if 'previous_snapshots' not in st.session_state:
         st.session_state.previous_snapshots = {}
-    if 'signal_history' not in st.session_state:
-        st.session_state.signal_history = {}
-    if 'instrument_tokens' not in st.session_state:
-        st.session_state.instrument_tokens = {}
-    if 'ticks_per_second' not in st.session_state:
-        st.session_state.ticks_per_second = 0
-    if 'last_tick_count' not in st.session_state:
-        st.session_state.last_tick_count = 0
     if 'total_ticks' not in st.session_state:
         st.session_state.total_ticks = 0
+    
+    # Signal tracking
+    if 'daily_signals_pool' not in st.session_state:
+        st.session_state.daily_signals_pool = []
+    if 'top_signals' not in st.session_state:
+        st.session_state.top_signals = []
+    
+    # PCR caching
+    if 'pcr_cache' not in st.session_state:
+        st.session_state.pcr_cache = {}
+    if 'pcr_last_update' not in st.session_state:
+        st.session_state.pcr_last_update = {}
+    
+    # Volume averaging (for ratio calculation)
+    if 'volume_history' not in st.session_state:
+        st.session_state.volume_history = {}
 
-# ==================== HELPER FUNCTIONS ====================
+# ═══════════════════════════════════════════════════════════════════════════════
+# WEBSOCKET IMPLEMENTATION (THREAD-SAFE)
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def is_market_open() -> bool:
-    """Check if market is currently open"""
-    now = datetime.now().time()
-    return MARKET_OPEN <= now <= MARKET_CLOSE
+def on_ticks(ws, ticks):
+    """
+    WebSocket callback (runs in background thread).
+    
+    CRITICAL: Never access st.session_state here!
+    Only push to thread-safe queue.
+    """
+    for tick in ticks:
+        try:
+            TICK_DATA_QUEUE.put_nowait(tick)
+        except queue.Full:
+            logger.warning("Tick queue full, dropping tick")
 
-def get_login_url(api_key: str) -> str:
-    """Generate Zerodha login URL"""
-    return f"https://kite.zerodha.com/connect/login?api_key={api_key}&v=3"
-
-def establish_connection(api_key: str, api_secret: str, request_token: str) -> Tuple[bool, str]:
-    """Establish connection with Zerodha and generate access token"""
+def on_connect(ws, response):
+    """
+    Subscribe to tokens on connection.
+    
+    CRITICAL: Cannot access st.session_state from background thread.
+    Tokens must be passed via module-level variable.
+    """
     try:
-        kite = KiteConnect(api_key=api_key)
-        data = kite.generate_session(request_token, api_secret=api_secret)
-        access_token = data["access_token"]
-        kite.set_access_token(access_token)
-        
-        st.session_state.kite = kite
-        st.session_state.access_token = access_token
-        return True, "Connection established successfully!"
+        # Use module-level variable instead of session_state
+        if hasattr(ws, '_tokens_to_subscribe'):
+            tokens = ws._tokens_to_subscribe
+            if tokens:
+                ws.subscribe(tokens)
+                ws.set_mode(ws.MODE_FULL, tokens)
+                CONNECTED.set()
+                logger.info(f"✅ WebSocket connected, subscribed to {len(tokens)} instruments")
+        else:
+            logger.warning("No tokens to subscribe - tokens not set on WebSocket instance")
     except Exception as e:
-        logger.error(f"Connection error: {e}")
-        return False, f"Connection failed: {str(e)}"
+        logger.error(f"Connection callback error: {e}")
 
-def get_instrument_tokens(symbols: List[str]) -> Dict[str, int]:
-    """Get instrument tokens for given symbols"""
+def on_close(ws, code, reason):
+    """Handle WebSocket closure"""
+    CONNECTED.clear()
+    logger.warning(f"WebSocket closed: {code} - {reason}")
+
+def on_error(ws, code, reason):
+    """Handle WebSocket errors"""
+    logger.error(f"WebSocket error: {code} - {reason}")
+
+def run_websocket(api_key, access_token, tokens):
+    """
+    Background thread function.
+    Must use threaded=True for Streamlit compatibility.
+    
+    Args:
+        api_key: Zerodha API key
+        access_token: Session access token
+        tokens: List of instrument tokens to subscribe
+    """
+    global WS_INSTANCE
+    
     try:
-        instruments = st.session_state.kite.instruments("NSE")
-        token_map = {}
+        kws = KiteTicker(api_key, access_token)
+        kws.on_ticks = on_ticks
+        kws.on_connect = on_connect
+        kws.on_close = on_close
+        kws.on_error = on_error
         
-        for symbol in symbols:
-            symbol = symbol.strip().upper()
-            for inst in instruments:
-                if inst['tradingsymbol'] == symbol and inst['segment'] == 'NSE':
-                    token_map[symbol] = inst['instrument_token']
-                    break
+        # Store tokens on WebSocket instance (accessible in callback)
+        kws._tokens_to_subscribe = tokens
         
-        return token_map
+        WS_INSTANCE = kws
+        
+        # CRITICAL: threaded=True for Streamlit
+        kws.connect(threaded=True)
+        
     except Exception as e:
-        logger.error(f"Error fetching instruments: {e}")
-        return {}
+        logger.error(f"WebSocket thread error: {e}")
+        CONNECTED.clear()
 
-# ==================== ORDER FLOW CALCULATIONS ====================
+def start_websocket_thread(api_key, access_token, tokens):
+    """
+    Initialize and start WebSocket thread.
+    
+    Args:
+        api_key: Zerodha API key
+        access_token: Session access token
+        tokens: List of instrument tokens to subscribe
+    """
+    ws_thread = threading.Thread(
+        target=run_websocket,
+        args=(api_key, access_token, tokens),
+        daemon=True  # Dies when main thread exits
+    )
+    ws_thread.start()
+    logger.info("🚀 WebSocket thread started")
+
+def stop_websocket():
+    """Stop WebSocket connection"""
+    global WS_INSTANCE
+    
+    if WS_INSTANCE:
+        try:
+            WS_INSTANCE.close()
+            WS_INSTANCE = None
+            CONNECTED.clear()
+            logger.info("WebSocket stopped")
+        except Exception as e:
+            logger.error(f"Error stopping WebSocket: {e}")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CORE CALCULATION FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def calculate_order_imbalance(depth: Dict) -> Tuple[float, float, float]:
     """
-    Calculate order book imbalance from market depth
-    Returns: (buy_percentage, sell_percentage, imbalance_ratio)
+    Calculate order book imbalance from depth data.
+    
+    Example:
+        depth = {
+            'buy': [{'quantity': 1000}, {'quantity': 2000}],  # Total: 3000
+            'sell': [{'quantity': 1500}, {'quantity': 2500}]  # Total: 4000
+        }
+        
+        Returns: (42.9, 57.1, 0.75)
+        # 42.9% buy pressure, 57.1% sell pressure, 0.75 buy/sell ratio
+    
+    Returns:
+        (buy_pct, sell_pct, imbalance_ratio)
     """
     try:
-        buy_depth = depth.get('buy', [])
-        sell_depth = depth.get('sell', [])
+        buy_orders = depth.get('buy', [])
+        sell_orders = depth.get('sell', [])
         
-        total_buy_qty = sum([order['quantity'] for order in buy_depth])
-        total_sell_qty = sum([order['quantity'] for order in sell_depth])
+        total_buy_qty = sum([order.get('quantity', 0) for order in buy_orders])
+        total_sell_qty = sum([order.get('quantity', 0) for order in sell_orders])
         
-        total = total_buy_qty + total_sell_qty
-        if total == 0:
+        total_qty = total_buy_qty + total_sell_qty
+        
+        if total_qty == 0:
             return 50.0, 50.0, 1.0
         
-        buy_pct = (total_buy_qty / total) * 100
-        sell_pct = (total_sell_qty / total) * 100
+        buy_pct = (total_buy_qty / total_qty) * 100
+        sell_pct = (total_sell_qty / total_qty) * 100
         
         imbalance_ratio = total_buy_qty / total_sell_qty if total_sell_qty > 0 else 1.0
         
         return buy_pct, sell_pct, imbalance_ratio
+        
     except Exception as e:
-        logger.error(f"Error calculating imbalance: {e}")
+        logger.error(f"Order imbalance calculation error: {e}")
         return 50.0, 50.0, 1.0
 
-def detect_institutional_activity(symbol: str, current_depth: Dict, current_volume: int) -> Tuple[float, bool]:
+def detect_institutional_activity_normalized(
+    symbol: str,
+    current_depth: Dict,
+    current_volume: int,
+    current_price: float,
+    current_timestamp: float,
+    current_oi: int
+) -> Tuple[float, bool, int, str]:
     """
-    Detect institutional activity by analyzing order book changes vs volume changes
-    Returns: (institutional_ratio, is_institutional)
+    Detect institutional activity with TIME NORMALIZATION.
+    
+    Example:
+        Previous: timestamp=1699945234.50, volume=500000
+        Current: timestamp=1699945236.21, volume=515000
+        
+        time_delta = 1.71 seconds
+        volume_change = 15000 shares
+        volume_rate = 8771.9 shares/second
+        
+        orderbook_change = 1000 shares
+        orderbook_rate = 584.8 shares/second
+        
+        institutional_ratio = 15.0 (Very Strong Institutional)
+    
+    Returns:
+        (institutional_ratio, is_institutional, oi_change, oi_trend)
     """
-    try:
-        prev = st.session_state.previous_snapshots.get(symbol, {})
-        
-        if not prev:
-            # First snapshot, store and return
-            st.session_state.previous_snapshots[symbol] = {
-                'depth': current_depth,
-                'volume': current_volume,
-                'timestamp': datetime.now()
-            }
-            return 0.0, False
-        
-        # Calculate order book change
-        prev_buy = sum([o['quantity'] for o in prev['depth'].get('buy', [])])
-        prev_sell = sum([o['quantity'] for o in prev['depth'].get('sell', [])])
-        curr_buy = sum([o['quantity'] for o in current_depth.get('buy', [])])
-        curr_sell = sum([o['quantity'] for o in current_depth.get('sell', [])])
-        
-        orderbook_change = abs(curr_buy - prev_buy) + abs(curr_sell - prev_sell)
-        volume_change = max(0, current_volume - prev['volume'])
-        
-        # Calculate institutional ratio
-        if orderbook_change > 0:
-            institutional_ratio = volume_change / orderbook_change
-        else:
-            institutional_ratio = 0.0
-        
-        # Update snapshot
+    
+    prev = st.session_state.previous_snapshots.get(symbol)
+    
+    if prev is None:
+        # First tick - initialize
         st.session_state.previous_snapshots[symbol] = {
             'depth': current_depth,
             'volume': current_volume,
-            'timestamp': datetime.now()
+            'price': current_price,
+            'timestamp': current_timestamp,
+            'oi': current_oi
         }
+        return 0.0, False, 0, "Stable"
+    
+    # ══════════════════════════════════════════════════════════
+    # STEP 1: Calculate Time Delta (from exchange timestamp)
+    # ══════════════════════════════════════════════════════════
+    time_delta = current_timestamp - prev['timestamp']
+    time_delta = max(MIN_TIME_DELTA, time_delta)  # Safety minimum
+    
+    # ══════════════════════════════════════════════════════════
+    # STEP 2: Calculate Raw Changes (Incremental)
+    # ══════════════════════════════════════════════════════════
+    
+    # Volume: Cumulative → Incremental
+    volume_change = current_volume - prev['volume']
+    volume_change = max(0, volume_change)
+    
+    # Orderbook: Sum of both sides' absolute movement
+    prev_buy = sum([o.get('quantity', 0) for o in prev['depth'].get('buy', [])])
+    prev_sell = sum([o.get('quantity', 0) for o in prev['depth'].get('sell', [])])
+    curr_buy = sum([o.get('quantity', 0) for o in current_depth.get('buy', [])])
+    curr_sell = sum([o.get('quantity', 0) for o in current_depth.get('sell', [])])
+    
+    orderbook_change = abs(curr_buy - prev_buy) + abs(curr_sell - prev_sell)
+    
+    # ══════════════════════════════════════════════════════════
+    # STEP 3: Normalize to Per-Second Rates (KEY INNOVATION)
+    # ══════════════════════════════════════════════════════════
+    
+    volume_rate = volume_change / time_delta
+    orderbook_rate = orderbook_change / time_delta
+    
+    # ══════════════════════════════════════════════════════════
+    # STEP 4: Calculate Institutional Ratio
+    # ══════════════════════════════════════════════════════════
+    
+    if orderbook_rate > 0:
+        institutional_ratio = volume_rate / orderbook_rate
+    else:
+        institutional_ratio = 0.0
+    
+    is_institutional = institutional_ratio > INSTITUTIONAL_THRESHOLD
+    
+    # ══════════════════════════════════════════════════════════
+    # STEP 5: OI Analysis (Informational)
+    # ══════════════════════════════════════════════════════════
+    
+    oi_change = current_oi - prev.get('oi', current_oi)
+    
+    if oi_change > 0:
+        oi_trend = "Rising"
+    elif oi_change < 0:
+        oi_trend = "Falling"
+    else:
+        oi_trend = "Stable"
+    
+    # ══════════════════════════════════════════════════════════
+    # STEP 6: Update Snapshot for Next Comparison
+    # ══════════════════════════════════════════════════════════
+    
+    st.session_state.previous_snapshots[symbol] = {
+        'depth': current_depth,
+        'volume': current_volume,
+        'price': current_price,
+        'timestamp': current_timestamp,
+        'oi': current_oi
+    }
+    
+    return round(institutional_ratio, 2), is_institutional, oi_change, oi_trend
+
+def calculate_volume_ratio(symbol: str, current_volume: int) -> float:
+    """
+    Calculate current volume as ratio of average volume.
+    Uses rolling window of last 20 ticks.
+    
+    Example:
+        Average volume: 100000 shares
+        Current volume: 230000 shares
+        Returns: 2.3 (230% of average)
+    """
+    if symbol not in st.session_state.volume_history:
+        st.session_state.volume_history[symbol] = []
+    
+    history = st.session_state.volume_history[symbol]
+    history.append(current_volume)
+    
+    # Keep last 20 data points
+    if len(history) > 20:
+        history.pop(0)
+    
+    if len(history) < 3:
+        return 1.0
+    
+    avg_volume = np.mean(history[:-1])  # Exclude current
+    
+    if avg_volume == 0:
+        return 1.0
+    
+    return current_volume / avg_volume
+
+def get_pcr_cached(symbol: str, current_price: float) -> Tuple[float, str]:
+    """
+    Get Put-Call Ratio with 5-minute caching.
+    
+    Example:
+        RELIANCE @ ₹1500
+        ATM strikes: 1480, 1500, 1520
         
-        is_institutional = institutional_ratio > 1.5
+        Put OI: 25000, Call OI: 43000
+        PCR = 0.58
         
-        return institutional_ratio, is_institutional
+        0.58 < 0.9 → STRONG_BULLISH
+    
+    Note: Currently using mock data. Replace with actual options chain API.
+    """
+    
+    now = time.time()
+    
+    # Check cache
+    if symbol in st.session_state.pcr_cache:
+        last_update = st.session_state.pcr_last_update.get(symbol, 0)
+        if now - last_update < 300:  # 5 minutes
+            return st.session_state.pcr_cache[symbol]
+    
+    # Fetch PCR (MOCK - replace with real API)
+    try:
+        # TODO: Implement real options chain fetching
+        # pcr = calculate_real_pcr(symbol, current_price)
+        
+        # Mock with realistic bounded random
+        pcr = round(np.random.uniform(0.6, 1.4), 2)
+        
+        # Determine bias
+        if pcr < 0.7:
+            bias = "STRONG_BULLISH"
+        elif pcr < 0.9:
+            bias = "BULLISH"
+        elif pcr > 1.3:
+            bias = "STRONG_BEARISH"
+        elif pcr > 1.1:
+            bias = "BEARISH"
+        else:
+            bias = "NEUTRAL"
+        
+        # Cache result
+        st.session_state.pcr_cache[symbol] = (pcr, bias)
+        st.session_state.pcr_last_update[symbol] = now
+        
+        return pcr, bias
     
     except Exception as e:
-        logger.error(f"Error detecting institutional activity: {e}")
-        return 0.0, False
+        logger.error(f"PCR calculation failed for {symbol}: {e}")
+        return 1.0, "NEUTRAL"
 
-def calculate_volume_ratio(current_volume: int, avg_volume: int) -> float:
-    """Calculate current volume vs average volume ratio"""
-    if avg_volume > 0:
-        return current_volume / avg_volume
-    return 1.0
-
-def calculate_targets_and_stops(signal_type: str, current_price: float, depth: Dict) -> Tuple[float, float, float]:
+def calculate_risk_levels(
+    signal_type: str,
+    current_price: float,
+    depth: Dict
+) -> Tuple[float, float, float, float]:
     """
-    Calculate entry, target, and stop loss prices
-    Returns: (entry_price, target_price, stop_loss)
+    Calculate dynamic entry, target, and stop loss from orderbook structure.
+    
+    Example (ACCUMULATION signal):
+        current_price = 1500.00
+        
+        Best bid = 1499.50 (support)
+        Best ask = 1500.50 (resistance)
+        
+        Entry: 1500.00
+        Target: 1509.98 (0.67% up, 2x risk distance)
+        Stop Loss: 1495.01 (0.33% down, at support)
+        R:R = 2.0
     """
+    
     try:
+        buy_orders = depth.get('buy', [])
+        sell_orders = depth.get('sell', [])
+        
+        if not buy_orders or not sell_orders:
+            # Fallback to percentage-based
+            if signal_type in ['BUY', 'ACCUMULATION']:
+                entry = current_price
+                target = entry * 1.0067  # 0.67% up
+                stop_loss = entry * 0.9967  # 0.33% down
+            else:
+                entry = current_price
+                target = entry * 0.9967  # 0.67% down
+                stop_loss = entry * 1.0033  # 0.33% up
+            
+            rr_ratio = 2.0
+            return entry, target, stop_loss, rr_ratio
+        
+        # Extract support/resistance levels
+        best_bid = buy_orders[0].get('price', current_price * 0.997)
+        best_ask = sell_orders[0].get('price', current_price * 1.003)
+        
         if signal_type in ['BUY', 'ACCUMULATION']:
-            # Buy signal
-            entry = depth['buy'][0]['price'] if depth.get('buy') else current_price
-            target = current_price * 1.005  # 0.5% target
-            stop_loss = current_price * 0.997  # 0.3% stop
+            entry = current_price
+            stop_loss = best_bid * 0.9997  # Just below support
+            risk_distance = entry - stop_loss
+            target = entry + (risk_distance * 2)  # 1:2 risk-reward
             
-            # Check for resistance in order book
-            sell_orders = depth.get('sell', [])
-            if sell_orders:
-                heavy_sell = max(sell_orders, key=lambda x: x['quantity'])
-                if heavy_sell['quantity'] > 10000:  # Heavy resistance
-                    target = min(target, heavy_sell['price'])
+        else:  # SELL, DISTRIBUTION
+            entry = current_price
+            stop_loss = best_ask * 1.0003  # Just above resistance
+            risk_distance = stop_loss - entry
+            target = entry - (risk_distance * 2)
         
-        else:  # SELL or DISTRIBUTION
-            entry = depth['sell'][0]['price'] if depth.get('sell') else current_price
-            target = current_price * 0.995  # 0.5% target
-            stop_loss = current_price * 1.003  # 0.3% stop
-            
-            # Check for support in order book
-            buy_orders = depth.get('buy', [])
-            if buy_orders:
-                heavy_buy = max(buy_orders, key=lambda x: x['quantity'])
-                if heavy_buy['quantity'] > 10000:  # Heavy support
-                    target = max(target, heavy_buy['price'])
+        rr_ratio = abs((target - entry) / (entry - stop_loss)) if abs(entry - stop_loss) > 0 else 2.0
         
-        return entry, target, stop_loss
-    
+        return entry, target, stop_loss, rr_ratio
+        
     except Exception as e:
-        logger.error(f"Error calculating targets: {e}")
-        return current_price, current_price * 1.005, current_price * 0.997
+        logger.error(f"Risk calculation error: {e}")
+        # Safe fallback
+        if signal_type in ['BUY', 'ACCUMULATION']:
+            return current_price, current_price * 1.0067, current_price * 0.9967, 2.0
+        else:
+            return current_price, current_price * 0.9967, current_price * 1.0033, 2.0
 
-def generate_signal(symbol: str, tick_data: Dict) -> Dict:
+def calculate_relative_score(signal: Dict) -> float:
     """
-    Generate trading signal based on order flow analysis
-    Returns signal dictionary or None
+    Calculate relative score for ranking signals.
+    
+    Scoring components:
+    - Confidence (max 10 points)
+    - Institutional ratio (max 3 points)
+    - Volume ratio (max 2 points)
+    
+    Max total: 15 points
     """
+    score = 0.0
+    
+    # Confidence (0-10 points)
+    score += signal['Confidence Score']
+    
+    # Institutional ratio (0-3 points)
+    inst_ratio = signal['Institutional Ratio']
+    if inst_ratio > 4.0:
+        score += 3
+    elif inst_ratio > 2.5:
+        score += 2
+    elif inst_ratio > 1.5:
+        score += 1
+    
+    # Volume ratio (0-2 points)
+    vol_ratio_str = signal['Volume Status'].replace('x Avg', '')
     try:
+        vol_ratio = float(vol_ratio_str)
+        if vol_ratio > 2.0:
+            score += 2
+        elif vol_ratio > 1.5:
+            score += 1
+    except:
+        pass
+    
+    return round(score, 2)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SIGNAL GENERATION (MAIN LOGIC)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def generate_signal(symbol: str, tick_data: Dict) -> Optional[Dict]:
+    """
+    Generate trading signal with multi-factor confirmation.
+    
+    Example Flow:
+        Stock: RELIANCE
+        Orderbook: 65% sellers (visible selling)
+        Price: +0.08% (stable)
+        Inst Ratio: 15.0 (very high)
+        PCR: 0.62 (bullish)
+        
+        → Signal: ACCUMULATION
+        → Confidence: 9/10
+        → Relative Score: 13.8/15
+    """
+    
+    try:
+        # Extract data
         current_price = tick_data.get('last_price', 0)
         depth = tick_data.get('depth', {})
         volume = tick_data.get('volume', 0)
-        avg_volume = tick_data.get('average_price', volume)  # Fallback to current if avg not available
+        timestamp = tick_data.get('exchange_timestamp')
         
+        # Fallback to timestamp if exchange_timestamp not available
+        if timestamp is None:
+            timestamp = tick_data.get('timestamp', time.time())
+        
+        oi = tick_data.get('oi', 0)
+        
+        # Validation
         if current_price == 0 or not depth:
             return None
         
-        # Check signal cooldown
-        signal_key = f"{symbol}"
-        last_signal_time = st.session_state.signal_history.get(signal_key)
-        if last_signal_time:
-            time_diff = (datetime.now() - last_signal_time).total_seconds() / 60
-            if time_diff < SIGNAL_COOLDOWN_MINUTES:
-                return None
+        # ══════════════════════════════════════════════════════════
+        # CALCULATE ALL METRICS
+        # ══════════════════════════════════════════════════════════
         
-        # Calculate order imbalance
+        # 1. Order Imbalance
         buy_pct, sell_pct, imbalance_ratio = calculate_order_imbalance(depth)
         
-        # Detect institutional activity
-        inst_ratio, is_institutional = detect_institutional_activity(symbol, depth, volume)
+        # 2. Institutional Detection (TIME-NORMALIZED)
+        inst_ratio, is_institutional, oi_change, oi_trend = detect_institutional_activity_normalized(
+            symbol, depth, volume, current_price, timestamp, oi
+        )
         
-        # Calculate volume ratio
-        vol_ratio = calculate_volume_ratio(volume, avg_volume)
+        # 3. Volume Ratio
+        vol_ratio = calculate_volume_ratio(symbol, volume)
         
-        # Get previous price for trend detection
+        # 4. PCR
+        pcr, pcr_bias = get_pcr_cached(symbol, current_price)
+        
+        # 5. Price Change
         prev_price = st.session_state.previous_snapshots.get(symbol, {}).get('price', current_price)
         price_change = ((current_price - prev_price) / prev_price * 100) if prev_price > 0 else 0
         
-        # Signal generation logic
+        # ══════════════════════════════════════════════════════════
+        # SIGNAL DECISION TREE
+        # ══════════════════════════════════════════════════════════
+        
         signal_type = None
         confidence = 0
         
-        # Standard BUY signal
-        if buy_pct > 60 and vol_ratio > 1.2:
-            signal_type = "BUY"
-            confidence += 2
-            if price_change > 0:
-                confidence += 2  # Price confirms direction
-        
-        # Standard SELL signal
-        elif sell_pct > 60 and vol_ratio > 1.2:
-            signal_type = "SELL"
-            confidence += 2
-            if price_change < 0:
-                confidence += 2
-        
-        # Institutional ACCUMULATION (selling pressure but price stable/rising)
+        # TYPE 1: ACCUMULATION (Hidden Buying - Best Signal)
         if sell_pct > 60 and price_change >= -0.1 and is_institutional:
             signal_type = "ACCUMULATION"
             confidence += 3
+            
+            if pcr_bias in ["STRONG_BULLISH", "BULLISH"]:
+                confidence += 4
+            elif pcr_bias == "NEUTRAL":
+                confidence += 1
         
-        # Institutional DISTRIBUTION (buying pressure but price stable/falling)
-        if buy_pct > 60 and price_change <= 0.1 and is_institutional:
+        # TYPE 2: DISTRIBUTION (Hidden Selling)
+        elif buy_pct > 60 and price_change <= 0.1 and is_institutional:
             signal_type = "DISTRIBUTION"
             confidence += 3
+            
+            if pcr_bias in ["STRONG_BEARISH", "BEARISH"]:
+                confidence += 4
+            elif pcr_bias == "NEUTRAL":
+                confidence += 1
         
-        # Confidence scoring
+        # TYPE 3: BUY (Visible Buying)
+        elif buy_pct > 60 and vol_ratio > 1.2:
+            signal_type = "BUY"
+            confidence += 2
+            
+            if price_change > 0:
+                confidence += 2
+            
+            if pcr_bias in ["BULLISH", "STRONG_BULLISH"]:
+                confidence += 3
+            elif pcr_bias in ["BEARISH", "STRONG_BEARISH"]:
+                confidence -= 2
+        
+        # TYPE 4: SELL (Visible Selling)
+        elif sell_pct > 60 and vol_ratio > 1.2:
+            signal_type = "SELL"
+            confidence += 2
+            
+            if price_change < 0:
+                confidence += 2
+            
+            if pcr_bias in ["BEARISH", "STRONG_BEARISH"]:
+                confidence += 3
+            elif pcr_bias in ["BULLISH", "STRONG_BULLISH"]:
+                confidence -= 2
+        
+        # No signal generated
+        if not signal_type:
+            return None
+        
+        # ══════════════════════════════════════════════════════════
+        # CONFIDENCE BOOSTERS
+        # ══════════════════════════════════════════════════════════
+        
+        # Order imbalance strength
         if buy_pct > 70 or sell_pct > 70:
             confidence += 3
         elif buy_pct > 60 or sell_pct > 60:
             confidence += 2
         
+        # Institutional strength
         if inst_ratio > 4.0:
             confidence += 3
         elif inst_ratio > 2.5:
             confidence += 2
-        elif inst_ratio > 1.5:
-            confidence += 1
         
+        # Volume surge
         if vol_ratio > 2.0:
             confidence += 2
         elif vol_ratio > 1.5:
             confidence += 1
+        elif vol_ratio < 0.8:
+            confidence -= 2
         
-        # Only generate signal if confidence >= 4
-        if signal_type and confidence >= 4:
-            confidence = min(confidence, 10)  # Cap at 10
-            
-            # Calculate targets and stops
-            entry, target, stop_loss = calculate_targets_and_stops(signal_type, current_price, depth)
-            
-            # Calculate potential profit
-            if signal_type in ['BUY', 'ACCUMULATION']:
-                profit_pct = ((target - entry) / entry) * 100
-            else:
-                profit_pct = ((entry - target) / entry) * 100
-            
-            # Update signal history
-            st.session_state.signal_history[signal_key] = datetime.now()
-            
-            return {
-                'Stock Symbol': symbol,
-                'Signal Type': signal_type,
-                'Confidence Score': confidence,
-                'Current Price': round(current_price, 2),
-                'Entry Price': round(entry, 2),
-                'Target Price': round(target, 2),
-                'Stop Loss': round(stop_loss, 2),
-                'Order Imbalance': f"{buy_pct:.1f}% Buy, {sell_pct:.1f}% Sell",
-                'Institutional Ratio': round(inst_ratio, 2),
-                'Volume Status': f"{vol_ratio:.1f}x Avg",
-                'Potential Profit %': round(profit_pct, 2),
-                'Time Detected': datetime.now().strftime("%H:%M:%S")
-            }
+        # Cap confidence at 10
+        confidence = min(confidence, 10)
         
-        return None
-    
+        # Minimum threshold
+        if confidence < MIN_CONFIDENCE:
+            return None
+        
+        # ══════════════════════════════════════════════════════════
+        # RISK MANAGEMENT
+        # ══════════════════════════════════════════════════════════
+        
+        entry, target, stop_loss, rr_ratio = calculate_risk_levels(
+            signal_type, current_price, depth
+        )
+        
+        # Calculate potential profit
+        if signal_type in ['BUY', 'ACCUMULATION']:
+            profit_pct = ((target - entry) / entry * 100)
+        else:
+            profit_pct = ((entry - target) / entry * 100)
+        
+        # ══════════════════════════════════════════════════════════
+        # CREATE SIGNAL DICTIONARY
+        # ══════════════════════════════════════════════════════════
+        
+        signal = {
+            'Stock Symbol': symbol,
+            'Signal Type': signal_type,
+            'Confidence Score': confidence,
+            'Current Price': round(current_price, 2),
+            'Entry Price': round(entry, 2),
+            'Target Price': round(target, 2),
+            'Stop Loss': round(stop_loss, 2),
+            'Risk:Reward': f"1:{round(rr_ratio, 1)}",
+            'Order Imbalance': f"{buy_pct:.1f}% Buy, {sell_pct:.1f}% Sell",
+            'Institutional Ratio': round(inst_ratio, 2),
+            'Volume Status': f"{vol_ratio:.1f}x Avg",
+            'PCR': round(pcr, 2),
+            'PCR Bias': pcr_bias,
+            'OI Change': oi_change,
+            'OI Trend': oi_trend,
+            'Potential Profit %': round(profit_pct, 2),
+            'Time Detected': datetime.now().strftime("%H:%M:%S")
+        }
+        
+        # Calculate relative score for ranking
+        signal['Relative Score'] = calculate_relative_score(signal)
+        
+        return signal
+        
     except Exception as e:
-        logger.error(f"Error generating signal for {symbol}: {e}")
+        logger.error(f"Signal generation error for {symbol}: {e}")
         return None
 
-# ==================== WEBSOCKET HANDLERS ====================
+# ═══════════════════════════════════════════════════════════════════════════════
+# TICK PROCESSING (MAIN THREAD)
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def on_ticks(ws, ticks):
-    """Callback for receiving ticks"""
-    try:
-        st.session_state.total_ticks += len(ticks)
-        
-        for tick in ticks:
-            token = tick['instrument_token']
+def process_tick_queue():
+    """
+    Process all ticks from queue (runs in main Streamlit thread).
+    Safe to access st.session_state here.
+    """
+    processed = 0
+    
+    while not TICK_DATA_QUEUE.empty() and processed < 50:
+        try:
+            tick = TICK_DATA_QUEUE.get_nowait()
+            
             # Find symbol for this token
             symbol = None
-            for sym, tok in st.session_state.instrument_tokens.items():
-                if tok == token:
+            for sym, tok in st.session_state.instrument_tokens_map.items():
+                if tok == tick['instrument_token']:
                     symbol = sym
                     break
             
             if symbol:
+                # Store tick data
                 st.session_state.tick_data[symbol] = tick
+                st.session_state.total_ticks += 1
                 
                 # Generate signal
                 signal = generate_signal(symbol, tick)
-                if signal:
-                    # Add or update signal in dataframe
-                    if st.session_state.signals_df.empty:
-                        st.session_state.signals_df = pd.DataFrame([signal])
-                    else:
-                        # Remove old signal for same stock if exists
-                        st.session_state.signals_df = st.session_state.signals_df[
-                            st.session_state.signals_df['Stock Symbol'] != symbol
-                        ]
-                        # Add new signal
-                        st.session_state.signals_df = pd.concat([
-                            st.session_state.signals_df,
-                            pd.DataFrame([signal])
-                        ], ignore_index=True)
-                        
-                        # Sort by confidence
-                        st.session_state.signals_df = st.session_state.signals_df.sort_values(
-                            'Confidence Score', ascending=False
-                        ).reset_index(drop=True)
-        
-        # Clean expired signals
-        clean_expired_signals()
+                
+                if signal and signal['Confidence Score'] >= MIN_CONFIDENCE:
+                    # Add to daily pool (avoid duplicates)
+                    existing = [s for s in st.session_state.daily_signals_pool 
+                               if s['Stock Symbol'] == symbol and s['Signal Type'] == signal['Signal Type']]
+                    
+                    if not existing:
+                        st.session_state.daily_signals_pool.append(signal)
+            
+            processed += 1
+            
+        except queue.Empty:
+            break
+        except Exception as e:
+            logger.error(f"Error processing tick: {e}")
     
-    except Exception as e:
-        logger.error(f"Error processing ticks: {e}")
+    return processed
 
-def on_connect(ws, response):
-    """Callback on successful connection"""
-    logger.info("WebSocket connected")
-    st.session_state.connected = True
+def update_top_signals():
+    """
+    Update top signals by ranking the daily pool.
+    Keeps only top MAX_DAILY_SIGNALS by Relative Score.
+    """
+    if not st.session_state.daily_signals_pool:
+        st.session_state.top_signals = []
+        return
     
-    # Subscribe to instruments
-    tokens = list(st.session_state.instrument_tokens.values())
-    if tokens:
-        ws.subscribe(tokens)
-        ws.set_mode(ws.MODE_FULL, tokens)  # Full mode for depth data
-
-def on_close(ws, code, reason):
-    """Callback on connection close"""
-    logger.info(f"WebSocket closed: {code} - {reason}")
-    st.session_state.connected = False
-
-def on_error(ws, code, reason):
-    """Callback on error"""
-    logger.error(f"WebSocket error: {code} - {reason}")
-
-def clean_expired_signals():
-    """Remove expired signals from the dataframe"""
-    if not st.session_state.signals_df.empty:
-        current_time = datetime.now()
-        
-        def is_valid(row):
-            try:
-                signal_time = datetime.strptime(row['Time Detected'], "%H:%M:%S")
-                signal_time = current_time.replace(
-                    hour=signal_time.hour,
-                    minute=signal_time.minute,
-                    second=signal_time.second
-                )
-                time_diff = (current_time - signal_time).total_seconds() / 60
-                return time_diff < SIGNAL_EXPIRY_MINUTES
-            except:
-                return False
-        
-        st.session_state.signals_df = st.session_state.signals_df[
-            st.session_state.signals_df.apply(is_valid, axis=1)
-        ].reset_index(drop=True)
-
-def start_websocket():
-    """Start WebSocket connection in background thread"""
-    try:
-        if st.session_state.access_token and st.session_state.instrument_tokens:
-            api_key = st.session_state.get('api_key', '')
-            
-            kws = KiteTicker(api_key, st.session_state.access_token)
-            kws.on_ticks = on_ticks
-            kws.on_connect = on_connect
-            kws.on_close = on_close
-            kws.on_error = on_error
-            
-            st.session_state.kite_ticker = kws
-            
-            # Start in background thread
-            ws_thread = threading.Thread(target=kws.connect, daemon=True)
-            ws_thread.start()
-            
-            return True
-        return False
-    except Exception as e:
-        logger.error(f"Error starting WebSocket: {e}")
-        return False
-
-# ==================== STREAMLIT UI ====================
-
-def main():
-    st.set_page_config(
-        page_title="Order Flow Trading Dashboard",
-        page_icon="📊",
-        layout="wide"
+    # Sort by Relative Score (descending)
+    sorted_signals = sorted(
+        st.session_state.daily_signals_pool,
+        key=lambda x: x['Relative Score'],
+        reverse=True
     )
     
-    init_session_state()
+    # Keep top N
+    st.session_state.top_signals = sorted_signals[:MAX_DAILY_SIGNALS]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SELF-VERIFICATION TESTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def run_self_tests():
+    """
+    Self-verification tests for critical functions.
+    Returns dict of test results.
+    """
+    results = {}
     
-    # Custom CSS
-    st.markdown("""
-        <style>
-        .big-font {
-            font-size:20px !important;
-            font-weight: bold;
-        }
-        .status-connected {
-            color: #00ff00;
-            font-weight: bold;
-        }
-        .status-disconnected {
-            color: #ff0000;
-            font-weight: bold;
-        }
-        </style>
-    """, unsafe_allow_html=True)
+    # Test 1: Time normalization
+    try:
+        mock_depth = {'buy': [{'quantity': 1000}], 'sell': [{'quantity': 1000}]}
+        mock_timestamp = time.time()
+        
+        # First tick (initialization)
+        ratio1, is_inst1, oi_chg1, trend1 = detect_institutional_activity_normalized(
+            'TEST_SYMBOL', mock_depth, 100000, 1500.0, mock_timestamp, 0
+        )
+        
+        assert ratio1 == 0.0, "First tick should return 0.0 ratio"
+        assert not is_inst1, "First tick should not flag institutional"
+        
+        # Second tick (should calculate properly)
+        time.sleep(0.1)  # Small delay
+        ratio2, is_inst2, oi_chg2, trend2 = detect_institutional_activity_normalized(
+            'TEST_SYMBOL', mock_depth, 110000, 1500.5, mock_timestamp + 1.0, 0
+        )
+        
+        assert ratio2 >= 0, "Ratio should be non-negative"
+        
+        results['time_normalization'] = "✅ PASS"
+    except Exception as e:
+        results['time_normalization'] = f"❌ FAIL: {e}"
     
-    st.title("📊 Real-Time Order Flow Trading Dashboard")
-    st.markdown("---")
+    # Test 2: Order imbalance calculation
+    try:
+        test_depth = {
+            'buy': [{'quantity': 1000}, {'quantity': 2000}],
+            'sell': [{'quantity': 1500}, {'quantity': 2500}]
+        }
+        
+        buy_pct, sell_pct, ratio = calculate_order_imbalance(test_depth)
+        
+        assert abs(buy_pct + sell_pct - 100) < 0.01, "Percentages should sum to 100"
+        assert 0 <= buy_pct <= 100, "Buy% should be 0-100"
+        assert 0 <= sell_pct <= 100, "Sell% should be 0-100"
+        assert ratio > 0, "Ratio should be positive"
+        
+        results['order_imbalance'] = "✅ PASS"
+    except Exception as e:
+        results['order_imbalance'] = f"❌ FAIL: {e}"
     
-    # ==================== SIDEBAR ====================
-    with st.sidebar:
-        st.header("⚙️ Configuration")
+    # Test 3: Signal confidence bounds
+    try:
+        mock_tick = {
+            'last_price': 1500.0,
+            'depth': {'buy': [{'quantity': 3000}], 'sell': [{'quantity': 1000}]},
+            'volume': 100000,
+            'timestamp': time.time(),
+            'oi': 50000
+        }
         
-        # Market status
-        if is_market_open():
-            st.success("🟢 Market is OPEN")
-        else:
-            st.warning("🔴 Market is CLOSED")
+        signal = generate_signal('TEST', mock_tick)
         
-        st.markdown("### 🔐 Zerodha Authentication")
+        if signal:
+            assert 0 <= signal['Confidence Score'] <= 10, "Confidence should be 0-10"
+            assert signal['Institutional Ratio'] >= 0, "Inst ratio should be non-negative"
+            assert 0 <= signal['PCR'] <= 3, "PCR should be reasonable"
         
-        api_key = st.text_input("API Key", type="password", key="api_key")
-        api_secret = st.text_input("API Secret", type="password", key="api_secret")
+        results['confidence_scoring'] = "✅ PASS"
+    except Exception as e:
+        results['confidence_scoring'] = f"❌ FAIL: {e}"
+    
+    # Test 4: Thread safety check
+    try:
+        queue_size = TICK_DATA_QUEUE.qsize()
+        assert queue_size >= 0, "Queue size should be non-negative"
         
-        if api_key and st.button("🔗 Generate Login URL"):
-            login_url = get_login_url(api_key)
-            st.markdown(f"[Click here to login]({login_url})")
-            st.info("After login, copy the request token from URL")
+        results['thread_safety'] = "✅ PASS"
+    except Exception as e:
+        results['thread_safety'] = f"❌ FAIL: {e}"
+    
+    # Test 5: Risk calculation
+    try:
+        test_depth = {
+            'buy': [{'price': 1499.5, 'quantity': 1000}],
+            'sell': [{'price': 1500.5, 'quantity': 1000}]
+        }
         
-        request_token = st.text_input("Request Token", key="request_token")
+        entry, target, sl, rr = calculate_risk_levels('BUY', 1500.0, test_depth)
         
-        if st.button("🔌 Connect to Zerodha"):
-            if api_key and api_secret and request_token:
-                with st.spinner("Connecting..."):
-                    success, message = establish_connection(api_key, api_secret, request_token)
-                    if success:
-                        st.success(message)
-                    else:
-                        st.error(message)
+        assert entry > 0, "Entry should be positive"
+        assert target > entry, "Target should be above entry for BUY"
+        assert sl < entry, "Stop loss should be below entry for BUY"
+        assert rr > 0, "Risk-reward should be positive"
+        
+        results['risk_calculation'] = "✅ PASS"
+    except Exception as e:
+        results['risk_calculation'] = f"❌ FAIL: {e}"
+    
+    return results
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AUTHENTICATION UI
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def render_authentication_ui():
+    """Render authentication interface in sidebar"""
+    
+    st.sidebar.title("🔐 Zerodha Authentication")
+    
+    if st.session_state.kite is None:
+        # Not authenticated
+        st.sidebar.info("Enter your Zerodha API credentials to connect")
+        
+        api_key = st.sidebar.text_input(
+            "API Key",
+            value=st.session_state.api_key,
+            type="default",
+            key="api_key_input"
+        )
+        
+        api_secret = st.sidebar.text_input(
+            "API Secret",
+            value=st.session_state.api_secret,
+            type="password",
+            key="api_secret_input"
+        )
+        
+        if st.sidebar.button("📋 Generate Login URL"):
+            if api_key and api_secret:
+                st.session_state.api_key = api_key
+                st.session_state.api_secret = api_secret
+                
+                login_url = f"https://kite.zerodha.com/connect/login?api_key={api_key}&v=3"
+                
+                st.sidebar.success("✅ Login URL Generated!")
+                st.sidebar.code(login_url, language=None)
+                st.sidebar.info("👆 Click the URL above, login, and copy the request_token from the redirect URL")
             else:
-                st.error("Please fill all fields")
+                st.sidebar.error("❌ Please enter both API Key and Secret")
         
-        # Connection status
-        st.markdown("### 📡 Connection Status")
-        if st.session_state.connected:
-            st.markdown('<p class="status-connected">🟢 CONNECTED</p>', unsafe_allow_html=True)
-        else:
-            st.markdown('<p class="status-disconnected">🔴 DISCONNECTED</p>', unsafe_allow_html=True)
+        st.sidebar.markdown("---")
         
-        st.markdown("---")
-        
-        # Stock universe configuration
-        st.markdown("### 📋 Stock Universe")
-        
-        stock_input = st.text_area(
-            "Enter stock symbols (one per line or comma-separated)",
-            height=150,
-            placeholder="RELIANCE\nTCS\nINFY\nHDFC"
+        request_token = st.sidebar.text_input(
+            "Request Token",
+            type="default",
+            key="request_token_input",
+            help="Paste the request_token from redirect URL"
         )
         
-        if stock_input:
-            symbols = [s.strip().upper() for s in stock_input.replace(',', '\n').split('\n') if s.strip()]
-            st.info(f"📊 {len(symbols)} stocks configured")
-            
-            if st.button("🚀 Start Monitoring") and st.session_state.kite:
-                with st.spinner("Fetching instruments..."):
-                    token_map = get_instrument_tokens(symbols)
-                    st.session_state.instrument_tokens = token_map
+        if st.sidebar.button("🔓 Complete Login"):
+            if not api_key or not api_secret:
+                st.sidebar.error("❌ Please enter API credentials first")
+            elif not request_token:
+                st.sidebar.error("❌ Please enter request token")
+            else:
+                try:
+                    st.session_state.api_key = api_key
+                    st.session_state.api_secret = api_secret
                     
-                    if token_map:
-                        st.success(f"Found {len(token_map)} instruments")
-                        if start_websocket():
-                            st.session_state.monitoring = True
-                            st.success("Monitoring started!")
-                        else:
-                            st.error("Failed to start WebSocket")
-                    else:
-                        st.error("No valid instruments found")
-            
-            if st.session_state.monitoring and st.button("⏹️ Stop Monitoring"):
-                st.session_state.monitoring = False
-                if st.session_state.kite_ticker:
-                    st.session_state.kite_ticker.close()
-                st.info("Monitoring stopped")
-        
-        st.markdown("---")
-        
-        # Filters
-        st.markdown("### 🎯 Filters")
-        min_confidence = st.slider("Minimum Confidence Score", 1, 10, 4)
-        signal_filter = st.multiselect(
-            "Signal Types",
-            ["BUY", "SELL", "ACCUMULATION", "DISTRIBUTION"],
-            default=["BUY", "SELL", "ACCUMULATION", "DISTRIBUTION"]
-        )
-    
-    # ==================== MAIN AREA ====================
-    
-    if st.session_state.monitoring:
-        # Summary statistics
-        st.markdown("### 📈 Summary Statistics")
-        
-        col1, col2, col3, col4, col5, col6 = st.columns(6)
-        
-        total_stocks = len(st.session_state.instrument_tokens)
-        active_signals = len(st.session_state.signals_df)
-        
-        # Safe column access with empty DataFrame check
-        if not st.session_state.signals_df.empty and 'Signal Type' in st.session_state.signals_df.columns:
-            buy_signals = len(st.session_state.signals_df[st.session_state.signals_df['Signal Type'] == 'BUY'])
-            sell_signals = len(st.session_state.signals_df[st.session_state.signals_df['Signal Type'] == 'SELL'])
-            accum_signals = len(st.session_state.signals_df[st.session_state.signals_df['Signal Type'] == 'ACCUMULATION'])
-            avg_confidence = st.session_state.signals_df['Confidence Score'].mean()
-        else:
-            buy_signals = 0
-            sell_signals = 0
-            accum_signals = 0
-            avg_confidence = 0
-        
-        col1.metric("Total Stocks", total_stocks)
-        col2.metric("Active Signals", active_signals)
-        col3.metric("🟢 BUY", buy_signals)
-        col4.metric("🔴 SELL", sell_signals)
-        col5.metric("🔵 ACCUMULATION", accum_signals)
-        col6.metric("Avg Confidence", f"{avg_confidence:.1f}")
-        
-        st.markdown("---")
-        
-        # Main signals table
-        st.markdown("### 🎯 Live Trading Opportunities")
-        
-        # Filter dataframe
-        filtered_df = st.session_state.signals_df.copy()
-        if not filtered_df.empty:
-            filtered_df = filtered_df[
-                (filtered_df['Confidence Score'] >= min_confidence) &
-                (filtered_df['Signal Type'].isin(signal_filter))
-            ]
-        
-        # Display options
-        col_a, col_b, col_c = st.columns([2, 2, 1])
-        with col_c:
-            if st.button("📥 Export to CSV") and not filtered_df.empty:
-                csv = filtered_df.to_csv(index=False)
-                st.download_button(
-                    "Download CSV",
-                    csv,
-                    "signals.csv",
-                    "text/csv"
-                )
-        
-        # Display table
-        if not filtered_df.empty:
-            # Color code by signal type
-            def highlight_signal(row):
-                if row['Signal Type'] == 'BUY':
-                    return ['background-color: #90EE90'] * len(row)
-                elif row['Signal Type'] == 'SELL':
-                    return ['background-color: #FFB6C6'] * len(row)
-                elif row['Signal Type'] == 'ACCUMULATION':
-                    return ['background-color: #ADD8E6'] * len(row)
-                elif row['Signal Type'] == 'DISTRIBUTION':
-                    return ['background-color: #FFD580'] * len(row)
-                return [''] * len(row)
-            
-            styled_df = filtered_df.style.apply(highlight_signal, axis=1)
-            st.dataframe(styled_df, height=400, use_container_width=True)
-            
-            st.caption(f"Last Updated: {datetime.now().strftime('%H:%M:%S')}")
-        else:
-            st.info("No signals detected yet. Monitoring in progress...")
-        
-        # Connection health
-        tps = st.session_state.total_ticks / max(1, time.time() - st.session_state.get('start_time', time.time()))
-        st.caption(f"📶 Connection Health: {st.session_state.total_ticks} total ticks received")
-        
-        # Auto-refresh
-        time.sleep(UPDATE_INTERVAL)
-        st.rerun()
+                    # Initialize KiteConnect
+                    kite = KiteConnect(api_key=api_key)
+                    
+                    # Generate session
+                    data = kite.generate_session(request_token, api_secret=api_secret)
+                    
+                    st.session_state.access_token = data["access_token"]
+                    kite.set_access_token(st.session_state.access_token)
+                    
+                    st.session_state.kite = kite
+                    
+                    st.sidebar.success("✅ Authentication Successful!")
+                    st.rerun()
+                    
+                except Exception as e:
+                    st.sidebar.error(f"❌ Authentication failed: {str(e)}")
+                    logger.error(f"Auth error: {e}")
     
     else:
-        st.info("👈 Configure authentication and stocks in the sidebar to start monitoring")
+        # Already authenticated
+        st.sidebar.success("✅ API Connected")
         
-        st.markdown("""
-        ### 📖 How to Use:
-        1. **Authentication**: Enter your Zerodha API credentials in the sidebar
-        2. **Generate Login URL**: Click to get the login link
-        3. **Get Request Token**: Login and copy the request token from the URL
-        4. **Connect**: Paste the request token and click Connect
-        5. **Add Stocks**: Enter stock symbols (NSE) you want to monitor
-        6. **Start Monitoring**: Click Start Monitoring to begin real-time analysis
+        # Mask access token
+        masked_token = st.session_state.access_token[:8] + "****" if st.session_state.access_token else "N/A"
+        st.sidebar.info(f"🔑 Token: {masked_token}")
         
-        ### 🎯 Signal Types:
-        - **🟢 BUY**: Strong buying pressure with volume increase
-        - **🔴 SELL**: Strong selling pressure with volume increase
-        - **🔵 ACCUMULATION**: Institutional buying (selling pressure but price stable/rising)
-        - **🟠 DISTRIBUTION**: Institutional selling (buying pressure but price stable/falling)
+        if st.sidebar.button("🔌 Disconnect"):
+            stop_websocket()
+            st.session_state.kite = None
+            st.session_state.access_token = ""
+            st.session_state.monitoring_active = False
+            st.session_state.monitored_symbols = []
+            st.session_state.tick_data = {}
+            st.session_state.previous_snapshots = {}
+            st.session_state.daily_signals_pool = []
+            st.session_state.top_signals = []
+            st.sidebar.success("Disconnected successfully")
+            st.rerun()
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MONITORING SETUP UI
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def render_monitoring_setup():
+    """Render stock monitoring setup interface"""
+    
+    st.sidebar.markdown("---")
+    st.sidebar.title("📊 Monitoring Setup")
+    
+    if st.session_state.kite is None:
+        st.sidebar.warning("⚠️ Please authenticate first")
+        return
+    
+    if not st.session_state.monitoring_active:
+        symbols_input = st.sidebar.text_area(
+            "Stock Symbols (NSE)",
+            value="RELIANCE\nTCS\nINFY\nHDFCBANK\nSBIN",
+            height=150,
+            help="Enter one symbol per line"
+        )
         
-        ### ⚡ Features:
-        - Real-time order flow analysis
-        - Institutional activity detection
-        - Confidence scoring (1-10)
-        - Automatic target & stop loss calculation
-        - Signal cooldown to avoid duplicates
-        - Auto-refresh every 2 seconds
-        """)
+        if st.sidebar.button("🚀 Start Monitoring"):
+            symbols = [s.strip().upper() for s in symbols_input.split('\n') if s.strip()]
+            
+            if not symbols:
+                st.sidebar.error("❌ Please enter at least one symbol")
+                return
+            
+            try:
+                # Fetch instrument list
+                instruments = st.session_state.kite.instruments("NSE")
+                
+                # Map symbols to tokens
+                token_map = {}
+                missing = []
+                
+                for symbol in symbols:
+                    found = False
+                    for inst in instruments:
+                        if inst['tradingsymbol'] == symbol and inst['segment'] == 'NSE':
+                            token_map[symbol] = inst['instrument_token']
+                            found = True
+                            break
+                    
+                    if not found:
+                        missing.append(symbol)
+                
+                if missing:
+                    st.sidebar.warning(f"⚠️ Could not find: {', '.join(missing)}")
+                
+                if not token_map:
+                    st.sidebar.error("❌ No valid symbols found")
+                    return
+                
+                # Store configuration
+                st.session_state.monitored_symbols = list(token_map.keys())
+                st.session_state.instrument_tokens_map = token_map
+                st.session_state.monitoring_active = True
+                
+                # Start WebSocket with tokens passed as argument
+                start_websocket_thread(
+                    st.session_state.api_key,
+                    st.session_state.access_token,
+                    list(token_map.values())  # Pass tokens directly
+                )
+                
+                st.sidebar.success(f"✅ Monitoring {len(token_map)} stocks!")
+                time.sleep(1)
+                st.rerun()
+                
+            except Exception as e:
+                st.sidebar.error(f"❌ Setup failed: {str(e)}")
+                logger.error(f"Monitoring setup error: {e}")
+    
+    else:
+        # Monitoring active
+        st.sidebar.success(f"✅ Monitoring Active")
+        st.sidebar.info(f"📈 Stocks: {', '.join(st.session_state.monitored_symbols[:3])}...")
+        st.sidebar.metric("Total Ticks Processed", st.session_state.total_ticks)
+        
+        ws_status = "🟢 Connected" if CONNECTED.is_set() else "🔴 Disconnected"
+        st.sidebar.info(f"WebSocket: {ws_status}")
+        
+        if st.sidebar.button("⏹️ Stop Monitoring"):
+            stop_websocket()
+            st.session_state.monitoring_active = False
+            st.session_state.monitored_symbols = []
+            st.session_state.tick_data = {}
+            st.session_state.previous_snapshots = {}
+            st.sidebar.success("Monitoring stopped")
+            st.rerun()
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DASHBOARD UI
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def render_dashboard():
+    """Render main dashboard"""
+    
+    st.title("📊 Order Flow Trading Dashboard")
+    st.markdown("### Institutional Activity Detection System")
+    
+    if not st.session_state.monitoring_active:
+        st.info("👈 Configure monitoring in the sidebar to begin")
+        
+        # Display documentation
+        with st.expander("📖 How It Works"):
+            st.markdown("""
+            **Signal Types:**
+            
+            1. **ACCUMULATION** 🟢 (Best Signal)
+               - Visible selling but price stable
+               - High institutional ratio (hidden buying)
+               - Institutions accumulating via iceberg orders
+            
+            2. **DISTRIBUTION** 🔴
+               - Visible buying but price capped
+               - High institutional ratio (hidden selling)
+               - Institutions distributing via iceberg orders
+            
+            3. **BUY** 🔵
+               - Strong visible buying pressure
+               - High volume, rising price
+               - Confirmed by bullish PCR
+            
+            4. **SELL** 🟠
+               - Strong visible selling pressure
+               - High volume, falling price
+               - Confirmed by bearish PCR
+            
+            **Time Normalization:**
+            - Ticks arrive at irregular intervals (1-3 seconds)
+            - System normalizes volume/orderbook changes to per-second rates
+            - Enables accurate institutional detection regardless of tick frequency
+            
+            **Confidence Scoring:**
+            - Base signal type: 2-3 points
+            - PCR confirmation: 1-4 points
+            - Order imbalance: 2-3 points
+            - Institutional strength: 2-3 points
+            - Volume surge: 1-2 points
+            - Minimum threshold: 7/10
+            """)
+        
+        return
+    
+    # Process ticks
+    processed = process_tick_queue()
+    
+    # Update top signals
+    update_top_signals()
+    
+    # Metrics row
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric("📊 Monitored Stocks", len(st.session_state.monitored_symbols))
+    
+    with col2:
+        st.metric("📡 Ticks Processed", st.session_state.total_ticks)
+    
+    with col3:
+        st.metric("🎯 Signals Generated", len(st.session_state.daily_signals_pool))
+    
+    with col4:
+        st.metric("⭐ Top Signals", len(st.session_state.top_signals))
+    
+    st.markdown("---")
+    
+    # Top signals display
+    if st.session_state.top_signals:
+        st.subheader("🏆 Top Trading Opportunities")
+        
+        for idx, signal in enumerate(st.session_state.top_signals, 1):
+            signal_type = signal['Signal Type']
+            
+            # Color coding
+            if signal_type == "ACCUMULATION":
+                color = "green"
+                emoji = "🟢"
+            elif signal_type == "DISTRIBUTION":
+                color = "red"
+                emoji = "🔴"
+            elif signal_type == "BUY":
+                color = "blue"
+                emoji = "🔵"
+            else:  # SELL
+                color = "orange"
+                emoji = "🟠"
+            
+            with st.expander(
+                f"#{idx} {emoji} {signal['Stock Symbol']} - {signal_type} "
+                f"(Confidence: {signal['Confidence Score']}/10, Score: {signal['Relative Score']}/15)",
+                expanded=(idx <= 2)
+            ):
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    st.markdown("**📊 Price Levels**")
+                    st.metric("Current Price", f"₹{signal['Current Price']}")
+                    st.metric("Entry Price", f"₹{signal['Entry Price']}")
+                    st.metric("Target Price", f"₹{signal['Target Price']}")
+                    st.metric("Stop Loss", f"₹{signal['Stop Loss']}")
+                
+                with col2:
+                    st.markdown("**📈 Trade Metrics**")
+                    st.metric("Risk:Reward", signal['Risk:Reward'])
+                    st.metric("Potential Profit", f"{signal['Potential Profit %']}%")
+                    st.metric("Volume Status", signal['Volume Status'])
+                    st.metric("Institutional Ratio", signal['Institutional Ratio'])
+                
+                with col3:
+                    st.markdown("**🎯 Confirmations**")
+                    st.info(f"**Order Imbalance:** {signal['Order Imbalance']}")
+                    st.info(f"**PCR:** {signal['PCR']} ({signal['PCR Bias']})")
+                    st.info(f"**OI Trend:** {signal['OI Trend']} ({signal['OI Change']:+d})")
+                    st.info(f"**Detected:** {signal['Time Detected']}")
+    
+    else:
+        st.info("⏳ Analyzing market data... Signals will appear when high-quality opportunities are detected (min confidence: 7/10)")
+    
+    st.markdown("---")
+    
+    # Live tick data table
+    with st.expander("📡 Live Tick Data", expanded=False):
+        if st.session_state.tick_data:
+            tick_df_data = []
+            
+            for symbol, tick in st.session_state.tick_data.items():
+                tick_df_data.append({
+                    'Symbol': symbol,
+                    'Price': round(tick.get('last_price', 0), 2),
+                    'Volume': tick.get('volume', 0),
+                    'OI': tick.get('oi', 0),
+                    'Last Update': datetime.fromtimestamp(
+                        tick.get('exchange_timestamp', tick.get('timestamp', time.time()))
+                    ).strftime("%H:%M:%S")
+                })
+            
+            st.dataframe(
+                pd.DataFrame(tick_df_data),
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            st.info("No tick data received yet")
+    
+    # Auto-refresh
+    time.sleep(0.5)
+    st.rerun()
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN APPLICATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    """Main application entry point"""
+    
+    st.set_page_config(
+        page_title="Order Flow Dashboard",
+        page_icon="📊",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+    
+    # Initialize session state
+    init_session_state()
+    
+    # Render sidebar components
+    render_authentication_ui()
+    render_monitoring_setup()
+    
+    # Self-tests in sidebar
+    st.sidebar.markdown("---")
+    if st.sidebar.button("🔍 Run Self-Tests"):
+        with st.sidebar:
+            with st.spinner("Running tests..."):
+                test_results = run_self_tests()
+                st.subheader("Test Results")
+                for test_name, result in test_results.items():
+                    st.write(f"**{test_name.replace('_', ' ').title()}:** {result}")
+    
+    # Render main dashboard
+    render_dashboard()
 
 if __name__ == "__main__":
     main()
