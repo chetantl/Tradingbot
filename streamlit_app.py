@@ -36,6 +36,14 @@ TICK_DATA_QUEUE = queue.Queue(maxsize=1000)
 CONNECTED = threading.Event()
 WS_INSTANCE = None
 
+# WebSocket error recovery
+WS_RECONNECT_EVENT = threading.Event()
+WS_RECONNECT_LOCK = threading.Lock()
+WS_RECONNECT_COUNT = 0
+WS_MAX_RETRIES = 5
+WS_INITIAL_BACKOFF = 1  # seconds
+WS_LAST_ERROR_TIME = 0
+
 # Trading parameters
 MIN_CONFIDENCE = 7
 MAX_DAILY_SIGNALS = 6
