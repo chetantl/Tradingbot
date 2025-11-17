@@ -1,0 +1,53 @@
+version: '3.8'
+
+services:
+  trading-dashboard:
+    build: .
+    container_name: order-flow-dashboard
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    environment:
+      - ENV=production
+      - LOG_LEVEL=INFO
+      - TZ=Asia/Kolkata
+    volumes:
+      - ./logs:/app/logs
+      - ./data:/app/data
+    networks:
+      - trading-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '0.5'
+        reservations:
+          memory: 512M
+          cpus: '0.25'
+
+  # Optional: Add monitoring service (Prometheus/Grafana can be added later)
+  # monitoring:
+  #   image: prom/prometheus
+  #   container_name: prometheus
+  #   ports:
+  #     - "9090:9090"
+  #   volumes:
+  #     - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+  #   networks:
+  #     - trading-network
+
+networks:
+  trading-network:
+    driver: bridge
+
+volumes:
+  logs:
+    driver: local
+  data:
+    driver: local
