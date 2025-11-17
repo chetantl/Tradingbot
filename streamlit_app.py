@@ -27,10 +27,13 @@ except ImportError:
 try:
     from config import get_config
     from monitoring import get_health_monitor
+    from database import get_signal_persistence, initialize_signal_persistence
 except ImportError:
     logger.warning("Configuration and monitoring modules not available")
     get_config = None
     get_health_monitor = None
+    get_signal_persistence = None
+    initialize_signal_persistence = None
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION & LOGGING
