@@ -260,43 +260,34 @@ frontend/
 └── public/                       # Static assets
 ```
 
-## 🔧 Development
+## 🚀 Production Deployment
 
-### Project Structure
+### Docker Deployment (Recommended)
 
-```
-Tradingbot/
-├── streamlit_app.py          # Main application
-├── config.py                 # Configuration management
-├── monitoring.py             # System health monitoring
-├── database.py               # Signal persistence
-├── requirements.txt          # Python dependencies
-├── Dockerfile               # Docker configuration
-├── docker-compose.yml       # Multi-container setup
-├── .env.example             # Environment template
-├── deploy.sh                # Deployment script
-└── README.md                # This file
+```bash
+# Build and start production containers
+docker-compose -f docker-compose.prod.yml up -d
+
+# Check status
+docker-compose ps
+
+# View logs
+docker-compose logs -f
 ```
 
-### Key Components
+### Manual Production Deployment
 
-1. **WebSocket Manager**: Handles real-time data streaming with reconnection
-2. **Circuit Breaker**: Prevents API overload during failures
-3. **Signal Generator**: Core trading logic with multi-factor analysis
-4. **Health Monitor**: System resource monitoring and alerting
-5. **Persistence Layer**: Optional database for historical analysis
+```bash
+# Backend
+cd backend
+pip install -r requirements.txt
+uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
 
-### Running Tests
-
-The application includes built-in self-tests:
-
-1. Click "🔍 Run Self-Tests" in the sidebar
-2. Tests cover:
-   - Time normalization algorithms
-   - Order imbalance calculations
-   - Signal confidence bounds
-   - Thread safety
-   - Risk calculation accuracy
+# Frontend (build and serve)
+cd frontend
+npm run build
+# Serve build files with nginx or similar
+```
 
 ## 🚨 Production Deployment
 
