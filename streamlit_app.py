@@ -138,13 +138,42 @@ def on_connect(ws, response):
         logger.error(f"Connection callback error: {e}")
 
 def on_close(ws, code, reason):
-    """Handle WebSocket closure"""
+    """Handle WebSocket closure with automatic reconnection"""
+    import time
+
+    global WS_LAST_ERROR_TIME
+    WS_LAST_ERROR_TIME = time.time()
+
     CONNECTED.clear()
     logger.warning(f"WebSocket closed: {code} - {reason}")
 
+    # Trigger reconnection if monitoring is active
+    if 'monitoring_active' in st.session_state and st.session_state.monitoring_active:
+        with WS_RECONNECT_LOCK:
+            global WS_RECONNECT_COUNT
+            if WS_RECONNECT_COUNT < WS_MAX_RETRIES:
+                WS_RECONNECT_EVENT.set()
+                logger.info("🔄 Scheduling WebSocket reconnection...")
+            else:
+                logger.error(f"❌ Max reconnection attempts ({WS_MAX_RETRIES}) reached")
+
 def on_error(ws, code, reason):
-    """Handle WebSocket errors"""
+    """Handle WebSocket errors with reconnection logic"""
+    import time
+
+    global WS_LAST_ERROR_TIME
+    WS_LAST_ERROR_TIME = time.time()
+
     logger.error(f"WebSocket error: {code} - {reason}")
+
+    # For network errors, trigger reconnection
+    if code in [1006, 1000, 1001] or not CONNECTED.is_set():
+        if 'monitoring_active' in st.session_state and st.session_state.monitoring_active:
+            with WS_RECONNECT_LOCK:
+                global WS_RECONNECT_COUNT
+                if WS_RECONNECT_COUNT < WS_MAX_RETRIES:
+                    WS_RECONNECT_EVENT.set()
+                    logger.info(f"🔄 Network error detected, scheduling reconnection...")
 
 def run_websocket(api_key, access_token, tokens):
     """
