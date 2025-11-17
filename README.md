@@ -289,105 +289,121 @@ npm run build
 # Serve build files with nginx or similar
 ```
 
-## 🚨 Production Deployment
+## 📈 Monitoring & Maintenance
 
-### System Requirements
+### Health Checks
 
-- **Minimum**: 1 CPU core, 512MB RAM, 1GB storage
-- **Recommended**: 2 CPU cores, 1GB RAM, 5GB storage
-- **Network**: Stable internet connection for WebSocket streaming
+- **Backend Health**: http://localhost:8000/health
+- **Frontend Status**: Available in dashboard footer
+- **WebSocket Connection**: Status shown in dashboard header
 
-### Security Considerations
+### Logs
 
-- API credentials stored in environment variables
-- Non-root Docker execution
-- Input validation and sanitization
-- HTTPS recommended for production
+- **Backend Logs**: Check console output or log files
+- **Frontend Logs**: Browser developer console
+- **Trading Activity**: Available in dashboard Analytics section
 
-### Monitoring
+### Performance Metrics
 
-The system provides comprehensive monitoring:
+- **WebSocket Latency**: < 100ms target
+- **Signal Processing**: < 1 second from tick to signal
+- **Memory Usage**: < 512MB for 10 instrument monitoring
+- **CPU Usage**: < 50% during market hours
 
-- **Health Endpoint**: `/health` returns system status
-- **Resource Monitoring**: CPU, memory, disk usage
-- **WebSocket Health**: Connection status and reconnection attempts
-- **Circuit Breaker Status**: API failure tracking
+## 🔒 Security
 
-## 🆘 Troubleshooting
+### API Security
+- JWT token-based authentication
+- Secure API key storage in environment variables
+- CORS protection for cross-origin requests
+- Rate limiting on API endpoints
+
+### Data Protection
+- No sensitive data stored in browser localStorage
+- Secure WebSocket connections (WSS in production)
+- API key masking in UI displays
+- Session timeout and automatic logout
+
+## 🐛 Troubleshooting
 
 ### Common Issues
 
-**WebSocket Connection Issues**
-- Check API credentials are correct
-- Verify market hours (9:15 AM - 3:30 PM IST)
-- Check internet connectivity
-- Review logs for specific error messages
+#### 1. WebSocket Connection Failed
+**Solution**: Check backend is running and API credentials are correct
+```bash
+# Verify backend status
+curl http://localhost:8000/health
 
-**No Signals Generated**
-- Lower confidence threshold in configuration
-- Check if symbols are valid and liquid
-- Verify market is open
-- Review signal generation logic in logs
+# Check API credentials
+cat .env | grep KITE_
+```
 
-**High CPU/Memory Usage**
-- Reduce number of monitored symbols
-- Lower tick processing batch size
-- Enable data retention limits
-- Check for memory leaks in logs
+#### 2. Authentication Not Working
+**Solution**: Verify Kite Connect API credentials and complete OAuth flow
+- Ensure API key/secret are correct
+- Complete the full OAuth redirect process
+- Check network connectivity to Zerodha servers
+
+#### 3. No Signals Generating
+**Solution**: Check market hours and instrument selection
+- Verify market is open (9:15 AM - 3:30 PM IST)
+- Ensure selected instruments have sufficient liquidity
+- Check institutional detection threshold settings
+
+#### 4. High Memory Usage
+**Solution**: Reduce monitored instruments or restart application
+```bash
+# Restart backend
+docker-compose restart backend
+
+# Or manually:
+pkill -f "python main.py"
+python main.py
+```
 
 ### Debug Mode
 
-Enable debug logging:
-```bash
-export LOG_LEVEL=DEBUG
-streamlit run streamlit_app.py
+Enable debug logging for troubleshooting:
+
+```env
+# In .env
+LOG_LEVEL=DEBUG
+ENV=development
 ```
 
-## 📚 API Reference
+```env
+# In .env.local
+REACT_APP_LOG_LEVEL=DEBUG
+```
 
-### Core Functions
+## 📞 Support
 
-- `generate_signal()`: Main signal generation logic
-- `detect_institutional_activity_normalized()`: Time-normalized institutional detection
-- `calculate_real_pcr()`: Real Put-Call Ratio calculation
-- `health_check()`: System health status
+### Getting Help
 
-### WebSocket Events
+1. **Check Logs**: Review application logs for error messages
+2. **Documentation**: Refer to this README and inline code comments
+3. **Health Checks**: Verify all components are running correctly
+4. **Community**: Join our trading community for support
 
-- `on_ticks()`: Process incoming tick data
-- `on_connect()`: Handle WebSocket connection
-- `on_close()`: Handle connection closure with reconnection
-- `on_error()`: Handle errors with recovery logic
-
-## 🤝 Contributing
+### Contributing
 
 1. Fork the repository
-2. Create feature branch
-3. Make changes with tests
-4. Submit pull request
+2. Create a feature branch
+3. Make your changes
+4. Test thoroughly
+5. Submit a pull request
 
 ## 📄 License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-## ⚠️ Disclaimer
+## 🙏 Acknowledgments
 
-**IMPORTANT**: This is a trading tool for educational and research purposes. Trading in financial markets involves substantial risk. Past performance is not indicative of future results.
-
-- Use at your own risk
-- Start with paper trading
-- Never risk more than you can afford to lose
-- Consult with financial advisors before trading
-
-## 🆘 Support
-
-For issues and questions:
-
-1. Check the troubleshooting section
-2. Review logs for specific error messages
-3. Create GitHub issue with detailed description
-4. Include system logs and configuration details
+- **Zerodha** for Kite Connect API and market data
+- **FastAPI** team for the excellent web framework
+- **React** and **Material-UI** communities for the frontend framework
+- **WebSocket** standard for real-time data streaming
 
 ---
 
-**Built with ❤️ for the trading community**
+**⚠️ Disclaimer**: This tool is for educational and research purposes only. Trading in financial markets carries substantial risk. Use at your own risk and never risk more than you can afford to lose.
