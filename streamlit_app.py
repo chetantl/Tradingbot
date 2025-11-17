@@ -825,6 +825,26 @@ def get_pcr_cached(symbol: str, current_price: float) -> Tuple[float, str]:
 
         return pcr, bias
 
+@api_circuit_breaker
+def fetch_instruments_safely(kite, exchange="NSE"):
+    """
+    Fetch instruments list with circuit breaker protection.
+
+    Args:
+        kite: KiteConnect instance
+        exchange: Exchange segment
+
+    Returns:
+        List of instruments or empty list if failed
+    """
+    try:
+        instruments = kite.instruments(exchange)
+        logger.info(f"✅ Successfully fetched {len(instruments)} {exchange} instruments")
+        return instruments
+    except Exception as e:
+        logger.error(f"❌ Failed to fetch {exchange} instruments: {e}")
+        return []
+
 def calculate_risk_levels(
     signal_type: str,
     current_price: float,
