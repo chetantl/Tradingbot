@@ -1267,7 +1267,18 @@ def generate_signal(symbol: str, tick_data: Dict) -> Optional[Dict]:
         
         # Calculate relative score for ranking
         signal['Relative Score'] = calculate_relative_score(signal)
-        
+
+        # Save signal to database if persistence is enabled
+        persistence = get_signal_persistence()
+        if persistence:
+            try:
+                signal_id = persistence.save_signal(signal)
+                if signal_id:
+                    signal['Database ID'] = signal_id
+                    logger.debug(f"Signal saved to database: ID {signal_id}")
+            except Exception as e:
+                logger.warning(f"Failed to save signal to database: {e}")
+
         return signal
         
     except Exception as e:
