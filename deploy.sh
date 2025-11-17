@@ -193,52 +193,138 @@ cleanup() {
     docker volume prune -f
 }
 
-# Main deployment flow
-main() {
-    log "Starting Order Flow Trading Dashboard deployment..."
+# Validate environment files
+validate_environment() {
+    print_status "Validating environment configuration..."
 
-    case "${1:-deploy}" in
-        "deploy")
-            check_prerequisites
-            backup_current
-            deploy
-            show_status
-            ;;
-        "status")
-            show_status
-            ;;
-        "stop")
-            info "Stopping services..."
-            docker-compose down
-            ;;
-        "restart")
-            info "Restarting services..."
-            docker-compose restart
-            ;;
-        "logs")
-            docker-compose logs -f trading-dashboard
-            ;;
-        "cleanup")
-            cleanup
-            ;;
-        "backup")
-            backup_current
-            ;;
-        *)
-            echo "Usage: $0 {deploy|status|stop|restart|logs|cleanup|backup}"
-            echo ""
-            echo "Commands:"
-            echo "  deploy   - Full deployment (default)"
-            echo "  status   - Show deployment status"
-            echo "  stop     - Stop services"
-            echo "  restart  - Restart services"
-            echo "  logs     - Show logs"
-            echo "  cleanup  - Cleanup Docker resources"
-            echo "  backup   - Backup current deployment"
-            exit 1
-            ;;
-    esac
+    # Check for required backend environment variables
+    local backend_env="backend/.env.prod"
+    local required_vars=("KITE_API_KEY" "KITE_API_SECRET" "SECRET_KEY")
+
+    for var in "${required_vars[@]}"; do
+        if ! grep -q "^${var}=" "$backend_env" || grep -q "${var}=your_\|${var}=change_this" "$backend_env"; then
+            print_warning "Environment variable $var may not be properly configured in $backend_env"
+        fi
+    done
+
+    print_status "Environment validation completed ✓"
 }
 
-# Run main function with all arguments
+# Build and deploy services
+deploy_services() {
+    print_status "Deploying services with environment: $ENVIRONMENT"
+
+    # Set compose file based on environment
+    if [ "$ENVIRONMENT" = "development" ]; then
+        COMPOSE_FILE="docker-compose.yml"
+    fi
+
+    # Build Docker images
+    print_status "Building Docker images..."
+    docker-compose -f "$COMPOSE_FILE" build --no-cache
+
+    # Start services
+    if [ "$WITH_MONITORING" = true ]; then
+        print_status "Starting services with monitoring..."
+        docker-compose -f "$COMPOSE_FILE" --profile monitoring up -d
+    else
+        print_status "Starting services..."
+        docker-compose -f "$COMPOSE_FILE" up -d
+    fi
+
+    # Wait for services to be ready
+    print_status "Waiting for services to be ready..."
+    sleep 30
+
+    print_status "Deployment completed ✓"
+}
+
+# Health check
+health_check() {
+    print_status "Performing health checks..."
+
+    local services=()
+    if [ "$ENVIRONMENT" = "production" ]; then
+        services=("trading-backend-prod" "trading-frontend-prod" "trading-nginx-prod")
+        if [ "$WITH_MONITORING" = true ]; then
+            services+=("trading-prometheus" "trading-grafana")
+        fi
+    else
+        services=("trading-backend" "trading-frontend" "trading-nginx")
+    fi
+
+    local healthy_services=0
+    local total_services=${#services[@]}
+
+    for service in "${services[@]}"; do
+        if docker-compose -f "$COMPOSE_FILE" ps "$service" | grep -q "Up (healthy)"; then
+            print_status "$service is healthy ✓"
+            ((healthy_services++))
+        else
+            print_warning "$service may not be ready yet"
+        fi
+    done
+
+    if [ $healthy_services -eq $total_services ]; then
+        print_status "All services are healthy! ✓"
+    else
+        print_warning "$healthy_services/$total_services services are healthy"
+        print_status "Check service logs for more information"
+    fi
+}
+
+# Display service URLs
+display_urls() {
+    print_status "Service URLs:"
+    echo ""
+
+    if [ "$ENVIRONMENT" = "production" ]; then
+        echo "  🌐 Main Application: https://yourdomain.com"
+        echo "  🔧 Backend API: https://api.yourdomain.com"
+        echo "  📊 API Documentation: https://api.yourdomain.com/docs"
+
+        if [ "$WITH_MONITORING" = true ]; then
+            echo "  📈 Prometheus: http://yourdomain.com:9090"
+            echo "  📊 Grafana: http://yourdomain.com:3001"
+        fi
+    else
+        echo "  🌐 Frontend: http://localhost:3000"
+        echo "  🔧 Backend API: http://localhost:8000"
+        echo "  📊 API Documentation: http://localhost:8000/docs"
+        echo "  🌐 Nginx Proxy: http://localhost:80"
+    fi
+
+    echo ""
+    print_status "Use 'docker-compose -f $COMPOSE_FILE logs -f' to view logs"
+    print_status "Use 'docker-compose -f $COMPOSE_FILE ps' to check service status"
+}
+
+# Main deployment function
+main() {
+    print_header
+    echo ""
+
+    # Parse command line arguments
+    parse_args "$@"
+
+    # Run deployment steps
+    check_prerequisites
+    validate_environment
+    echo ""
+
+    deploy_services
+    echo ""
+
+    health_check
+    echo ""
+
+    display_urls
+
+    print_status "Deployment completed successfully! 🚀"
+}
+
+# Handle script interruption
+trap 'print_status "Deployment interrupted"; exit 1' INT TERM
+
+# Run main function
 main "$@"
