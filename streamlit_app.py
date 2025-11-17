@@ -1793,9 +1793,13 @@ def render_dashboard():
     
     else:
         st.info("⏳ Analyzing market data... Signals will appear when high-quality opportunities are detected (min confidence: 7/10)")
-    
+
     st.markdown("---")
-    
+
+    # Analytics Section (if persistence is enabled)
+    if get_signal_persistence and get_signal_persistence():
+        render_analytics_section()
+
     # Live tick data table
     with st.expander("📡 Live Tick Data", expanded=False):
         if st.session_state.tick_data:
