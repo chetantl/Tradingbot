@@ -157,38 +157,82 @@ docker-compose up -d
 - **Backend API**: http://localhost:8000
 - **API Documentation**: http://localhost:8000/docs
 
-## ⚙️ Configuration
+## 🔧 Configuration
 
 ### Environment Variables
 
-```bash
-# Environment
-ENV=production
-LOG_LEVEL=INFO
-TZ=Asia/Kolkata
-
-# Zerodha Kite Connect
+#### Backend (`.env`)
+```env
+# Zerodha Kite Connect API
 KITE_API_KEY=your_api_key_here
 KITE_API_SECRET=your_api_secret_here
 
-# Trading Parameters
-MIN_CONFIDENCE=7
-MAX_DAILY_SIGNALS=6
-INSTITUTIONAL_THRESHOLD=2.5
+# Database (optional)
+DATABASE_URL=sqlite:///./trading_dashboard.db
 
-# Features
-ENABLE_REAL_PCR=true
-ENABLE_SIGNAL_PERSISTENCE=false
-ENABLE_PERFORMANCE_TRACKING=true
+# Application Settings
+ENV=development
+LOG_LEVEL=INFO
+SECRET_KEY=your_secret_key_here
+CORS_ORIGINS=["http://localhost:3000"]
+
+# WebSocket Settings
+WS_HEARTBEAT_INTERVAL=30
+WS_MAX_CONNECTIONS=100
 ```
 
-### Key Configuration Options
+#### Frontend (`.env.local`)
+```env
+# API Configuration
+REACT_APP_API_URL=http://localhost:8000
+REACT_APP_WS_URL=ws://localhost:8000
 
-- `MIN_CONFIDENCE`: Minimum confidence score for signals (1-10)
-- `MAX_DAILY_SIGNALS`: Maximum signals to show per day
-- `INSTITUTIONAL_THRESHOLD`: Threshold for institutional detection
-- `ENABLE_SIGNAL_PERSISTENCE`: Save signals to database for analysis
-- `ENABLE_REAL_PCR`: Use real options chain data vs mock data
+# Application Settings
+REACT_APP_ENV=development
+REACT_APP_LOG_LEVEL=INFO
+```
+
+## 📊 Usage Guide
+
+### 1. Initial Authentication
+
+1. Open http://localhost:3000 in your browser
+2. Click "Connect to Zerodha"
+3. Enter your Kite Connect API Key and API Secret
+4. Complete the OAuth flow on Zerodha's website
+5. Return to dashboard - you'll be authenticated automatically
+
+### 2. Setting Up Monitoring
+
+1. **Select Instruments**: Choose stocks/indices to monitor
+2. **Configure Parameters**:
+   - Institutional detection threshold (default: 2.5)
+   - Signal confidence minimum (default: 6/10)
+   - Risk-reward ratio (default: 1:2)
+3. **Start Monitoring**: Click "Start Real-time Monitoring"
+
+### 3. Interpreting Signals
+
+The dashboard generates four types of signals:
+
+- **🟢 ACCUMULATION**: Institutional buying detected
+- **🔴 DISTRIBUTION**: Institutional selling detected
+- **📈 BUY**: Strong bullish momentum with confidence
+- **📉 SELL**: Strong bearish momentum with confidence
+
+Each signal includes:
+- **Confidence Score**: 0-10 scale (higher = more reliable)
+- **Entry Price**: Suggested entry level
+- **Target Price**: Profit target (1:2 risk-reward)
+- **Stop Loss**: Risk management level
+- **PCR Bias**: Market sentiment confirmation
+
+### 4. Real-time Monitoring
+
+- **Live Ticks**: Real-time price and volume data
+- **Signal Pool**: Active signals with countdown timers
+- **Market Metrics**: PCR trends, institutional activity levels
+- **Performance Stats**: Win rate, profit/loss tracking
 
 ## 📱 Getting Started
 
