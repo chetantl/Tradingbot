@@ -1829,6 +1829,215 @@ def render_dashboard():
     st.rerun()
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# ANALYTICS SECTION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def render_analytics_section():
+    """Render analytics and historical performance section"""
+    st.subheader("📈 Analytics & Performance")
+
+    persistence = get_signal_persistence()
+    if not persistence:
+        return
+
+    # Tabs for different analytics views
+    tab1, tab2, tab3 = st.tabs(["📊 Statistics", "📜 Signal History", "🎯 Performance Analysis"])
+
+    with tab1:
+        render_statistics_tab(persistence)
+
+    with tab2:
+        render_signal_history_tab(persistence)
+
+    with tab3:
+        render_performance_analysis_tab(persistence)
+
+def render_statistics_tab(persistence):
+    """Render statistics tab"""
+    col1, col2, col3 = st.columns(3)
+
+    # Time period selector
+    period = st.selectbox("Select Period", [7, 30, 90], index=1, format_func=lambda x: f"Last {x} days")
+
+    try:
+        stats = persistence.get_statistics(days_back=period)
+
+        with col1:
+            st.metric("📊 Total Signals", stats.get('total_signals', 0))
+            st.metric("⭐ Avg Confidence", f"{stats.get('average_confidence', 0):.1f}/10")
+
+        with col2:
+            st.metric("🎯 Win Rate", f"{stats.get('win_rate_percent', 0):.1f}%")
+            st.metric("💰 Avg Profit", f"{stats.get('average_profit_pct', 0):.2f}%")
+
+        with col3:
+            tracked_trades = stats.get('total_tracked_performance', 0)
+            st.metric("📈 Tracked Trades", tracked_trades)
+
+        # Signal type distribution
+        if stats.get('signals_by_type'):
+            st.markdown("#### Signal Distribution")
+            signal_types = stats['signals_by_type']
+
+            # Create bar chart data
+            chart_data = pd.DataFrame(list(signal_types.items()), columns=['Signal Type', 'Count'])
+            st.bar_chart(chart_data.set_index('Signal Type'))
+
+        # Performance breakdown
+        if stats.get('performance_stats'):
+            st.markdown("#### Performance Breakdown")
+            performance = stats['performance_stats']
+
+            perf_data = pd.DataFrame(list(performance.items()), columns=['Result', 'Count'])
+            st.bar_chart(perf_data.set_index('Result'))
+
+    except Exception as e:
+        st.error(f"Failed to load statistics: {e}")
+
+def render_signal_history_tab(persistence):
+    """Render signal history tab"""
+    # Filters
+    col1, col2, col3, col4 = st.columns(4)
+
+    with col1:
+        symbol_filter = st.text_input("Symbol Filter", placeholder="e.g., RELIANCE")
+
+    with col2:
+        signal_type_filter = st.selectbox("Signal Type", ["All", "ACCUMULATION", "DISTRIBUTION", "BUY", "SELL"])
+
+    with col3:
+        min_confidence = st.slider("Min Confidence", 1, 10, 7)
+
+    with col4:
+        hours_back = st.selectbox("Time Period", [24, 72, 168], format_func=lambda x: f"{x//24} days" if x >= 24 else f"{x} hours")
+
+    try:
+        # Apply filters
+        symbol = symbol_filter.upper() if symbol_filter else None
+        signal_type = signal_type_filter if signal_type_filter != "All" else None
+
+        signals = persistence.get_signals(
+            symbol=symbol,
+            signal_type=signal_type,
+            min_confidence=min_confidence,
+            hours_back=hours_back,
+            limit=100
+        )
+
+        if signals:
+            st.info(f"Found {len(signals)} matching signals")
+
+            # Convert to DataFrame for display
+            df_data = []
+            for signal in signals:
+                df_data.append({
+                    'Time': signal.get('created_time', ''),
+                    'Symbol': signal.get('symbol', ''),
+                    'Type': signal.get('signal_type', ''),
+                    'Confidence': signal.get('confidence_score', 0),
+                    'Entry': signal.get('entry_price', 0),
+                    'Target': signal.get('target_price', 0),
+                    'Stop Loss': signal.get('stop_loss', 0),
+                    'Inst Ratio': signal.get('institutional_ratio', 0),
+                    'PCR': signal.get('pcr', 0)
+                })
+
+            df = pd.DataFrame(df_data)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+
+        else:
+            st.info("No signals found matching the criteria")
+
+    except Exception as e:
+        st.error(f"Failed to load signal history: {e}")
+
+def render_performance_analysis_tab(persistence):
+    """Render performance analysis tab"""
+    st.info("📈 Performance analysis allows you to track signal effectiveness over time")
+
+    # Manual trade entry form
+    with st.expander("📝 Record Trade Result", expanded=False):
+        st.markdown("Manually record the outcome of a signal to track performance")
+
+        try:
+            # Get recent signals for selection
+            recent_signals = persistence.get_signals(hours_back=72, limit=20)
+
+            if recent_signals:
+                signal_options = []
+                for signal in recent_signals:
+                    label = f"{signal['symbol']} - {signal['signal_type']} ({signal['created_time']})"
+                    signal_options.append((signal['id'], label))
+
+                selected_signal_id = st.selectbox("Select Signal", signal_options, format_func=lambda x: x[1])
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    status = st.selectbox("Trade Result", ["WIN", "LOSS", "PARTIAL", "CANCELLED"])
+                    exit_price = st.number_input("Exit Price", value=0.0, format="%.2f")
+
+                with col2:
+                    actual_profit = st.number_input("Actual Profit %", value=0.0, format="%.2f")
+                    notes = st.text_area("Notes (optional)")
+
+                if st.button("💾 Save Trade Result"):
+                    try:
+                        persistence.update_signal_performance(
+                            signal_id=selected_signal_id[0],
+                            status=status,
+                            exit_price=exit_price if exit_price > 0 else None,
+                            actual_profit_pct=actual_profit if actual_profit != 0 else None,
+                            notes=notes if notes else None
+                        )
+                        st.success("✅ Trade result saved successfully!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed to save trade result: {e}")
+            else:
+                st.info("No recent signals found")
+
+        except Exception as e:
+            st.error(f"Failed to load recent signals: {e}")
+
+    # Performance summary
+    try:
+        stats = persistence.get_statistics(days_back=30)
+
+        if stats.get('performance_stats'):
+            st.markdown("#### 📊 Recent Performance Summary")
+
+            perf_stats = stats['performance_stats']
+            total_trades = sum(perf_stats.values())
+
+            if total_trades > 0:
+                # Create metrics
+                col1, col2, col3, col4 = st.columns(4)
+
+                with col1:
+                    wins = perf_stats.get('WIN', 0)
+                    win_rate = (wins / total_trades * 100)
+                    st.metric("🎯 Win Rate", f"{win_rate:.1f}%")
+
+                with col2:
+                    losses = perf_stats.get('LOSS', 0)
+                    st.metric("❌ Losses", losses)
+
+                with col3:
+                    partials = perf_stats.get('PARTIAL', 0)
+                    st.metric("⚖️ Partial", partials)
+
+                with col4:
+                    avg_profit = stats.get('average_profit_pct', 0)
+                    profit_color = "green" if avg_profit > 0 else "red"
+                    st.markdown(f"#### Avg Profit: <span style='color:{profit_color}'>{avg_profit:.2f}%</span>", unsafe_allow_html=True)
+
+            else:
+                st.info("No performance data available yet. Start recording trade results to see analytics!")
+
+    except Exception as e:
+        st.error(f"Failed to load performance data: {e}")
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # MAIN APPLICATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
