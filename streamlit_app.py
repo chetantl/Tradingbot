@@ -1856,6 +1856,18 @@ def main():
         except Exception as e:
             logger.warning(f"Health monitoring initialization failed: {e}")
 
+    # Initialize signal persistence if available and enabled
+    if initialize_signal_persistence:
+        try:
+            config = get_config() if get_config else None
+            persistence_enabled = config.features.enable_signal_persistence if config else False
+
+            persistence = initialize_signal_persistence(enabled=persistence_enabled)
+            if persistence:
+                logger.info("Signal persistence initialized")
+        except Exception as e:
+            logger.warning(f"Signal persistence initialization failed: {e}")
+
     # Initialize session state
     init_session_state()
 
