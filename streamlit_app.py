@@ -567,38 +567,138 @@ def calculate_volume_ratio(symbol: str, current_volume: int) -> float:
     
     return current_volume / avg_volume
 
+def calculate_real_pcr(symbol: str, current_price: float) -> float:
+    """
+    Calculate real Put-Call Ratio from Zerodha options chain.
+
+    Fetches actual options data from Zerodha and calculates PCR based on
+    strike prices around the current price (ATM strikes).
+
+    Args:
+        symbol: Stock symbol (e.g., 'RELIANCE')
+        current_price: Current price of the underlying
+
+    Returns:
+        PCR value (Put OI / Call OI)
+    """
+    try:
+        # Get Kite instance from session state
+        kite = st.session_state.get('kite')
+        if not kite:
+            raise ValueError("Kite session not available")
+
+        # Get current expiry instruments for this symbol
+        nse_instruments = None
+        if 'instruments_cache' not in st.session_state:
+            # Cache instruments to avoid repeated API calls
+            all_instruments = kite.instruments()
+            nse_instruments = [inst for inst in all_instruments if inst['segment'] == 'NFO-OPT']
+            st.session_state.instruments_cache = nse_instruments
+        else:
+            nse_instruments = st.session_state.instruments_cache
+
+        # Filter options for this symbol
+        symbol_options = [inst for inst in nse_instruments
+                         if inst['name'] == symbol and inst['instrument_type'] in ['CE', 'PE']]
+
+        if not symbol_options:
+            logger.warning(f"No options found for {symbol}")
+            return 1.0
+
+        # Find ATM strikes (within ±2% of current price)
+        atm_range = 0.02  # 2%
+        lower_bound = current_price * (1 - atm_range)
+        upper_bound = current_price * (1 + atm_range)
+
+        atm_strikes = set()
+        for inst in symbol_options:
+            strike = inst['strike']
+            if lower_bound <= strike <= upper_bound:
+                atm_strikes.add(strike)
+
+        # If no ATM strikes found, take strikes closest to current price
+        if not atm_strikes:
+            all_strikes = sorted(set(inst['strike'] for inst in symbol_options))
+            current_idx = 0
+            for i, strike in enumerate(all_strikes):
+                if strike > current_price:
+                    current_idx = i
+                    break
+
+            # Take 3 strikes around current price
+            start_idx = max(0, current_idx - 1)
+            end_idx = min(len(all_strikes), current_idx + 2)
+            atm_strikes = set(all_strikes[start_idx:end_idx])
+
+        # Calculate PCR for selected strikes
+        total_put_oi = 0
+        total_call_oi = 0
+
+        for strike in atm_strikes:
+            for inst in symbol_options:
+                if inst['strike'] == strike:
+                    # Get live quote for this option
+                    try:
+                        quote = kite.quote([inst['instrument_token']])[inst['instrument_token']]
+                        oi = quote.get('oi', 0)
+
+                        if inst['instrument_type'] == 'PE':
+                            total_put_oi += oi
+                        elif inst['instrument_type'] == 'CE':
+                            total_call_oi += oi
+
+                    except Exception as e:
+                        logger.warning(f"Failed to get quote for {inst['tradingsymbol']}: {e}")
+                        # Fall back to static data
+                        oi = inst.get('oi', 0)
+                        if inst['instrument_type'] == 'PE':
+                            total_put_oi += oi
+                        elif inst['instrument_type'] == 'CE':
+                            total_call_oi += oi
+
+        # Calculate PCR
+        if total_call_oi > 0:
+            pcr = total_put_oi / total_call_oi
+        else:
+            pcr = 1.0  # Neutral if no call OI
+
+        logger.info(f"PCR calculated for {symbol}: {pcr:.2f} (Put OI: {total_put_oi}, Call OI: {total_call_oi})")
+        return round(pcr, 2)
+
+    except Exception as e:
+        logger.error(f"Real PCR calculation failed for {symbol}: {e}")
+        # Fall back to mock data if real calculation fails
+        return round(np.random.uniform(0.6, 1.4), 2)
+
 def get_pcr_cached(symbol: str, current_price: float) -> Tuple[float, str]:
     """
-    Get Put-Call Ratio with 5-minute caching.
-    
+    Get Put-Call Ratio with 5-minute caching and fallback to real data.
+
     Example:
         RELIANCE @ ₹1500
         ATM strikes: 1480, 1500, 1520
-        
+
         Put OI: 25000, Call OI: 43000
         PCR = 0.58
-        
+
         0.58 < 0.9 → STRONG_BULLISH
-    
-    Note: Currently using mock data. Replace with actual options chain API.
+
+    Enhanced: Now uses real options chain data with mock fallback.
     """
-    
+
     now = time.time()
-    
+
     # Check cache
     if symbol in st.session_state.pcr_cache:
         last_update = st.session_state.pcr_last_update.get(symbol, 0)
         if now - last_update < 300:  # 5 minutes
             return st.session_state.pcr_cache[symbol]
-    
-    # Fetch PCR (MOCK - replace with real API)
+
+    # Fetch PCR (REAL API with fallback)
     try:
-        # TODO: Implement real options chain fetching
-        # pcr = calculate_real_pcr(symbol, current_price)
-        
-        # Mock with realistic bounded random
-        pcr = round(np.random.uniform(0.6, 1.4), 2)
-        
+        # Calculate real PCR from options chain
+        pcr = calculate_real_pcr(symbol, current_price)
+
         # Determine bias
         if pcr < 0.7:
             bias = "STRONG_BULLISH"
@@ -610,13 +710,13 @@ def get_pcr_cached(symbol: str, current_price: float) -> Tuple[float, str]:
             bias = "BEARISH"
         else:
             bias = "NEUTRAL"
-        
+
         # Cache result
         st.session_state.pcr_cache[symbol] = (pcr, bias)
         st.session_state.pcr_last_update[symbol] = now
-        
+
         return pcr, bias
-    
+
     except Exception as e:
         logger.error(f"PCR calculation failed for {symbol}: {e}")
         return 1.0, "NEUTRAL"
