@@ -291,6 +291,81 @@ class WebSocketManager:
 # Global WebSocket manager instance
 ws_manager = WebSocketManager(max_retries=WS_MAX_RETRIES, initial_backoff=WS_INITIAL_BACKOFF)
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# CIRCUIT BREAKER PATTERN
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class CircuitBreaker:
+    """
+    Circuit breaker pattern for API calls to prevent cascading failures.
+
+    Automatically opens circuit when failures exceed threshold, temporarily
+    blocking calls to prevent overloading failing services.
+    """
+
+    def __init__(self, failure_threshold=5, recovery_timeout=60, expected_exception=Exception):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.expected_exception = expected_exception
+
+        self.failure_count = 0
+        self.last_failure_time = None
+        self.state = 'CLOSED'  # CLOSED, OPEN, HALF_OPEN
+
+    def __call__(self, func):
+        """Decorator to wrap function with circuit breaker logic"""
+        def wrapper(*args, **kwargs):
+            if self.state == 'OPEN':
+                if time.time() - self.last_failure_time >= self.recovery_timeout:
+                    self.state = 'HALF_OPEN'
+                    logger.info("🔓 Circuit breaker transitioning to HALF_OPEN")
+                else:
+                    raise Exception("Circuit breaker OPEN - call blocked")
+
+            try:
+                result = func(*args, **kwargs)
+
+                # Success - reset failure count
+                if self.state == 'HALF_OPEN':
+                    self.state = 'CLOSED'
+                    self.failure_count = 0
+                    logger.info("🔒 Circuit breaker CLOSED after successful call")
+
+                return result
+
+            except self.expected_exception as e:
+                self.failure_count += 1
+                self.last_failure_time = time.time()
+
+                if self.failure_count >= self.failure_threshold:
+                    self.state = 'OPEN'
+                    logger.error(f"🚨 Circuit breaker OPENED after {self.failure_count} failures")
+
+                raise e
+
+        return wrapper
+
+    def reset(self):
+        """Manually reset circuit breaker to CLOSED state"""
+        self.failure_count = 0
+        self.last_failure_time = None
+        self.state = 'CLOSED'
+        logger.info("🔒 Circuit breaker manually reset to CLOSED")
+
+    def get_status(self):
+        """Get current circuit breaker status"""
+        return {
+            'state': self.state,
+            'failure_count': self.failure_count,
+            'failure_threshold': self.failure_threshold,
+            'last_failure_time': self.last_failure_time,
+            'recovery_timeout': self.recovery_timeout
+        }
+
+# Circuit breaker instances for different services
+pcr_circuit_breaker = CircuitBreaker(failure_threshold=3, recovery_timeout=300)  # 5 min recovery
+api_circuit_breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=60)    # 1 min recovery
+
 def run_websocket(api_key, access_token, tokens):
     """
     Enhanced WebSocket connection with automatic reconnection.
