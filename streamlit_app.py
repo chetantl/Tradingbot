@@ -1268,15 +1268,30 @@ def render_monitoring_setup():
         st.sidebar.info(f"📈 Stocks: {', '.join(st.session_state.monitored_symbols[:3])}...")
         st.sidebar.metric("Total Ticks Processed", st.session_state.total_ticks)
         
-        ws_status = "🟢 Connected" if CONNECTED.is_set() else "🔴 Disconnected"
-        st.sidebar.info(f"WebSocket: {ws_status}")
-        
+        # Enhanced WebSocket status
+        ws_health = get_websocket_health()
+        status_emoji = "🟢" if ws_health['connected'] else "🔴"
+
+        if ws_health['status'] == 'Reconnecting':
+            status_emoji = "🔄"
+        elif ws_health['status'] == 'Failed - Max Retries':
+            status_emoji = "❌"
+        elif ws_health['status'] == 'Recovered':
+            status_emoji = "✅"
+
+        st.sidebar.info(f"WebSocket: {status_emoji} {ws_health['status']}")
+
+        if ws_health['reconnect_count'] > 0:
+            st.sidebar.caption(f"🔄 Reconnect attempts: {ws_health['reconnect_count']}/{ws_health['max_retries']}")
+
         if st.sidebar.button("⏹️ Stop Monitoring"):
             stop_websocket()
             st.session_state.monitoring_active = False
             st.session_state.monitored_symbols = []
             st.session_state.tick_data = {}
             st.session_state.previous_snapshots = {}
+            st.session_state.connection_errors = 0
+            st.session_state.last_connection_status = 'Disconnected'
             st.sidebar.success("Monitoring stopped")
             st.rerun()
 
