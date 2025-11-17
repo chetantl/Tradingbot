@@ -234,63 +234,31 @@ Each signal includes:
 - **Market Metrics**: PCR trends, institutional activity levels
 - **Performance Stats**: Win rate, profit/loss tracking
 
-## 📱 Getting Started
+## 🏗️ Architecture
 
-### 1. Authentication
+### Backend (FastAPI)
+```
+backend/
+├── main.py              # FastAPI application and WebSocket endpoints
+├── trading_system.py    # Core trading logic and signal generation
+├── database.py          # Database operations and persistence
+├── auth.py             # JWT authentication and Kite Connect integration
+├── monitoring.py        # System health monitoring
+└── requirements.txt     # Python dependencies
+```
 
-1. Open the dashboard in your browser
-2. Enter your Zerodha API credentials in the sidebar
-3. Click "Generate Login URL"
-4. Authorize on Zerodha website
-5. Copy the `request_token` from redirect URL
-6. Paste it in the dashboard and complete login
-
-### 2. Monitoring Setup
-
-1. Enter stock symbols (one per line):
-   ```
-   RELIANCE
-   TCS
-   INFY
-   HDFCBANK
-   SBIN
-   ```
-
-2. Click "Start Monitoring"
-3. System will begin real-time analysis
-
-### 3. Interpreting Signals
-
-**High-Conviction Signals (9-10/10):**
-- ACCUMULATION with bullish PCR
-- DISTRIBUTION with bearish PCR
-- Strong institutional ratio (>4.0)
-- High volume surge (>2x average)
-
-**Medium-Conviction Signals (7-8/10):**
-- Good institutional detection
-- Moderate volume surge
-- Reasonable PCR confirmation
-
-## 📈 Analytics & Performance
-
-When `ENABLE_SIGNAL_PERSISTENCE=true`, the system provides:
-
-### Statistics Dashboard
-- Total signals generated
-- Win rate analysis
-- Average profit/loss
-- Signal type distribution
-
-### Historical Analysis
-- Filter signals by symbol, type, confidence
-- View performance over time
-- Track effectiveness of different strategies
-
-### Performance Tracking
-- Manually record trade results
-- Calculate win rates and profitability
-- Identify best performing signal types
+### Frontend (React)
+```
+frontend/
+├── src/
+│   ├── App.js                    # Main application with routing
+│   ├── contexts/                 # React contexts (Auth, WebSocket, Notifications)
+│   ├── pages/                    # Page components (Dashboard, Analytics, Settings)
+│   ├── components/               # Reusable UI components
+│   └── utils/                    # Utility functions and helpers
+├── package.json                  # Node.js dependencies
+└── public/                       # Static assets
+```
 
 ## 🔧 Development
 
