@@ -646,9 +646,10 @@ def calculate_volume_ratio(symbol: str, current_volume: int) -> float:
     
     return current_volume / avg_volume
 
-def calculate_real_pcr(symbol: str, current_price: float) -> float:
+@pcr_circuit_breaker
+def calculate_real_pcr_protected(symbol: str, current_price: float) -> float:
     """
-    Calculate real Put-Call Ratio from Zerodha options chain.
+    Calculate real Put-Call Ratio from Zerodha options chain with circuit breaker protection.
 
     Fetches actual options data from Zerodha and calculates PCR based on
     strike prices around the current price (ATM strikes).
