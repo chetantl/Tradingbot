@@ -77,55 +77,85 @@ Institutional Activity (Iceberg):
 - Volume surge: 1-2 points
 - **Minimum threshold: 7/10**
 
-## 🛠️ Installation
+## 📋 Prerequisites
 
-### Prerequisites
-
+- Node.js 16+ and npm
 - Python 3.8+
 - Zerodha Kite Connect API credentials
-- Docker (for production deployment)
+- Git
 
-### Quick Start
+## 🛠️ Quick Start
 
-1. **Clone the repository**
-   ```bash
-   git clone <repository-url>
-   cd Tradingbot
-   ```
+### 1. Clone the Repository
 
-2. **Install dependencies**
-   ```bash
-   pip install -r requirements.txt
-   ```
+```bash
+git clone <repository-url>
+cd Tradingbot
+```
 
-3. **Set up environment**
-   ```bash
-   cp .env.example .env
-   # Edit .env with your API credentials
-   ```
+### 2. Backend Setup
 
-4. **Run the dashboard**
-   ```bash
-   streamlit run streamlit_app.py --server.enableCORS false --server.enableXsrfProtection false
-   ```
+```bash
+# Navigate to backend directory
+cd backend
 
-### Docker Deployment
+# Create Python virtual environment
+python -m venv venv
 
-1. **Build and run with Docker Compose**
-   ```bash
-   # Copy environment file
-   cp .env.example .env
+# Activate virtual environment
+# On Windows:
+venv\Scripts\activate
+# On macOS/Linux:
+source venv/bin/activate
 
-   # Edit configuration
-   nano .env
+# Install dependencies
+pip install -r requirements.txt
 
-   # Deploy
-   chmod +x deploy.sh
-   ./deploy.sh
-   ```
+# Create environment file
+cp .env.example .env
+# Edit .env with your Zerodha API credentials
+```
 
-2. **Access the dashboard**
-   - Open http://localhost:8501 in your browser
+### 3. Frontend Setup
+
+```bash
+# Navigate to frontend directory (from project root)
+cd frontend
+
+# Install dependencies
+npm install
+
+# Create environment file
+cp .env.example .env.local
+# Edit .env.local with your API configuration
+```
+
+### 4. Start the Applications
+
+#### Option A: Development Mode (Recommended for first-time setup)
+
+```bash
+# Terminal 1: Start backend
+cd backend
+python main.py
+
+# Terminal 2: Start frontend (new terminal)
+cd frontend
+npm start
+```
+
+#### Option B: Docker Deployment
+
+```bash
+# From project root
+docker-compose up -d
+```
+
+### 5. Access the Dashboard
+
+- **Frontend**: http://localhost:3000
+- **Backend API**: http://localhost:8000
+- **API Documentation**: http://localhost:8000/docs
 
 ## ⚙️ Configuration
 
