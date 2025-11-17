@@ -377,6 +377,123 @@ class CircuitBreaker:
 pcr_circuit_breaker = CircuitBreaker(failure_threshold=3, recovery_timeout=300)  # 5 min recovery
 api_circuit_breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=60)    # 1 min recovery
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# HEALTH CHECK ENDPOINT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def health_check():
+    """
+    Comprehensive health check endpoint for monitoring systems.
+
+    Returns JSON health status for:
+    - Application status
+    - WebSocket connection
+    - System resources
+    - Circuit breakers
+    - Trading system health
+    """
+    try:
+        health_status = {
+            'status': 'healthy',
+            'timestamp': datetime.now().isoformat(),
+            'uptime': time.time() - start_time if 'start_time' in globals() else 0,
+            'version': '1.0.0'
+        }
+
+        # System resources
+        try:
+            cpu_percent = psutil.cpu_percent(interval=1)
+            memory = psutil.virtual_memory()
+            disk = psutil.disk_usage('/')
+
+            health_status['system'] = {
+                'cpu_percent': cpu_percent,
+                'memory_percent': memory.percent,
+                'memory_available_mb': memory.available / 1024 / 1024,
+                'disk_percent': disk.percent
+            }
+
+            # Determine if system resources are healthy
+            if cpu_percent > 90 or memory.percent > 90 or disk.percent > 95:
+                health_status['status'] = 'unhealthy'
+            elif cpu_percent > 75 or memory.percent > 75 or disk.percent > 85:
+                health_status['status'] = 'degraded'
+
+        except Exception as e:
+            health_status['system'] = {'error': str(e)}
+            health_status['status'] = 'unhealthy'
+
+        # WebSocket status
+        ws_health = get_websocket_health()
+        health_status['websocket'] = {
+            'connected': ws_health['connected'],
+            'status': ws_health['status'],
+            'reconnect_count': ws_health['reconnect_count'],
+            'max_retries': ws_health['max_retries']
+        }
+
+        if not ws_health['connected'] and ws_health['status'] not in ['Disconnected']:
+            health_status['status'] = 'degraded'
+
+        # Circuit breaker status
+        health_status['circuit_breakers'] = {
+            'pcr': pcr_circuit_breaker.get_status(),
+            'api': api_circuit_breaker.get_status()
+        }
+
+        # Check if any circuit breakers are open
+        if (pcr_circuit_breaker.state == 'OPEN' or api_circuit_breaker.state == 'OPEN'):
+            if health_status['status'] == 'healthy':
+                health_status['status'] = 'degraded'
+
+        # Application-specific health
+        if 'monitoring_active' in st.session_state and st.session_state.monitoring_active:
+            health_status['trading'] = {
+                'monitoring_active': True,
+                'monitored_symbols': len(st.session_state.monitored_symbols),
+                'total_ticks': st.session_state.total_ticks,
+                'signals_generated': len(st.session_state.daily_signals_pool)
+            }
+        else:
+            health_status['trading'] = {
+                'monitoring_active': False,
+                'message': 'Trading monitoring not active'
+            }
+
+        # Additional health monitoring if available
+        if get_health_monitor:
+            try:
+                monitor = get_health_monitor()
+                system_health = monitor.get_system_health()
+                performance = monitor.get_performance_metrics()
+                recent_alerts = monitor.get_recent_alerts(hours=1)
+
+                health_status['monitoring'] = {
+                    'system_health': system_health,
+                    'performance': performance,
+                    'recent_alerts_count': len(recent_alerts)
+                }
+
+                if system_health['status'] == 'Critical':
+                    health_status['status'] = 'unhealthy'
+                elif system_health['status'] == 'Warning' and health_status['status'] == 'healthy':
+                    health_status['status'] = 'degraded'
+
+            except Exception as e:
+                health_status['monitoring'] = {'error': str(e)}
+
+        return health_status
+
+    except Exception as e:
+        return {
+            'status': 'unhealthy',
+            'timestamp': datetime.now().isoformat(),
+            'error': str(e)
+        }
+
+# Global start time for uptime tracking
+start_time = time.time()
+
 def run_websocket(api_key, access_token, tokens):
     """
     Enhanced WebSocket connection with automatic reconnection.
