@@ -328,17 +328,57 @@ def start_websocket_thread(api_key, access_token, tokens):
     logger.info("🚀 WebSocket thread started")
 
 def stop_websocket():
-    """Stop WebSocket connection"""
-    global WS_INSTANCE
-    
-    if WS_INSTANCE:
-        try:
+    """Stop WebSocket connection and reconnection monitoring"""
+    global WS_INSTANCE, WS_RECONNECT_COUNT
+
+    try:
+        # Stop reconnection monitor
+        ws_manager.is_running = False
+        WS_RECONNECT_EVENT.clear()
+        WS_RECONNECT_COUNT = 0
+
+        # Close WebSocket connection
+        if WS_INSTANCE:
             WS_INSTANCE.close()
             WS_INSTANCE = None
-            CONNECTED.clear()
-            logger.info("WebSocket stopped")
-        except Exception as e:
-            logger.error(f"Error stopping WebSocket: {e}")
+
+        CONNECTED.clear()
+        logger.info("🛑 WebSocket and reconnection monitor stopped")
+
+    except Exception as e:
+        logger.error(f"❌ Error stopping WebSocket: {e}")
+
+def get_websocket_health() -> Dict:
+    """
+    Get WebSocket connection health status for monitoring.
+
+    Returns:
+        Dict with connection health information
+    """
+    health = {
+        'connected': CONNECTED.is_set(),
+        'last_error_time': WS_LAST_ERROR_TIME,
+        'reconnect_count': WS_RECONNECT_COUNT,
+        'max_retries': WS_MAX_RETRIES,
+        'time_since_error': 0,
+        'status': 'Connected' if CONNECTED.is_set() else 'Disconnected'
+    }
+
+    if WS_LAST_ERROR_TIME > 0:
+        health['time_since_error'] = time.time() - WS_LAST_ERROR_TIME
+
+    # Determine health status
+    if not CONNECTED.is_set():
+        if WS_RECONNECT_COUNT >= WS_MAX_RETRIES:
+            health['status'] = 'Failed - Max Retries'
+        elif WS_RECONNECT_COUNT > 0:
+            health['status'] = 'Reconnecting'
+        else:
+            health['status'] = 'Disconnected'
+    elif WS_RECONNECT_COUNT > 0:
+        health['status'] = 'Recovered'
+
+    return health
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CORE CALCULATION FUNCTIONS
