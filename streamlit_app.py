@@ -175,35 +175,139 @@ def on_error(ws, code, reason):
                     WS_RECONNECT_EVENT.set()
                     logger.info(f"🔄 Network error detected, scheduling reconnection...")
 
+class WebSocketManager:
+    """
+    WebSocket connection manager with automatic reconnection and exponential backoff.
+
+    Handles connection failures, network interruptions, and provides robust
+    reconnection logic for production deployment.
+    """
+
+    def __init__(self, max_retries=5, initial_backoff=1):
+        self.max_retries = max_retries
+        self.initial_backoff = initial_backoff
+        self.retry_count = 0
+        self.is_running = False
+
+    def connect_with_retry(self, api_key, access_token, tokens):
+        """
+        Connect to WebSocket with exponential backoff retry logic.
+
+        Args:
+            api_key: Zerodha API key
+            access_token: Session access token
+            tokens: List of instrument tokens to subscribe
+
+        Returns:
+            bool: True if connection successful, False after max retries
+        """
+        global WS_RECONNECT_COUNT, WS_INSTANCE
+
+        while self.retry_count < self.max_retries:
+            try:
+                logger.info(f"🔌 Connecting WebSocket (attempt {self.retry_count + 1}/{self.max_retries})...")
+
+                # Create new WebSocket instance
+                kws = KiteTicker(api_key, access_token)
+                kws.on_ticks = on_ticks
+                kws.on_connect = on_connect
+                kws.on_close = on_close
+                kws.on_error = on_error
+
+                # Store tokens for subscription
+                kws._tokens_to_subscribe = tokens
+
+                WS_INSTANCE = kws
+                WS_RECONNECT_COUNT = self.retry_count
+
+                # Connect with threading
+                kws.connect(threaded=True)
+
+                # Wait for connection or timeout
+                connection_timeout = 30  # seconds
+                start_time = time.time()
+
+                while not CONNECTED.is_set() and (time.time() - start_time) < connection_timeout:
+                    time.sleep(0.1)
+
+                if CONNECTED.is_set():
+                    logger.info(f"✅ WebSocket connected successfully on attempt {self.retry_count + 1}")
+                    self.retry_count = 0  # Reset on success
+                    return True
+                else:
+                    logger.warning(f"⏰ Connection timeout on attempt {self.retry_count + 1}")
+                    kws.close()
+
+            except Exception as e:
+                logger.error(f"❌ WebSocket connection failed (attempt {self.retry_count + 1}): {e}")
+
+            # Increment retry count and apply backoff
+            self.retry_count += 1
+
+            if self.retry_count < self.max_retries:
+                backoff = self.initial_backoff * (2 ** (self.retry_count - 1))
+                backoff = min(backoff, 60)  # Cap at 60 seconds
+
+                logger.info(f"⏱️ Waiting {backoff:.1f}s before reconnection attempt {self.retry_count + 1}")
+                time.sleep(backoff)
+
+        logger.error(f"❌ All {self.max_retries} connection attempts failed")
+        return False
+
+    def start_reconnection_monitor(self, api_key, access_token, tokens):
+        """
+        Start background monitoring for reconnection events.
+
+        Args:
+            api_key: Zerodha API key
+            access_token: Session access token
+            tokens: List of instrument tokens to subscribe
+        """
+        def monitor_reconnection():
+            while self.is_running:
+                # Wait for reconnection event
+                if WS_RECONNECT_EVENT.wait(timeout=1):
+                    WS_RECONNECT_EVENT.clear()
+
+                    if not CONNECTED.is_set() and self.is_running:
+                        logger.info("🔄 Reconnection event triggered, attempting to reconnect...")
+                        self.connect_with_retry(api_key, access_token, tokens)
+
+        self.is_running = True
+        monitor_thread = threading.Thread(target=monitor_reconnection, daemon=True)
+        monitor_thread.start()
+        logger.info("👁️ WebSocket reconnection monitor started")
+
+# Global WebSocket manager instance
+ws_manager = WebSocketManager(max_retries=WS_MAX_RETRIES, initial_backoff=WS_INITIAL_BACKOFF)
+
 def run_websocket(api_key, access_token, tokens):
     """
-    Background thread function.
-    Must use threaded=True for Streamlit compatibility.
-    
+    Enhanced WebSocket connection with automatic reconnection.
+
     Args:
         api_key: Zerodha API key
         access_token: Session access token
         tokens: List of instrument tokens to subscribe
     """
-    global WS_INSTANCE
-    
+    global WS_RECONNECT_COUNT
+
     try:
-        kws = KiteTicker(api_key, access_token)
-        kws.on_ticks = on_ticks
-        kws.on_connect = on_connect
-        kws.on_close = on_close
-        kws.on_error = on_error
-        
-        # Store tokens on WebSocket instance (accessible in callback)
-        kws._tokens_to_subscribe = tokens
-        
-        WS_INSTANCE = kws
-        
-        # CRITICAL: threaded=True for Streamlit
-        kws.connect(threaded=True)
-        
+        # Reset reconnection count
+        WS_RECONNECT_COUNT = 0
+
+        # Connect with retry logic
+        success = ws_manager.connect_with_retry(api_key, access_token, tokens)
+
+        if success:
+            # Start reconnection monitor
+            ws_manager.start_reconnection_monitor(api_key, access_token, tokens)
+        else:
+            CONNECTED.clear()
+            logger.error("❌ WebSocket setup failed after all retry attempts")
+
     except Exception as e:
-        logger.error(f"WebSocket thread error: {e}")
+        logger.error(f"WebSocket setup error: {e}")
         CONNECTED.clear()
 
 def start_websocket_thread(api_key, access_token, tokens):
