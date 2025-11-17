@@ -13,6 +13,8 @@ import queue
 import threading
 from typing import Dict, List, Tuple, Optional
 import json
+import psutil
+import os
 
 # Zerodha Kite Connect imports
 try:
@@ -20,6 +22,15 @@ try:
 except ImportError:
     st.error("⚠️ kiteconnect library not installed. Run: pip install kiteconnect")
     st.stop()
+
+# Import configuration and monitoring
+try:
+    from config import get_config
+    from monitoring import get_health_monitor
+except ImportError:
+    logger.warning("Configuration and monitoring modules not available")
+    get_config = None
+    get_health_monitor = None
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION & LOGGING
