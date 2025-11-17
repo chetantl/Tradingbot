@@ -36,37 +36,88 @@ print_header() {
     echo -e "${BLUE}================================${NC}"
 }
 
+# Function to display usage
+usage() {
+    echo "Usage: $0 [OPTIONS]"
+    echo ""
+    echo "Options:"
+    echo "  -e, --env ENVIRONMENT    Set environment (development|production) [default: production]"
+    echo "  -m, --monitoring        Enable monitoring stack (Prometheus, Grafana)"
+    echo "  -f, --file FILE         Use specific docker-compose file"
+    echo "  -h, --help              Show this help message"
+    echo ""
+    echo "Examples:"
+    echo "  $0                      # Deploy production version"
+    echo "  $0 -e development       # Deploy development version"
+    echo "  $0 -m                   # Deploy with monitoring enabled"
+    echo "  $0 -f docker-compose.yml  # Use custom compose file"
+}
+
+# Parse command line arguments
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -e|--env)
+                ENVIRONMENT="$2"
+                shift 2
+                ;;
+            -m|--monitoring)
+                WITH_MONITORING=true
+                shift
+                ;;
+            -f|--file)
+                COMPOSE_FILE="$2"
+                shift 2
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                print_error "Unknown option: $1"
+                usage
+                exit 1
+                ;;
+        esac
+    done
+}
+
 # Check prerequisites
 check_prerequisites() {
-    log "Checking prerequisites..."
+    print_status "Checking prerequisites..."
 
     # Check if Docker is installed
     if ! command -v docker &> /dev/null; then
-        error "Docker is not installed. Please install Docker first."
+        print_error "Docker is required but not installed!"
+        exit 1
     fi
 
     # Check if Docker Compose is installed
     if ! command -v docker-compose &> /dev/null; then
-        error "Docker Compose is not installed. Please install Docker Compose first."
-    fi
-
-    # Check if .env file exists
-    if [ ! -f .env ]; then
-        warning ".env file not found. Creating from template..."
-        cp .env.example .env
-        warning "Please edit .env file with your configuration before running again."
+        print_error "Docker Compose is required but not installed!"
         exit 1
     fi
 
-    # Check if required files exist
-    required_files=("streamlit_app.py" "requirements.txt" "Dockerfile" "docker-compose.yml")
-    for file in "${required_files[@]}"; do
-        if [ ! -f "$file" ]; then
-            error "Required file $file not found."
-        fi
-    done
+    # Check if compose file exists
+    if [ ! -f "$COMPOSE_FILE" ]; then
+        print_error "Docker Compose file not found: $COMPOSE_FILE"
+        exit 1
+    fi
 
-    log "Prerequisites check completed."
+    # Check if .env files exist
+    if [ ! -f "backend/.env.prod" ]; then
+        print_error "Production environment file not found: backend/.env.prod"
+        print_status "Please create it from backend/.env.prod.example"
+        exit 1
+    fi
+
+    if [ ! -f "frontend/.env.production" ]; then
+        print_error "Frontend environment file not found: frontend/.env.production"
+        print_status "Please create it from frontend/.env.example"
+        exit 1
+    fi
+
+    print_status "Prerequisites verified ✓"
 }
 
 # Backup current deployment
