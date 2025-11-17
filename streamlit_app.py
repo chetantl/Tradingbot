@@ -1441,8 +1441,12 @@ def render_monitoring_setup():
                 return
             
             try:
-                # Fetch instrument list
-                instruments = st.session_state.kite.instruments("NSE")
+                # Fetch instrument list with circuit breaker protection
+                instruments = fetch_instruments_safely(st.session_state.kite, "NSE")
+
+                if not instruments:
+                    st.sidebar.error("❌ Unable to fetch instruments. Market may be closed or API limit reached.")
+                    return
                 
                 # Map symbols to tokens
                 token_map = {}
