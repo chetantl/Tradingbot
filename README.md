@@ -1,28 +1,32 @@
-# Order Flow Trading Dashboard
+# Professional Order Flow Trading Dashboard
 
-A production-ready, real-time institutional order flow detection system for stock options trading. Built with Streamlit and powered by Zerodha Kite Connect API.
+A sophisticated, production-ready institutional order flow detection system built with FastAPI backend and React frontend. This dashboard provides real-time trading signals with confidence scoring, PCR analysis, and professional UI for monitoring institutional trading activity.
 
 ## 🚀 Features
 
 ### Core Trading System
-- **Real-time WebSocket Streaming**: Live market data with automatic reconnection
-- **Time-Normalized Analysis**: Sophisticated algorithm for accurate institutional detection
-- **Four Signal Types**: ACCUMULATION, DISTRIBUTION, BUY, SELL with confidence scoring
-- **Dynamic Risk Management**: Automatic entry/target/stop-loss calculation from orderbook
-- **Put-Call Ratio Integration**: Real-time options market sentiment analysis
+- **Real-time WebSocket streaming** with Zerodha Kite Connect integration
+- **Time-normalized institutional detection** identifying iceberg orders
+- **Multi-factor signal generation** (ACCUMULATION, DISTRIBUTION, BUY, SELL)
+- **Confidence scoring** (0-10 scale) with relative ranking (0-15 points)
+- **Put-Call Ratio (PCR) analysis** with bias classification
+- **Dynamic risk management** with entry/target/stop-loss calculations
+
+### Professional Dashboard
+- **Modern React frontend** with Material-UI components
+- **Real-time signal display** with professional dark theme
+- **WebSocket integration** with automatic reconnection
+- **JWT authentication** with secure session management
+- **Responsive design** optimized for desktop and tablet
+- **Comprehensive error handling** with user-friendly messages
 
 ### Production Features
-- **Circuit Breaker Pattern**: Prevents cascading failures during API issues
-- **Automatic Error Recovery**: WebSocket reconnection with exponential backoff
-- **Health Monitoring**: Comprehensive system health checks and alerts
-- **Signal Persistence**: Optional SQLite database for historical analysis
-- **Performance Analytics**: Track win rates, profitability, and signal effectiveness
-
-### Infrastructure
-- **Docker Support**: Production-ready containerization
-- **Configuration Management**: Environment-based configuration system
-- **Monitoring**: System resource monitoring and alerting
-- **Security**: Non-root user execution and input validation
+- **FastAPI backend** with automatic API documentation
+- **Circuit breaker patterns** for API resilience
+- **System monitoring** with health checks
+- **Docker deployment** ready
+- **Environment-based configuration**
+- **Comprehensive logging** and error tracking
 
 ## 📊 How It Works
 
