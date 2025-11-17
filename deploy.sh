@@ -1,9 +1,9 @@
 #!/bin/bash
 
-# Order Flow Trading Dashboard - Production Deployment Script
-# This script handles deployment with proper error handling and rollback
+# Professional Trading Dashboard - Production Deployment Script
+# This script handles production deployment using Docker Compose
 
-set -e  # Exit on any error
+set -e
 
 # Colors for output
 RED='\033[0;31m'
@@ -12,22 +12,28 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# Logging function
-log() {
-    echo -e "${GREEN}[$(date +'%Y-%m-%d %H:%M:%S')] $1${NC}"
+# Default values
+ENVIRONMENT="production"
+COMPOSE_FILE="docker-compose.prod.yml"
+WITH_MONITORING=false
+
+# Function to print colored output
+print_status() {
+    echo -e "${GREEN}[INFO]${NC} $1"
 }
 
-error() {
-    echo -e "${RED}[$(date +'%Y-%m-%d %H:%M:%S')] ERROR: $1${NC}"
-    exit 1
+print_warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $1"
 }
 
-warning() {
-    echo -e "${YELLOW}[$(date +'%Y-%m-%d %H:%M:%S')] WARNING: $1${NC}"
+print_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
 }
 
-info() {
-    echo -e "${BLUE}[$(date +'%Y-%m-%d %H:%M:%S')] INFO: $1${NC}"
+print_header() {
+    echo -e "${BLUE}================================${NC}"
+    echo -e "${BLUE}  Trading Dashboard Deployment${NC}"
+    echo -e "${BLUE}================================${NC}"
 }
 
 # Check prerequisites
