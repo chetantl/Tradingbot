@@ -105,6 +105,10 @@ def init_session_state():
     if 'last_connection_status' not in st.session_state:
         st.session_state.last_connection_status = 'Disconnected'
 
+    # Instruments cache for PCR calculation
+    if 'instruments_cache' not in st.session_state:
+        st.session_state.instruments_cache = None
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # WEBSOCKET IMPLEMENTATION (THREAD-SAFE)
 # ═══════════════════════════════════════════════════════════════════════════════
