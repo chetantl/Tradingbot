@@ -99,6 +99,12 @@ def init_session_state():
     if 'volume_history' not in st.session_state:
         st.session_state.volume_history = {}
 
+    # Connection monitoring
+    if 'connection_errors' not in st.session_state:
+        st.session_state.connection_errors = 0
+    if 'last_connection_status' not in st.session_state:
+        st.session_state.last_connection_status = 'Disconnected'
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # WEBSOCKET IMPLEMENTATION (THREAD-SAFE)
 # ═══════════════════════════════════════════════════════════════════════════════
