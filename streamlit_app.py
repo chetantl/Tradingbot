@@ -1816,21 +1816,47 @@ def render_dashboard():
 
 def main():
     """Main application entry point"""
-    
+
     st.set_page_config(
         page_title="Order Flow Dashboard",
         page_icon="📊",
         layout="wide",
         initial_sidebar_state="expanded"
     )
-    
+
+    # Load configuration if available
+    if get_config:
+        try:
+            config = get_config()
+            logger.info(f"Configuration loaded: {config.environment}")
+        except Exception as e:
+            logger.warning(f"Configuration loading failed: {e}")
+
+    # Initialize health monitoring if available
+    if get_health_monitor:
+        try:
+            health_monitor = get_health_monitor()
+            if not health_monitor.is_running:
+                health_monitor.start_monitoring()
+                logger.info("Health monitoring started")
+        except Exception as e:
+            logger.warning(f"Health monitoring initialization failed: {e}")
+
     # Initialize session state
     init_session_state()
-    
+
+    # Add health check info to sidebar for debugging
+    if st.sidebar.button("🏥 Health Check"):
+        try:
+            health = health_check()
+            st.sidebar.json(health)
+        except Exception as e:
+            st.sidebar.error(f"Health check failed: {e}")
+
     # Render sidebar components
     render_authentication_ui()
     render_monitoring_setup()
-    
+
     # Self-tests in sidebar
     st.sidebar.markdown("---")
     if st.sidebar.button("🔍 Run Self-Tests"):
@@ -1840,7 +1866,7 @@ def main():
                 st.subheader("Test Results")
                 for test_name, result in test_results.items():
                     st.write(f"**{test_name.replace('_', ' ').title()}:** {result}")
-    
+
     # Render main dashboard
     render_dashboard()
 
