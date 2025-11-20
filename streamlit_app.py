@@ -5,8 +5,6 @@ from datetime import datetime, time as dt_time, timedelta
 import requests
 import json
 import time
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 import hashlib
 from collections import defaultdict, deque
 import warnings
@@ -110,7 +108,9 @@ class UpstoxAPI:
             'POWERGRID': 'POWERGRID',
             'ULTRACEMCO': 'ULTRACEMCO',
             'DRREDDY': 'DRREDDY',
-            'ALKEM': 'ALKEM'
+            'ALKEM': 'ALKEM',
+            'BIOCON': 'BIOCON',
+            'COFORGE': 'COFORGE'
         }
     
     def download_instruments(self):
@@ -126,7 +126,7 @@ class UpstoxAPI:
                 with gzip.GzipFile(fileobj=io.BytesIO(response.content)) as f:
                     instruments_data = json.loads(f.read().decode('utf-8'))
                 
-                for instrument in instruments_data:
+                for instrument in instruments_
                     if instrument.get('segment') == 'NSE_EQ' and instrument.get('instrument_type') == 'EQ':
                         trading_symbol = instrument.get('trading_symbol', '')
                         instrument_key = instrument.get('instrument_key', '')
@@ -288,7 +288,7 @@ class UpstoxAPI:
                 print(f"✓ Option chain fetched for {symbol} (Expiry: {expiry_date})")
                 return data
             else:
-                print(f"✗ Option chain failed for {symbol}: {response.status_code} - {response.text[:200]}")
+                print(f"✗ Option chain failed for {symbol}: {response.status_code}")
                 return None
         except Exception as e:
             print(f"✗ Option chain error for {symbol}: {str(e)}")
@@ -340,7 +340,7 @@ class TradingSignalEngine:
     
     def calculate_pcr(self, option_data):
         """Calculate Put-Call Ratio"""
-        if not option_data or 'data' not in option_data:
+        if not option_data or 'data' not in option_
             return 1.0
         
         try:
@@ -349,7 +349,7 @@ class TradingSignalEngine:
             call_oi = 0
             
             # New format: data is a list of strike prices with call/put options
-            for strike_data in data:
+            for strike_data in 
                 if isinstance(strike_data, dict):
                     # Get call and put OI
                     call_options = strike_data.get('call_options', {})
@@ -372,7 +372,7 @@ class TradingSignalEngine:
     
     def generate_signal(self, symbol, quote_data, option_data, historical_data):
         """Generate trading signal based on all factors"""
-        if not quote_data:
+        if not quote_
             return None
         
         try:
@@ -674,7 +674,9 @@ MARUTI
 TATAMOTORS
 AXISBANK
 DRREDDY
-ALKEM""")
+ALKEM
+BIOCON
+COFORGE""")
         
         stock_input = st.text_area(
             "Enter stocks (one per line, max 10)",
@@ -752,7 +754,7 @@ ALKEM""")
         print(f"Quote Data: {'✓ Available' if quote_data else '✗ Failed'}")
         print(f"Option Data: {'✓ Available' if option_data else '✗ Failed'}")
         
-        if quote_data:
+        if quote_
             try:
                 data_keys = list(quote_data['data'].keys())
                 if not data_keys:
@@ -857,8 +859,14 @@ ALKEM""")
         st.rerun()
 
 def display_signal_card(signal, rank):
+    """Display individual signal card"""
     medal = "🥇" if rank == 1 else "🥈" if rank == 2 else "🥉" if rank == 3 else f"#{rank}"
-    signal_class = {'BUY': 'buy-signal', 'SELL': 'sell-signal', 'ACCUMULATION': 'accumulation-signal', 'DISTRIBUTION': 'distribution-signal'}.get(signal['signal_type'], '')
+    signal_class = {
+        'BUY': 'buy-signal',
+        'SELL': 'sell-signal',
+        'ACCUMULATION': 'accumulation-signal',
+        'DISTRIBUTION': 'distribution-signal'
+    }.get(signal['signal_type'], '')
     stars = "⭐" * min(int(signal['confidence']), 5)
     
     col1, col2, col3 = st.columns([2, 2, 1])
@@ -886,8 +894,46 @@ def display_signal_card(signal, rank):
             <p><strong>PCR:</strong> {signal['pcr']}</p>
             <p><strong>Vol:</strong> {signal['volume_multiplier']}x</p>
         </div>""", unsafe_allow_html=True)
+    
+    with st.expander(f"📖 Why {signal['symbol']} is ranked #{rank}"):
+        st.write(f"""
+        **Signal Analysis:**
+        - **Order Book:** {signal['buy_ratio']}% buy pressure
+        - **Hidden Orders:** Institutional ratio of {signal['institutional_ratio']} 
+          {'(STRONG institutional activity)' if signal['institutional_ratio'] >= 4.0 else '(institutional activity detected)'}
+        - **Options Market:** PCR of {signal['pcr']} 
+          {'(Very Bullish)' if signal['pcr'] < 0.7 else '(Bullish)' if signal['pcr'] < 0.9 else '(Very Bearish)' if signal['pcr'] > 1.3 else '(Bearish)' if signal['pcr'] > 1.1 else '(Neutral)'}
+        - **Volume:** {signal['volume_multiplier']}x average volume
+        - **Price Action:** {signal['price_change']:+.2f}% change
+        
+        **Why this signal?**
+        """)
+        
+        if signal['signal_type'] == 'ACCUMULATION':
+            st.success("""
+            🔵 **ACCUMULATION detected**: Retail selling (low buy %), but institutions are absorbing 
+            with hidden orders. Price staying stable despite selling pressure. Once retail panic ends, 
+            expect sharp upward move.
+            """)
+        elif signal['signal_type'] == 'DISTRIBUTION':
+            st.warning("""
+            🟠 **DISTRIBUTION detected**: Retail buying (high buy %), but institutions are dumping 
+            with hidden orders. Price not rising despite buying pressure. Once retail demand exhausts, 
+            expect sharp downward move.
+            """)
+        elif signal['signal_type'] == 'BUY':
+            st.info("""
+            🟢 **BUY signal**: Clear buying pressure visible in order book, high volume, and price 
+            rising. Market consensus is bullish. Momentum trade opportunity.
+            """)
+        else:
+            st.info("""
+            🔴 **SELL signal**: Clear selling pressure visible in order book, high volume, and price 
+            falling. Market consensus is bearish. Momentum short trade opportunity.
+            """)
 
 def main():
+    """Main application logic"""
     if not st.session_state.authenticated:
         render_authentication()
     else:
