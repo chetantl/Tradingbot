@@ -1,225 +1,312 @@
-"""
-Order Flow Trading Dashboard - Institutional Activity Detection System
-Real-time WebSocket monitoring with time-normalized volume analysis
-"""
-
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import datetime, time as dt_time
-import time
-import logging
-import queue
-import threading
-from typing import Dict, List, Tuple, Optional
+from datetime import datetime, time as dt_time, timedelta
+import requests
 import json
+import time
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import hashlib
+from collections import defaultdict, deque
+import warnings
+from urllib.parse import quote
+warnings.filterwarnings('ignore')
 
-# Zerodha Kite Connect imports
-try:
-    from kiteconnect import KiteConnect, KiteTicker
-except ImportError:
-    st.error("⚠️ kiteconnect library not installed. Run: pip install kiteconnect")
-    st.stop()
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# CONFIGURATION & LOGGING
-# ═══════════════════════════════════════════════════════════════════════════════
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+# Page configuration
+st.set_page_config(
+    page_title="Institutional Order Flow Dashboard",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
-logger = logging.getLogger(__name__)
 
-# Thread-safe primitives (module-level globals)
-TICK_DATA_QUEUE = queue.Queue(maxsize=1000)
-CONNECTED = threading.Event()
-WS_INSTANCE = None
+# Custom CSS
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 2.5rem;
+        font-weight: bold;
+        color: #1f77b4;
+        text-align: center;
+        margin-bottom: 1rem;
+    }
+    .signal-card {
+        padding: 1rem;
+        border-radius: 10px;
+        margin: 0.5rem 0;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    .buy-signal {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+    }
+    .sell-signal {
+        background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+        color: white;
+    }
+    .accumulation-signal {
+        background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+        color: white;
+    }
+    .distribution-signal {
+        background: linear-gradient(135deg, #fa709a 0%, #fee140 100%);
+        color: white;
+    }
+    .metric-card {
+        background: white;
+        padding: 1rem;
+        border-radius: 8px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+</style>
+""", unsafe_allow_html=True)
 
-# Trading parameters
-MIN_CONFIDENCE = 7
-MAX_DAILY_SIGNALS = 6
-INSTITUTIONAL_THRESHOLD = 2.5
-MIN_TIME_DELTA = 0.5  # Minimum seconds between ticks
+# Initialize session state
+if 'authenticated' not in st.session_state:
+    st.session_state.authenticated = False
+if 'access_token' not in st.session_state:
+    st.session_state.access_token = None
+if 'monitoring_stocks' not in st.session_state:
+    st.session_state.monitoring_stocks = []
+if 'signals_history' not in st.session_state:
+    st.session_state.signals_history = []
+if 'orderbook_history' not in st.session_state:
+    st.session_state.orderbook_history = defaultdict(lambda: deque(maxlen=50))
+if 'volume_history' not in st.session_state:
+    st.session_state.volume_history = defaultdict(lambda: deque(maxlen=50))
+if 'price_history' not in st.session_state:
+    st.session_state.price_history = defaultdict(lambda: deque(maxlen=50))
+if 'instrument_map' not in st.session_state:
+    st.session_state.instrument_map = {}
+if 'expiry_cache' not in st.session_state:
+    st.session_state.expiry_cache = {}
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# SESSION STATE INITIALIZATION
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def init_session_state():
-    """Initialize all session state variables"""
+class UpstoxAPI:
+    def __init__(self, access_token):
+        self.access_token = access_token
+        self.base_url = "https://api.upstox.com/v2"
+        self.instrument_cache = {}
+        
+        self.symbol_corrections = {
+            'MARUTI': 'MARUTI',
+            'M&M': 'M&M',
+            'HDFCBANK': 'HDFCBANK',
+            'ICICIBANK': 'ICICIBANK',
+            'RELIANCE': 'RELIANCE',
+            'TCS': 'TCS',
+            'INFY': 'INFY',
+            'SBIN': 'SBIN',
+            'BHARTIARTL': 'BHARTIARTL',
+            'ITC': 'ITC',
+            'KOTAKBANK': 'KOTAKBANK',
+            'LT': 'LT',
+            'TATAMOTORS': 'TATAMOTORS',
+            'AXISBANK': 'AXISBANK',
+            'WIPRO': 'WIPRO',
+            'SUNPHARMA': 'SUNPHARMA',
+            'ONGC': 'ONGC',
+            'NTPC': 'NTPC',
+            'POWERGRID': 'POWERGRID',
+            'ULTRACEMCO': 'ULTRACEMCO',
+            'DRREDDY': 'DRREDDY',
+            'ALKEM': 'ALKEM'
+        }
     
-    # Authentication
-    if 'api_key' not in st.session_state:
-        st.session_state.api_key = ""
-    if 'api_secret' not in st.session_state:
-        st.session_state.api_secret = ""
-    if 'access_token' not in st.session_state:
-        st.session_state.access_token = ""
-    if 'kite' not in st.session_state:
-        st.session_state.kite = None
-    
-    # Monitoring state
-    if 'monitoring_active' not in st.session_state:
-        st.session_state.monitoring_active = False
-    if 'monitored_symbols' not in st.session_state:
-        st.session_state.monitored_symbols = []
-    if 'instrument_tokens_map' not in st.session_state:
-        st.session_state.instrument_tokens_map = {}
-    
-    # Tick data storage
-    if 'tick_data' not in st.session_state:
-        st.session_state.tick_data = {}
-    if 'previous_snapshots' not in st.session_state:
-        st.session_state.previous_snapshots = {}
-    if 'total_ticks' not in st.session_state:
-        st.session_state.total_ticks = 0
-    
-    # Signal tracking
-    if 'daily_signals_pool' not in st.session_state:
-        st.session_state.daily_signals_pool = []
-    if 'top_signals' not in st.session_state:
-        st.session_state.top_signals = []
-    
-    # PCR caching
-    if 'pcr_cache' not in st.session_state:
-        st.session_state.pcr_cache = {}
-    if 'pcr_last_update' not in st.session_state:
-        st.session_state.pcr_last_update = {}
-    
-    # Volume averaging (for ratio calculation)
-    if 'volume_history' not in st.session_state:
-        st.session_state.volume_history = {}
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# WEBSOCKET IMPLEMENTATION (THREAD-SAFE)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def on_ticks(ws, ticks):
-    """
-    WebSocket callback (runs in background thread).
-    
-    CRITICAL: Never access st.session_state here!
-    Only push to thread-safe queue.
-    """
-    for tick in ticks:
+    def download_instruments(self):
+        """Download and cache instrument master file"""
         try:
-            TICK_DATA_QUEUE.put_nowait(tick)
-        except queue.Full:
-            logger.warning("Tick queue full, dropping tick")
-
-def on_connect(ws, response):
-    """
-    Subscribe to tokens on connection.
-    
-    CRITICAL: Cannot access st.session_state from background thread.
-    Tokens must be passed via module-level variable.
-    """
-    try:
-        # Use module-level variable instead of session_state
-        if hasattr(ws, '_tokens_to_subscribe'):
-            tokens = ws._tokens_to_subscribe
-            if tokens:
-                ws.subscribe(tokens)
-                ws.set_mode(ws.MODE_FULL, tokens)
-                CONNECTED.set()
-                logger.info(f"✅ WebSocket connected, subscribed to {len(tokens)} instruments")
-        else:
-            logger.warning("No tokens to subscribe - tokens not set on WebSocket instance")
-    except Exception as e:
-        logger.error(f"Connection callback error: {e}")
-
-def on_close(ws, code, reason):
-    """Handle WebSocket closure"""
-    CONNECTED.clear()
-    logger.warning(f"WebSocket closed: {code} - {reason}")
-
-def on_error(ws, code, reason):
-    """Handle WebSocket errors"""
-    logger.error(f"WebSocket error: {code} - {reason}")
-
-def run_websocket(api_key, access_token, tokens):
-    """
-    Background thread function.
-    Must use threaded=True for Streamlit compatibility.
-    
-    Args:
-        api_key: Zerodha API key
-        access_token: Session access token
-        tokens: List of instrument tokens to subscribe
-    """
-    global WS_INSTANCE
-    
-    try:
-        kws = KiteTicker(api_key, access_token)
-        kws.on_ticks = on_ticks
-        kws.on_connect = on_connect
-        kws.on_close = on_close
-        kws.on_error = on_error
-        
-        # Store tokens on WebSocket instance (accessible in callback)
-        kws._tokens_to_subscribe = tokens
-        
-        WS_INSTANCE = kws
-        
-        # CRITICAL: threaded=True for Streamlit
-        kws.connect(threaded=True)
-        
-    except Exception as e:
-        logger.error(f"WebSocket thread error: {e}")
-        CONNECTED.clear()
-
-def start_websocket_thread(api_key, access_token, tokens):
-    """
-    Initialize and start WebSocket thread.
-    
-    Args:
-        api_key: Zerodha API key
-        access_token: Session access token
-        tokens: List of instrument tokens to subscribe
-    """
-    ws_thread = threading.Thread(
-        target=run_websocket,
-        args=(api_key, access_token, tokens),
-        daemon=True  # Dies when main thread exits
-    )
-    ws_thread.start()
-    logger.info("🚀 WebSocket thread started")
-
-def stop_websocket():
-    """Stop WebSocket connection"""
-    global WS_INSTANCE
-    
-    if WS_INSTANCE:
-        try:
-            WS_INSTANCE.close()
-            WS_INSTANCE = None
-            CONNECTED.clear()
-            logger.info("WebSocket stopped")
+            url = "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz"
+            
+            import gzip
+            import io
+            
+            response = requests.get(url, timeout=30)
+            if response.status_code == 200:
+                with gzip.GzipFile(fileobj=io.BytesIO(response.content)) as f:
+                    instruments_data = json.loads(f.read().decode('utf-8'))
+                
+                for instrument in instruments_data:
+                    if instrument.get('segment') == 'NSE_EQ' and instrument.get('instrument_type') == 'EQ':
+                        trading_symbol = instrument.get('trading_symbol', '')
+                        instrument_key = instrument.get('instrument_key', '')
+                        if trading_symbol and instrument_key:
+                            self.instrument_cache[trading_symbol.upper()] = instrument_key
+                
+                print(f"✓ Loaded {len(self.instrument_cache)} NSE_EQ instruments")
+                return True
+            else:
+                print(f"✗ Failed to download instruments: {response.status_code}")
+                return False
         except Exception as e:
-            logger.error(f"Error stopping WebSocket: {e}")
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# CORE CALCULATION FUNCTIONS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def calculate_order_imbalance(depth: Dict) -> Tuple[float, float, float]:
-    """
-    Calculate order book imbalance from depth data.
+            print(f"✗ Error downloading instruments: {str(e)}")
+            return False
     
-    Example:
-        depth = {
-            'buy': [{'quantity': 1000}, {'quantity': 2000}],  # Total: 3000
-            'sell': [{'quantity': 1500}, {'quantity': 2500}]  # Total: 4000
+    def get_instrument_key(self, symbol):
+        """Get instrument key for a symbol"""
+        if not self.instrument_cache:
+            print("Downloading instrument master file...")
+            if not self.download_instruments():
+                return None
+        
+        corrected_symbol = self.symbol_corrections.get(symbol.upper(), symbol.upper())
+        instrument_key = self.instrument_cache.get(corrected_symbol)
+        
+        if instrument_key:
+            print(f"✓ Found instrument key for {symbol}: {instrument_key}")
+            return instrument_key
+        else:
+            print(f"✗ Symbol {symbol} not found in instrument cache")
+            return self.search_instrument(symbol)
+    
+    def search_instrument(self, symbol):
+        """Search for instrument via API"""
+        url = f"{self.base_url}/search/instruments"
+        headers = {
+            'Accept': 'application/json',
+            'Authorization': f'Bearer {self.access_token}'
+        }
+        params = {'query': symbol}
+        
+        try:
+            response = requests.get(url, headers=headers, params=params)
+            if response.status_code == 200:
+                data = response.json()
+                if 'data' in data and len(data['data']) > 0:
+                    for instrument in data['data']:
+                        if instrument.get('segment') == 'NSE_EQ':
+                            instrument_key = instrument.get('instrument_key')
+                            print(f"✓ Found via search: {instrument_key}")
+                            return instrument_key
+            return None
+        except Exception as e:
+            print(f"Search error: {str(e)}")
+            return None
+    
+    def get_market_quote(self, symbol, exchange="NSE_EQ"):
+        """Get full market quote including depth for a symbol"""
+        if not self.access_token:
+            return None
+        
+        instrument_key = self.get_instrument_key(symbol)
+        
+        if not instrument_key:
+            print(f"✗ Could not find instrument key for {symbol}")
+            return None
+        
+        url = f"{self.base_url}/market-quote/quotes"
+        headers = {
+            'Accept': 'application/json',
+            'Authorization': f'Bearer {self.access_token}'
+        }
+        params = {'instrument_key': instrument_key}
+        
+        try:
+            response = requests.get(url, headers=headers, params=params)
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                if 'data' in data and data['data']:
+                    return data
+                else:
+                    print(f"✗ No data in response for {symbol}")
+                    return None
+            else:
+                print(f"✗ API Error {response.status_code} for {symbol}")
+                return None
+                
+        except Exception as e:
+            print(f"✗ Exception for {symbol}: {str(e)}")
+            return None
+    
+    def get_nearest_expiry(self, symbol):
+        """Get the nearest expiry date for a stock's options"""
+        # Check cache first
+        if symbol in st.session_state.expiry_cache:
+            return st.session_state.expiry_cache[symbol]
+        
+        instrument_key = self.get_instrument_key(symbol)
+        
+        if not instrument_key:
+            return None
+        
+        url = f"{self.base_url}/option/contract"
+        headers = {
+            'Accept': 'application/json',
+            'Authorization': f'Bearer {self.access_token}'
+        }
+        params = {'instrument_key': instrument_key}
+        
+        try:
+            response = requests.get(url, headers=headers, params=params)
+            if response.status_code == 200:
+                data = response.json()
+                if 'data' in data and len(data['data']) > 0:
+                    # Get unique expiry dates and sort
+                    expiry_dates = sorted(list(set([contract['expiry'] for contract in data['data']])))
+                    if expiry_dates:
+                        nearest_expiry = expiry_dates[0]
+                        # Cache it
+                        st.session_state.expiry_cache[symbol] = nearest_expiry
+                        return nearest_expiry
+            return None
+        except Exception as e:
+            print(f"Error getting expiry: {str(e)}")
+            return None
+    
+    def get_option_chain(self, symbol):
+        """Get option chain data for PCR calculation"""
+        if not self.access_token:
+            return None
+        
+        instrument_key = self.get_instrument_key(symbol)
+        
+        if not instrument_key:
+            return None
+        
+        expiry_date = self.get_nearest_expiry(symbol)
+        
+        if not expiry_date:
+            print(f"✗ No expiry date found for {symbol}")
+            return None
+        
+        url = f"{self.base_url}/option/chain"
+        headers = {
+            'Accept': 'application/json',
+            'Authorization': f'Bearer {self.access_token}'
+        }
+        params = {
+            'instrument_key': instrument_key,
+            'expiry_date': expiry_date
         }
         
-        Returns: (42.9, 57.1, 0.75)
-        # 42.9% buy pressure, 57.1% sell pressure, 0.75 buy/sell ratio
-    
-    Returns:
-        (buy_pct, sell_pct, imbalance_ratio)
-    """
-    try:
+        try:
+            response = requests.get(url, headers=headers, params=params)
+            if response.status_code == 200:
+                data = response.json()
+                print(f"✓ Option chain fetched for {symbol} (Expiry: {expiry_date})")
+                return data
+            else:
+                print(f"✗ Option chain failed for {symbol}: {response.status_code} - {response.text[:200]}")
+                return None
+        except Exception as e:
+            print(f"✗ Option chain error for {symbol}: {str(e)}")
+            return None
+
+class TradingSignalEngine:
+    def __init__(self):
+        self.min_confidence = 7
+        self.min_institutional_ratio = 2.5
+        self.strong_institutional_ratio = 4.0
+        self.orderbook_imbalance_threshold = 0.60
+        self.volume_multiplier_threshold = 1.5
+        
+    def calculate_orderbook_imbalance(self, depth):
+        """Calculate buy/sell imbalance from order book"""
+        if not depth or 'buy' not in depth or 'sell' not in depth:
+            return 0.5, 0, 0
+        
         buy_orders = depth.get('buy', [])
         sell_orders = depth.get('sell', [])
         
@@ -229,1062 +316,586 @@ def calculate_order_imbalance(depth: Dict) -> Tuple[float, float, float]:
         total_qty = total_buy_qty + total_sell_qty
         
         if total_qty == 0:
-            return 50.0, 50.0, 1.0
+            return 0.5, 0, 0
         
-        buy_pct = (total_buy_qty / total_qty) * 100
-        sell_pct = (total_sell_qty / total_qty) * 100
+        buy_ratio = total_buy_qty / total_qty
         
-        imbalance_ratio = total_buy_qty / total_sell_qty if total_sell_qty > 0 else 1.0
-        
-        return buy_pct, sell_pct, imbalance_ratio
-        
-    except Exception as e:
-        logger.error(f"Order imbalance calculation error: {e}")
-        return 50.0, 50.0, 1.0
-
-def detect_institutional_activity_normalized(
-    symbol: str,
-    current_depth: Dict,
-    current_volume: int,
-    current_price: float,
-    current_timestamp: float,
-    current_oi: int
-) -> Tuple[float, bool, int, str]:
-    """
-    Detect institutional activity with TIME NORMALIZATION.
+        return buy_ratio, total_buy_qty, total_sell_qty
     
-    Example:
-        Previous: timestamp=1699945234.50, volume=500000
-        Current: timestamp=1699945236.21, volume=515000
+    def detect_hidden_orders(self, symbol, current_volume, prev_volume, 
+                            current_orderbook_qty, prev_orderbook_qty):
+        """Detect institutional hidden orders"""
+        if prev_volume == 0 or prev_orderbook_qty == 0:
+            return 1.0
         
-        time_delta = 1.71 seconds
-        volume_change = 15000 shares
-        volume_rate = 8771.9 shares/second
+        volume_change = abs(current_volume - prev_volume)
+        orderbook_change = abs(current_orderbook_qty - prev_orderbook_qty)
         
-        orderbook_change = 1000 shares
-        orderbook_rate = 584.8 shares/second
+        if orderbook_change == 0:
+            orderbook_change = 1
         
-        institutional_ratio = 15.0 (Very Strong Institutional)
+        institutional_ratio = volume_change / orderbook_change
+        
+        return institutional_ratio
     
-    Returns:
-        (institutional_ratio, is_institutional, oi_change, oi_trend)
-    """
-    
-    prev = st.session_state.previous_snapshots.get(symbol)
-    
-    if prev is None:
-        # First tick - initialize
-        st.session_state.previous_snapshots[symbol] = {
-            'depth': current_depth,
-            'volume': current_volume,
-            'price': current_price,
-            'timestamp': current_timestamp,
-            'oi': current_oi
-        }
-        return 0.0, False, 0, "Stable"
-    
-    # ══════════════════════════════════════════════════════════
-    # STEP 1: Calculate Time Delta (from exchange timestamp)
-    # ══════════════════════════════════════════════════════════
-    time_delta = current_timestamp - prev['timestamp']
-    time_delta = max(MIN_TIME_DELTA, time_delta)  # Safety minimum
-    
-    # ══════════════════════════════════════════════════════════
-    # STEP 2: Calculate Raw Changes (Incremental)
-    # ══════════════════════════════════════════════════════════
-    
-    # Volume: Cumulative → Incremental
-    volume_change = current_volume - prev['volume']
-    volume_change = max(0, volume_change)
-    
-    # Orderbook: Sum of both sides' absolute movement
-    prev_buy = sum([o.get('quantity', 0) for o in prev['depth'].get('buy', [])])
-    prev_sell = sum([o.get('quantity', 0) for o in prev['depth'].get('sell', [])])
-    curr_buy = sum([o.get('quantity', 0) for o in current_depth.get('buy', [])])
-    curr_sell = sum([o.get('quantity', 0) for o in current_depth.get('sell', [])])
-    
-    orderbook_change = abs(curr_buy - prev_buy) + abs(curr_sell - prev_sell)
-    
-    # ══════════════════════════════════════════════════════════
-    # STEP 3: Normalize to Per-Second Rates (KEY INNOVATION)
-    # ══════════════════════════════════════════════════════════
-    
-    volume_rate = volume_change / time_delta
-    orderbook_rate = orderbook_change / time_delta
-    
-    # ══════════════════════════════════════════════════════════
-    # STEP 4: Calculate Institutional Ratio
-    # ══════════════════════════════════════════════════════════
-    
-    if orderbook_rate > 0:
-        institutional_ratio = volume_rate / orderbook_rate
-    else:
-        institutional_ratio = 0.0
-    
-    is_institutional = institutional_ratio > INSTITUTIONAL_THRESHOLD
-    
-    # ══════════════════════════════════════════════════════════
-    # STEP 5: OI Analysis (Informational)
-    # ══════════════════════════════════════════════════════════
-    
-    oi_change = current_oi - prev.get('oi', current_oi)
-    
-    if oi_change > 0:
-        oi_trend = "Rising"
-    elif oi_change < 0:
-        oi_trend = "Falling"
-    else:
-        oi_trend = "Stable"
-    
-    # ══════════════════════════════════════════════════════════
-    # STEP 6: Update Snapshot for Next Comparison
-    # ══════════════════════════════════════════════════════════
-    
-    st.session_state.previous_snapshots[symbol] = {
-        'depth': current_depth,
-        'volume': current_volume,
-        'price': current_price,
-        'timestamp': current_timestamp,
-        'oi': current_oi
-    }
-    
-    return round(institutional_ratio, 2), is_institutional, oi_change, oi_trend
-
-def calculate_volume_ratio(symbol: str, current_volume: int) -> float:
-    """
-    Calculate current volume as ratio of average volume.
-    Uses rolling window of last 20 ticks.
-    
-    Example:
-        Average volume: 100000 shares
-        Current volume: 230000 shares
-        Returns: 2.3 (230% of average)
-    """
-    if symbol not in st.session_state.volume_history:
-        st.session_state.volume_history[symbol] = []
-    
-    history = st.session_state.volume_history[symbol]
-    history.append(current_volume)
-    
-    # Keep last 20 data points
-    if len(history) > 20:
-        history.pop(0)
-    
-    if len(history) < 3:
-        return 1.0
-    
-    avg_volume = np.mean(history[:-1])  # Exclude current
-    
-    if avg_volume == 0:
-        return 1.0
-    
-    return current_volume / avg_volume
-
-def get_pcr_cached(symbol: str, current_price: float) -> Tuple[float, str]:
-    """
-    Get Put-Call Ratio with 5-minute caching.
-    
-    Example:
-        RELIANCE @ ₹1500
-        ATM strikes: 1480, 1500, 1520
+    def calculate_pcr(self, option_data):
+        """Calculate Put-Call Ratio"""
+        if not option_data or 'data' not in option_data:
+            return 1.0
         
-        Put OI: 25000, Call OI: 43000
-        PCR = 0.58
-        
-        0.58 < 0.9 → STRONG_BULLISH
-    
-    Note: Currently using mock data. Replace with actual options chain API.
-    """
-    
-    now = time.time()
-    
-    # Check cache
-    if symbol in st.session_state.pcr_cache:
-        last_update = st.session_state.pcr_last_update.get(symbol, 0)
-        if now - last_update < 300:  # 5 minutes
-            return st.session_state.pcr_cache[symbol]
-    
-    # Fetch PCR (MOCK - replace with real API)
-    try:
-        # TODO: Implement real options chain fetching
-        # pcr = calculate_real_pcr(symbol, current_price)
-        
-        # Mock with realistic bounded random
-        pcr = round(np.random.uniform(0.6, 1.4), 2)
-        
-        # Determine bias
-        if pcr < 0.7:
-            bias = "STRONG_BULLISH"
-        elif pcr < 0.9:
-            bias = "BULLISH"
-        elif pcr > 1.3:
-            bias = "STRONG_BEARISH"
-        elif pcr > 1.1:
-            bias = "BEARISH"
-        else:
-            bias = "NEUTRAL"
-        
-        # Cache result
-        st.session_state.pcr_cache[symbol] = (pcr, bias)
-        st.session_state.pcr_last_update[symbol] = now
-        
-        return pcr, bias
-    
-    except Exception as e:
-        logger.error(f"PCR calculation failed for {symbol}: {e}")
-        return 1.0, "NEUTRAL"
-
-def calculate_risk_levels(
-    signal_type: str,
-    current_price: float,
-    depth: Dict
-) -> Tuple[float, float, float, float]:
-    """
-    Calculate dynamic entry, target, and stop loss from orderbook structure.
-    
-    Example (ACCUMULATION signal):
-        current_price = 1500.00
-        
-        Best bid = 1499.50 (support)
-        Best ask = 1500.50 (resistance)
-        
-        Entry: 1500.00
-        Target: 1509.98 (0.67% up, 2x risk distance)
-        Stop Loss: 1495.01 (0.33% down, at support)
-        R:R = 2.0
-    """
-    
-    try:
-        buy_orders = depth.get('buy', [])
-        sell_orders = depth.get('sell', [])
-        
-        if not buy_orders or not sell_orders:
-            # Fallback to percentage-based
-            if signal_type in ['BUY', 'ACCUMULATION']:
-                entry = current_price
-                target = entry * 1.0067  # 0.67% up
-                stop_loss = entry * 0.9967  # 0.33% down
-            else:
-                entry = current_price
-                target = entry * 0.9967  # 0.67% down
-                stop_loss = entry * 1.0033  # 0.33% up
-            
-            rr_ratio = 2.0
-            return entry, target, stop_loss, rr_ratio
-        
-        # Extract support/resistance levels
-        best_bid = buy_orders[0].get('price', current_price * 0.997)
-        best_ask = sell_orders[0].get('price', current_price * 1.003)
-        
-        if signal_type in ['BUY', 'ACCUMULATION']:
-            entry = current_price
-            stop_loss = best_bid * 0.9997  # Just below support
-            risk_distance = entry - stop_loss
-            target = entry + (risk_distance * 2)  # 1:2 risk-reward
-            
-        else:  # SELL, DISTRIBUTION
-            entry = current_price
-            stop_loss = best_ask * 1.0003  # Just above resistance
-            risk_distance = stop_loss - entry
-            target = entry - (risk_distance * 2)
-        
-        rr_ratio = abs((target - entry) / (entry - stop_loss)) if abs(entry - stop_loss) > 0 else 2.0
-        
-        return entry, target, stop_loss, rr_ratio
-        
-    except Exception as e:
-        logger.error(f"Risk calculation error: {e}")
-        # Safe fallback
-        if signal_type in ['BUY', 'ACCUMULATION']:
-            return current_price, current_price * 1.0067, current_price * 0.9967, 2.0
-        else:
-            return current_price, current_price * 0.9967, current_price * 1.0033, 2.0
-
-def calculate_relative_score(signal: Dict) -> float:
-    """
-    Calculate relative score for ranking signals.
-    
-    Scoring components:
-    - Confidence (max 10 points)
-    - Institutional ratio (max 3 points)
-    - Volume ratio (max 2 points)
-    
-    Max total: 15 points
-    """
-    score = 0.0
-    
-    # Confidence (0-10 points)
-    score += signal['Confidence Score']
-    
-    # Institutional ratio (0-3 points)
-    inst_ratio = signal['Institutional Ratio']
-    if inst_ratio > 4.0:
-        score += 3
-    elif inst_ratio > 2.5:
-        score += 2
-    elif inst_ratio > 1.5:
-        score += 1
-    
-    # Volume ratio (0-2 points)
-    vol_ratio_str = signal['Volume Status'].replace('x Avg', '')
-    try:
-        vol_ratio = float(vol_ratio_str)
-        if vol_ratio > 2.0:
-            score += 2
-        elif vol_ratio > 1.5:
-            score += 1
-    except:
-        pass
-    
-    return round(score, 2)
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SIGNAL GENERATION (MAIN LOGIC)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def generate_signal(symbol: str, tick_data: Dict) -> Optional[Dict]:
-    """
-    Generate trading signal with multi-factor confirmation.
-    
-    Example Flow:
-        Stock: RELIANCE
-        Orderbook: 65% sellers (visible selling)
-        Price: +0.08% (stable)
-        Inst Ratio: 15.0 (very high)
-        PCR: 0.62 (bullish)
-        
-        → Signal: ACCUMULATION
-        → Confidence: 9/10
-        → Relative Score: 13.8/15
-    """
-    
-    try:
-        # Extract data
-        current_price = tick_data.get('last_price', 0)
-        depth = tick_data.get('depth', {})
-        volume = tick_data.get('volume', 0)
-        timestamp = tick_data.get('exchange_timestamp')
-        
-        # Fallback to timestamp if exchange_timestamp not available
-        if timestamp is None:
-            timestamp = tick_data.get('timestamp', time.time())
-        
-        oi = tick_data.get('oi', 0)
-        
-        # Validation
-        if current_price == 0 or not depth:
-            return None
-        
-        # ══════════════════════════════════════════════════════════
-        # CALCULATE ALL METRICS
-        # ══════════════════════════════════════════════════════════
-        
-        # 1. Order Imbalance
-        buy_pct, sell_pct, imbalance_ratio = calculate_order_imbalance(depth)
-        
-        # 2. Institutional Detection (TIME-NORMALIZED)
-        inst_ratio, is_institutional, oi_change, oi_trend = detect_institutional_activity_normalized(
-            symbol, depth, volume, current_price, timestamp, oi
-        )
-        
-        # 3. Volume Ratio
-        vol_ratio = calculate_volume_ratio(symbol, volume)
-        
-        # 4. PCR
-        pcr, pcr_bias = get_pcr_cached(symbol, current_price)
-        
-        # 5. Price Change
-        prev_price = st.session_state.previous_snapshots.get(symbol, {}).get('price', current_price)
-        price_change = ((current_price - prev_price) / prev_price * 100) if prev_price > 0 else 0
-        
-        # ══════════════════════════════════════════════════════════
-        # SIGNAL DECISION TREE
-        # ══════════════════════════════════════════════════════════
-        
-        signal_type = None
-        confidence = 0
-        
-        # TYPE 1: ACCUMULATION (Hidden Buying - Best Signal)
-        if sell_pct > 60 and price_change >= -0.1 and is_institutional:
-            signal_type = "ACCUMULATION"
-            confidence += 3
-            
-            if pcr_bias in ["STRONG_BULLISH", "BULLISH"]:
-                confidence += 4
-            elif pcr_bias == "NEUTRAL":
-                confidence += 1
-        
-        # TYPE 2: DISTRIBUTION (Hidden Selling)
-        elif buy_pct > 60 and price_change <= 0.1 and is_institutional:
-            signal_type = "DISTRIBUTION"
-            confidence += 3
-            
-            if pcr_bias in ["STRONG_BEARISH", "BEARISH"]:
-                confidence += 4
-            elif pcr_bias == "NEUTRAL":
-                confidence += 1
-        
-        # TYPE 3: BUY (Visible Buying)
-        elif buy_pct > 60 and vol_ratio > 1.2:
-            signal_type = "BUY"
-            confidence += 2
-            
-            if price_change > 0:
-                confidence += 2
-            
-            if pcr_bias in ["BULLISH", "STRONG_BULLISH"]:
-                confidence += 3
-            elif pcr_bias in ["BEARISH", "STRONG_BEARISH"]:
-                confidence -= 2
-        
-        # TYPE 4: SELL (Visible Selling)
-        elif sell_pct > 60 and vol_ratio > 1.2:
-            signal_type = "SELL"
-            confidence += 2
-            
-            if price_change < 0:
-                confidence += 2
-            
-            if pcr_bias in ["BEARISH", "STRONG_BEARISH"]:
-                confidence += 3
-            elif pcr_bias in ["BULLISH", "STRONG_BULLISH"]:
-                confidence -= 2
-        
-        # No signal generated
-        if not signal_type:
-            return None
-        
-        # ══════════════════════════════════════════════════════════
-        # CONFIDENCE BOOSTERS
-        # ══════════════════════════════════════════════════════════
-        
-        # Order imbalance strength
-        if buy_pct > 70 or sell_pct > 70:
-            confidence += 3
-        elif buy_pct > 60 or sell_pct > 60:
-            confidence += 2
-        
-        # Institutional strength
-        if inst_ratio > 4.0:
-            confidence += 3
-        elif inst_ratio > 2.5:
-            confidence += 2
-        
-        # Volume surge
-        if vol_ratio > 2.0:
-            confidence += 2
-        elif vol_ratio > 1.5:
-            confidence += 1
-        elif vol_ratio < 0.8:
-            confidence -= 2
-        
-        # Cap confidence at 10
-        confidence = min(confidence, 10)
-        
-        # Minimum threshold
-        if confidence < MIN_CONFIDENCE:
-            return None
-        
-        # ══════════════════════════════════════════════════════════
-        # RISK MANAGEMENT
-        # ══════════════════════════════════════════════════════════
-        
-        entry, target, stop_loss, rr_ratio = calculate_risk_levels(
-            signal_type, current_price, depth
-        )
-        
-        # Calculate potential profit
-        if signal_type in ['BUY', 'ACCUMULATION']:
-            profit_pct = ((target - entry) / entry * 100)
-        else:
-            profit_pct = ((entry - target) / entry * 100)
-        
-        # ══════════════════════════════════════════════════════════
-        # CREATE SIGNAL DICTIONARY
-        # ══════════════════════════════════════════════════════════
-        
-        signal = {
-            'Stock Symbol': symbol,
-            'Signal Type': signal_type,
-            'Confidence Score': confidence,
-            'Current Price': round(current_price, 2),
-            'Entry Price': round(entry, 2),
-            'Target Price': round(target, 2),
-            'Stop Loss': round(stop_loss, 2),
-            'Risk:Reward': f"1:{round(rr_ratio, 1)}",
-            'Order Imbalance': f"{buy_pct:.1f}% Buy, {sell_pct:.1f}% Sell",
-            'Institutional Ratio': round(inst_ratio, 2),
-            'Volume Status': f"{vol_ratio:.1f}x Avg",
-            'PCR': round(pcr, 2),
-            'PCR Bias': pcr_bias,
-            'OI Change': oi_change,
-            'OI Trend': oi_trend,
-            'Potential Profit %': round(profit_pct, 2),
-            'Time Detected': datetime.now().strftime("%H:%M:%S")
-        }
-        
-        # Calculate relative score for ranking
-        signal['Relative Score'] = calculate_relative_score(signal)
-        
-        return signal
-        
-    except Exception as e:
-        logger.error(f"Signal generation error for {symbol}: {e}")
-        return None
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# TICK PROCESSING (MAIN THREAD)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def process_tick_queue():
-    """
-    Process all ticks from queue (runs in main Streamlit thread).
-    Safe to access st.session_state here.
-    """
-    processed = 0
-    
-    while not TICK_DATA_QUEUE.empty() and processed < 50:
         try:
-            tick = TICK_DATA_QUEUE.get_nowait()
+            data = option_data['data']
+            put_oi = 0
+            call_oi = 0
             
-            # Find symbol for this token
-            symbol = None
-            for sym, tok in st.session_state.instrument_tokens_map.items():
-                if tok == tick['instrument_token']:
-                    symbol = sym
-                    break
-            
-            if symbol:
-                # Store tick data
-                st.session_state.tick_data[symbol] = tick
-                st.session_state.total_ticks += 1
-                
-                # Generate signal
-                signal = generate_signal(symbol, tick)
-                
-                if signal and signal['Confidence Score'] >= MIN_CONFIDENCE:
-                    # Add to daily pool (avoid duplicates)
-                    existing = [s for s in st.session_state.daily_signals_pool 
-                               if s['Stock Symbol'] == symbol and s['Signal Type'] == signal['Signal Type']]
+            # New format: data is a list of strike prices with call/put options
+            for strike_data in data:
+                if isinstance(strike_data, dict):
+                    # Get call and put OI
+                    call_options = strike_data.get('call_options', {})
+                    put_options = strike_data.get('put_options', {})
                     
-                    if not existing:
-                        st.session_state.daily_signals_pool.append(signal)
+                    call_market_data = call_options.get('market_data', {})
+                    put_market_data = put_options.get('market_data', {})
+                    
+                    call_oi += call_market_data.get('oi', 0)
+                    put_oi += put_market_data.get('oi', 0)
             
-            processed += 1
+            if call_oi == 0:
+                return 1.0
             
-        except queue.Empty:
-            break
+            pcr = put_oi / call_oi
+            return pcr
         except Exception as e:
-            logger.error(f"Error processing tick: {e}")
+            print(f"PCR calculation error: {str(e)}")
+            return 1.0
     
-    return processed
-
-def update_top_signals():
-    """
-    Update top signals by ranking the daily pool.
-    Keeps only top MAX_DAILY_SIGNALS by Relative Score.
-    """
-    if not st.session_state.daily_signals_pool:
-        st.session_state.top_signals = []
-        return
-    
-    # Sort by Relative Score (descending)
-    sorted_signals = sorted(
-        st.session_state.daily_signals_pool,
-        key=lambda x: x['Relative Score'],
-        reverse=True
-    )
-    
-    # Keep top N
-    st.session_state.top_signals = sorted_signals[:MAX_DAILY_SIGNALS]
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SELF-VERIFICATION TESTS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def run_self_tests():
-    """
-    Self-verification tests for critical functions.
-    Returns dict of test results.
-    """
-    results = {}
-    
-    # Test 1: Time normalization
-    try:
-        mock_depth = {'buy': [{'quantity': 1000}], 'sell': [{'quantity': 1000}]}
-        mock_timestamp = time.time()
+    def generate_signal(self, symbol, quote_data, option_data, historical_data):
+        """Generate trading signal based on all factors"""
+        if not quote_data:
+            return None
         
-        # First tick (initialization)
-        ratio1, is_inst1, oi_chg1, trend1 = detect_institutional_activity_normalized(
-            'TEST_SYMBOL', mock_depth, 100000, 1500.0, mock_timestamp, 0
-        )
-        
-        assert ratio1 == 0.0, "First tick should return 0.0 ratio"
-        assert not is_inst1, "First tick should not flag institutional"
-        
-        # Second tick (should calculate properly)
-        time.sleep(0.1)  # Small delay
-        ratio2, is_inst2, oi_chg2, trend2 = detect_institutional_activity_normalized(
-            'TEST_SYMBOL', mock_depth, 110000, 1500.5, mock_timestamp + 1.0, 0
-        )
-        
-        assert ratio2 >= 0, "Ratio should be non-negative"
-        
-        results['time_normalization'] = "✅ PASS"
-    except Exception as e:
-        results['time_normalization'] = f"❌ FAIL: {e}"
-    
-    # Test 2: Order imbalance calculation
-    try:
-        test_depth = {
-            'buy': [{'quantity': 1000}, {'quantity': 2000}],
-            'sell': [{'quantity': 1500}, {'quantity': 2500}]
-        }
-        
-        buy_pct, sell_pct, ratio = calculate_order_imbalance(test_depth)
-        
-        assert abs(buy_pct + sell_pct - 100) < 0.01, "Percentages should sum to 100"
-        assert 0 <= buy_pct <= 100, "Buy% should be 0-100"
-        assert 0 <= sell_pct <= 100, "Sell% should be 0-100"
-        assert ratio > 0, "Ratio should be positive"
-        
-        results['order_imbalance'] = "✅ PASS"
-    except Exception as e:
-        results['order_imbalance'] = f"❌ FAIL: {e}"
-    
-    # Test 3: Signal confidence bounds
-    try:
-        mock_tick = {
-            'last_price': 1500.0,
-            'depth': {'buy': [{'quantity': 3000}], 'sell': [{'quantity': 1000}]},
-            'volume': 100000,
-            'timestamp': time.time(),
-            'oi': 50000
-        }
-        
-        signal = generate_signal('TEST', mock_tick)
-        
-        if signal:
-            assert 0 <= signal['Confidence Score'] <= 10, "Confidence should be 0-10"
-            assert signal['Institutional Ratio'] >= 0, "Inst ratio should be non-negative"
-            assert 0 <= signal['PCR'] <= 3, "PCR should be reasonable"
-        
-        results['confidence_scoring'] = "✅ PASS"
-    except Exception as e:
-        results['confidence_scoring'] = f"❌ FAIL: {e}"
-    
-    # Test 4: Thread safety check
-    try:
-        queue_size = TICK_DATA_QUEUE.qsize()
-        assert queue_size >= 0, "Queue size should be non-negative"
-        
-        results['thread_safety'] = "✅ PASS"
-    except Exception as e:
-        results['thread_safety'] = f"❌ FAIL: {e}"
-    
-    # Test 5: Risk calculation
-    try:
-        test_depth = {
-            'buy': [{'price': 1499.5, 'quantity': 1000}],
-            'sell': [{'price': 1500.5, 'quantity': 1000}]
-        }
-        
-        entry, target, sl, rr = calculate_risk_levels('BUY', 1500.0, test_depth)
-        
-        assert entry > 0, "Entry should be positive"
-        assert target > entry, "Target should be above entry for BUY"
-        assert sl < entry, "Stop loss should be below entry for BUY"
-        assert rr > 0, "Risk-reward should be positive"
-        
-        results['risk_calculation'] = "✅ PASS"
-    except Exception as e:
-        results['risk_calculation'] = f"❌ FAIL: {e}"
-    
-    return results
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# AUTHENTICATION UI
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def render_authentication_ui():
-    """Render authentication interface in sidebar"""
-    
-    st.sidebar.title("🔐 Zerodha Authentication")
-    
-    if st.session_state.kite is None:
-        # Not authenticated
-        st.sidebar.info("Enter your Zerodha API credentials to connect")
-        
-        api_key = st.sidebar.text_input(
-            "API Key",
-            value=st.session_state.api_key,
-            type="default",
-            key="api_key_input"
-        )
-        
-        api_secret = st.sidebar.text_input(
-            "API Secret",
-            value=st.session_state.api_secret,
-            type="password",
-            key="api_secret_input"
-        )
-        
-        if st.sidebar.button("📋 Generate Login URL"):
-            if api_key and api_secret:
-                st.session_state.api_key = api_key
-                st.session_state.api_secret = api_secret
+        try:
+            data_keys = list(quote_data['data'].keys())
+            if not data_keys:
+                return None
+            
+            instrument_key = data_keys[0]
+            market_data = quote_data['data'][instrument_key]
+            
+            ohlc = market_data.get('ohlc', {})
+            depth = market_data.get('depth', {})
+            
+            current_price = ohlc.get('close', 0)
+            if current_price == 0:
+                current_price = market_data.get('last_price', 0)
+            
+            current_volume = market_data.get('volume', 0)
+            
+            buy_ratio, total_buy, total_sell = self.calculate_orderbook_imbalance(depth)
+            current_orderbook_qty = total_buy + total_sell
+            
+            hist = historical_data.get(symbol, {})
+            prev_volume = hist.get('volume', current_volume)
+            prev_orderbook_qty = hist.get('orderbook_qty', current_orderbook_qty)
+            prev_price = hist.get('price', current_price)
+            avg_volume = hist.get('avg_volume', current_volume)
+            
+            institutional_ratio = self.detect_hidden_orders(
+                symbol, current_volume, prev_volume,
+                current_orderbook_qty, prev_orderbook_qty
+            )
+            
+            pcr = self.calculate_pcr(option_data)
+            
+            volume_multiplier = current_volume / avg_volume if avg_volume > 0 else 1.0
+            
+            price_change = ((current_price - prev_price) / prev_price * 100) if prev_price > 0 else 0
+            
+            signal_type = None
+            confidence = 0
+            
+            buyers_dominating = buy_ratio >= 0.65
+            sellers_dominating = buy_ratio <= 0.35
+            
+            price_rising = price_change > 0.1
+            price_falling = price_change < -0.1
+            price_stable = abs(price_change) <= 0.1
+            
+            has_hidden_orders = institutional_ratio >= self.min_institutional_ratio
+            strong_hidden_orders = institutional_ratio >= self.strong_institutional_ratio
+            
+            pcr_bullish = pcr < 0.9
+            pcr_bearish = pcr > 1.1
+            pcr_very_bullish = pcr < 0.7
+            pcr_very_bearish = pcr > 1.3
+            
+            if buyers_dominating and price_rising and volume_multiplier >= self.volume_multiplier_threshold:
+                signal_type = "BUY"
+                confidence += 3
                 
-                login_url = f"https://kite.zerodha.com/connect/login?api_key={api_key}&v=3"
+            elif sellers_dominating and price_falling and volume_multiplier >= self.volume_multiplier_threshold:
+                signal_type = "SELL"
+                confidence += 3
                 
-                st.sidebar.success("✅ Login URL Generated!")
-                st.sidebar.code(login_url, language=None)
-                st.sidebar.info("👆 Click the URL above, login, and copy the request_token from the redirect URL")
+            elif sellers_dominating and (price_stable or price_rising) and has_hidden_orders and pcr_bullish:
+                signal_type = "ACCUMULATION"
+                confidence += 4
+                
+            elif buyers_dominating and (price_stable or price_falling) and has_hidden_orders and pcr_bearish:
+                signal_type = "DISTRIBUTION"
+                confidence += 4
+            
+            if signal_type is None:
+                return None
+            
+            if buy_ratio >= 0.70 or buy_ratio <= 0.30:
+                confidence += 3
+            
+            if strong_hidden_orders:
+                confidence += 3
+            elif has_hidden_orders:
+                confidence += 2
+            
+            if (signal_type in ["BUY", "ACCUMULATION"] and pcr_very_bullish) or \
+               (signal_type in ["SELL", "DISTRIBUTION"] and pcr_very_bearish):
+                confidence += 4
+            elif (signal_type in ["BUY", "ACCUMULATION"] and pcr_bullish) or \
+                 (signal_type in ["SELL", "DISTRIBUTION"] and pcr_bearish):
+                confidence += 2
+            
+            if volume_multiplier >= 2.0:
+                confidence += 2
+            elif volume_multiplier >= 1.5:
+                confidence += 1
+            
+            if signal_type in ["ACCUMULATION", "DISTRIBUTION"]:
+                confidence += 1
+            
+            confidence = min(confidence, 10)
+            
+            pcr_score = 0
+            if signal_type in ["BUY", "ACCUMULATION"]:
+                pcr_score = max(0, (1.0 - pcr) * 5)
             else:
-                st.sidebar.error("❌ Please enter both API Key and Secret")
+                pcr_score = max(0, (pcr - 1.0) * 5)
+            
+            institutional_score = min(institutional_ratio / 2, 5)
+            
+            relative_score = confidence + pcr_score + institutional_score
+            relative_score = min(relative_score, 15)
+            
+            if confidence < self.min_confidence:
+                return None
+            
+            if signal_type in ["BUY", "ACCUMULATION"]:
+                entry = current_price
+                target = entry * 1.01
+                stop_loss = entry * 0.996
+            else:
+                entry = current_price
+                target = entry * 0.99
+                stop_loss = entry * 1.004
+            
+            risk_reward = abs(target - entry) / abs(entry - stop_loss)
+            
+            signal = {
+                'symbol': symbol,
+                'signal_type': signal_type,
+                'confidence': confidence,
+                'relative_score': round(relative_score, 2),
+                'timestamp': datetime.now(),
+                'entry_price': round(entry, 2),
+                'target_price': round(target, 2),
+                'stop_loss': round(stop_loss, 2),
+                'risk_reward': round(risk_reward, 2),
+                'buy_ratio': round(buy_ratio * 100, 1),
+                'institutional_ratio': round(institutional_ratio, 2),
+                'pcr': round(pcr, 2),
+                'volume_multiplier': round(volume_multiplier, 2),
+                'price_change': round(price_change, 2),
+                'current_price': round(current_price, 2)
+            }
+            
+            return signal
+            
+        except Exception as e:
+            st.error(f"Signal generation error for {symbol}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+def render_authentication():
+    """Render authentication section"""
+    st.markdown("<h1 class='main-header'>🎯 Institutional Order Flow Dashboard</h1>", unsafe_allow_html=True)
+    st.markdown("---")
+    
+    with st.container():
+        st.subheader("🔐 Upstox Authentication")
         
-        st.sidebar.markdown("---")
+        tab1, tab2 = st.tabs(["📱 Use Access Token", "🔑 Generate New Token"])
         
-        request_token = st.sidebar.text_input(
-            "Request Token",
-            type="default",
-            key="request_token_input",
-            help="Paste the request_token from redirect URL"
+        with tab1:
+            st.info("If you already have a valid access token, paste it here:")
+            access_token = st.text_input(
+                "Enter your Upstox Access Token",
+                type="password",
+                key="access_token_input",
+                help="Paste your Upstox API access token here"
+            )
+            
+            if st.button("✅ Connect with Token", use_container_width=True, type="primary"):
+                if access_token:
+                    with st.spinner("Testing connection..."):
+                        upstox = UpstoxAPI(access_token)
+                        test_result = upstox.get_market_quote("RELIANCE")
+                        
+                        if test_result and 'data' in test_result:
+                            st.session_state.authenticated = True
+                            st.session_state.access_token = access_token
+                            st.session_state.upstox_client = upstox
+                            st.success("✅ Connected successfully!")
+                            time.sleep(1)
+                            st.rerun()
+                        else:
+                            st.error("❌ Token validation failed.")
+                            st.info("💡 Try generating a new token")
+                else:
+                    st.error("Please enter your access token")
+        
+        with tab2:
+            st.info("""
+            **Steps to generate a new Upstox Access Token:**
+            
+            1. Enter your API Key and API Secret
+            2. Click "Generate Login URL"
+            3. **Copy the URL and paste it in your browser**
+            4. Login and authorize
+            5. Copy the **code** from redirect URL
+            6. Paste it below and click "Get Access Token"
+            """)
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                api_key = st.text_input("API Key", type="password", key="api_key_gen")
+            with col2:
+                api_secret = st.text_input("API Secret", type="password", key="api_secret_gen")
+            
+            redirect_uri = st.text_input(
+                "Redirect URI", 
+                value="https://127.0.0.1"
+            )
+            
+            if st.button("🔗 Generate Login URL", use_container_width=True):
+                if api_key and api_secret:
+                    login_url = f"https://api.upstox.com/v2/login/authorization/dialog?client_id={api_key}&redirect_uri={redirect_uri}&response_type=code"
+                    st.session_state.temp_api_key = api_key
+                    st.session_state.temp_api_secret = api_secret
+                    st.session_state.temp_redirect_uri = redirect_uri
+                    
+                    st.success("✅ Login URL generated!")
+                    st.code(login_url, language=None)
+                    st.warning("⚠️ Copy and paste this in your browser")
+                else:
+                    st.error("Please enter both API Key and Secret")
+            
+            st.markdown("---")
+            
+            auth_code = st.text_input(
+                "Authorization Code",
+                key="auth_code_gen"
+            )
+            
+            if st.button("🎫 Get Access Token", use_container_width=True, type="primary"):
+                if auth_code and hasattr(st.session_state, 'temp_api_key'):
+                    with st.spinner("Generating access token..."):
+                        url = "https://api.upstox.com/v2/login/authorization/token"
+                        headers = {
+                            'accept': 'application/json',
+                            'Content-Type': 'application/x-www-form-urlencoded',
+                        }
+                        data = {
+                            'code': auth_code,
+                            'client_id': st.session_state.temp_api_key,
+                            'client_secret': st.session_state.temp_api_secret,
+                            'redirect_uri': st.session_state.temp_redirect_uri,
+                            'grant_type': 'authorization_code',
+                        }
+                        
+                        try:
+                            response = requests.post(url, headers=headers, data=data)
+                            
+                            if response.status_code == 200:
+                                result = response.json()
+                                new_token = result.get('access_token')
+                                
+                                if new_token:
+                                    st.success("✅ Access token generated!")
+                                    st.code(new_token, language=None)
+                                    
+                                    upstox = UpstoxAPI(new_token)
+                                    st.session_state.authenticated = True
+                                    st.session_state.access_token = new_token
+                                    st.session_state.upstox_client = upstox
+                                    
+                                    st.info("💾 Save this token!")
+                                    time.sleep(2)
+                                    st.rerun()
+                                else:
+                                    st.error("Failed to extract token")
+                            else:
+                                st.error(f"Token generation failed: {response.text}")
+                        except Exception as e:
+                            st.error(f"Error: {str(e)}")
+                else:
+                    st.error("Please generate login URL first")
+
+def render_dashboard(upstox_client, signal_engine):
+    """Render main trading dashboard"""
+    st.markdown("<h1 class='main-header'>📊 Live Trading Dashboard</h1>", unsafe_allow_html=True)
+    
+    with st.sidebar:
+        st.header("⚙️ Configuration")
+        
+        st.subheader("📈 Stock Selection")
+        
+        with st.expander("💡 Popular Stock Examples"):
+            st.code("""RELIANCE
+TCS
+INFY
+HDFCBANK
+ICICIBANK
+SBIN
+BHARTIARTL
+ITC
+KOTAKBANK
+LT
+MARUTI
+TATAMOTORS
+AXISBANK
+DRREDDY
+ALKEM""")
+        
+        stock_input = st.text_area(
+            "Enter stocks (one per line, max 10)",
+            value="\n".join(st.session_state.monitoring_stocks),
+            height=200
         )
         
-        if st.sidebar.button("🔓 Complete Login"):
-            if not api_key or not api_secret:
-                st.sidebar.error("❌ Please enter API credentials first")
-            elif not request_token:
-                st.sidebar.error("❌ Please enter request token")
-            else:
-                try:
-                    st.session_state.api_key = api_key
-                    st.session_state.api_secret = api_secret
-                    
-                    # Initialize KiteConnect
-                    kite = KiteConnect(api_key=api_key)
-                    
-                    # Generate session
-                    data = kite.generate_session(request_token, api_secret=api_secret)
-                    
-                    st.session_state.access_token = data["access_token"]
-                    kite.set_access_token(st.session_state.access_token)
-                    
-                    st.session_state.kite = kite
-                    
-                    st.sidebar.success("✅ Authentication Successful!")
-                    st.rerun()
-                    
-                except Exception as e:
-                    st.sidebar.error(f"❌ Authentication failed: {str(e)}")
-                    logger.error(f"Auth error: {e}")
-    
-    else:
-        # Already authenticated
-        st.sidebar.success("✅ API Connected")
+        if st.button("💾 Update Stocks", use_container_width=True):
+            stocks = [s.strip().upper() for s in stock_input.split('\n') if s.strip()]
+            stocks = stocks[:10]
+            st.session_state.monitoring_stocks = stocks
+            st.success(f"Monitoring {len(stocks)} stocks")
         
-        # Mask access token
-        masked_token = st.session_state.access_token[:8] + "****" if st.session_state.access_token else "N/A"
-        st.sidebar.info(f"🔑 Token: {masked_token}")
+        st.markdown("---")
         
-        if st.sidebar.button("🔌 Disconnect"):
-            stop_websocket()
-            st.session_state.kite = None
-            st.session_state.access_token = ""
-            st.session_state.monitoring_active = False
-            st.session_state.monitored_symbols = []
-            st.session_state.tick_data = {}
-            st.session_state.previous_snapshots = {}
-            st.session_state.daily_signals_pool = []
-            st.session_state.top_signals = []
-            st.sidebar.success("Disconnected successfully")
+        st.subheader("🎚️ Signal Parameters")
+        min_confidence = st.slider("Minimum Confidence", 5, 10, 7)
+        signal_engine.min_confidence = min_confidence
+        
+        st.subheader("⏱️ Refresh Settings")
+        auto_refresh = st.checkbox("Auto Refresh", value=True)
+        
+        if auto_refresh:
+            refresh_interval = st.select_slider(
+                "Refresh Interval",
+                options=[2, 5, 10, 15, 30, 60],
+                value=5,
+                format_func=lambda x: f"{x} seconds"
+            )
+        else:
+            refresh_interval = 30
+        
+        if st.button("🔄 Manual Refresh", use_container_width=True):
             st.rerun()
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# MONITORING SETUP UI
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def render_monitoring_setup():
-    """Render stock monitoring setup interface"""
+        
+        if st.button("🗑️ Clear History", use_container_width=True):
+            st.session_state.signals_history = []
+            st.success("History cleared")
+        
+        st.markdown("---")
+        if st.button("🚪 Logout", use_container_width=True):
+            st.session_state.authenticated = False
+            st.session_state.access_token = None
+            st.rerun()
     
-    st.sidebar.markdown("---")
-    st.sidebar.title("📊 Monitoring Setup")
-    
-    if st.session_state.kite is None:
-        st.sidebar.warning("⚠️ Please authenticate first")
+    if not st.session_state.monitoring_stocks:
+        st.warning("⚠️ Please add stocks to monitor in the sidebar")
         return
     
-    if not st.session_state.monitoring_active:
-        symbols_input = st.sidebar.text_area(
-            "Stock Symbols (NSE)",
-            value="RELIANCE\nTCS\nINFY\nHDFCBANK\nSBIN",
-            height=150,
-            help="Enter one symbol per line"
-        )
+    now = datetime.now().time()
+    market_open = dt_time(9, 15)
+    market_close = dt_time(15, 30)
+    is_market_hours = market_open <= now <= market_close
+    
+    if not is_market_hours:
+        st.warning(f"⏰ Market is closed. Market hours: 9:15 AM - 3:30 PM (Current: {now.strftime('%H:%M')})")
+    
+    all_signals = []
+    historical_data = {}
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for idx, symbol in enumerate(st.session_state.monitoring_stocks):
+        status_text.text(f"Scanning {symbol}... ({idx+1}/{len(st.session_state.monitoring_stocks)})")
+        progress_bar.progress((idx + 1) / len(st.session_state.monitoring_stocks))
         
-        if st.sidebar.button("🚀 Start Monitoring"):
-            symbols = [s.strip().upper() for s in symbols_input.split('\n') if s.strip()]
-            
-            if not symbols:
-                st.sidebar.error("❌ Please enter at least one symbol")
-                return
-            
+        print(f"\n{'='*50}")
+        print(f"Processing: {symbol}")
+        print(f"{'='*50}")
+        
+        quote_data = upstox_client.get_market_quote(symbol)
+        option_data = upstox_client.get_option_chain(symbol)
+        
+        print(f"Quote Data: {'✓ Available' if quote_data else '✗ Failed'}")
+        print(f"Option Data: {'✓ Available' if option_data else '✗ Failed'}")
+        
+        if quote_data:
             try:
-                # Fetch instrument list
-                instruments = st.session_state.kite.instruments("NSE")
+                data_keys = list(quote_data['data'].keys())
+                if not data_keys:
+                    continue
                 
-                # Map symbols to tokens
-                token_map = {}
-                missing = []
+                instrument_key = data_keys[0]
+                market_data = quote_data['data'][instrument_key]
                 
-                for symbol in symbols:
-                    found = False
-                    for inst in instruments:
-                        if inst['tradingsymbol'] == symbol and inst['segment'] == 'NSE':
-                            token_map[symbol] = inst['instrument_token']
-                            found = True
-                            break
+                print(f"\nInstrument Key: {instrument_key}")
+                
+                ohlc = market_data.get('ohlc', {})
+                depth = market_data.get('depth', {})
+                current_volume = market_data.get('volume', 0)
+                current_price = ohlc.get('close', market_data.get('last_price', 0))
+                
+                print(f"Current Price: ₹{current_price}")
+                print(f"Current Volume: {current_volume}")
+                
+                if depth and 'buy' in depth and 'sell' in depth:
+                    print(f"Depth Data: ✓ Available")
                     
-                    if not found:
-                        missing.append(symbol)
+                    buy_ratio, total_buy, total_sell = signal_engine.calculate_orderbook_imbalance(depth)
+                    current_orderbook_qty = total_buy + total_sell
+                    
+                    print(f"Buy Ratio: {buy_ratio*100:.1f}%")
+                else:
+                    current_orderbook_qty = 0
                 
-                if missing:
-                    st.sidebar.warning(f"⚠️ Could not find: {', '.join(missing)}")
+                st.session_state.volume_history[symbol].append(current_volume)
+                st.session_state.price_history[symbol].append(current_price)
+                st.session_state.orderbook_history[symbol].append(current_orderbook_qty)
                 
-                if not token_map:
-                    st.sidebar.error("❌ No valid symbols found")
-                    return
+                avg_volume = np.mean(list(st.session_state.volume_history[symbol])) if len(st.session_state.volume_history[symbol]) > 0 else current_volume
                 
-                # Store configuration
-                st.session_state.monitored_symbols = list(token_map.keys())
-                st.session_state.instrument_tokens_map = token_map
-                st.session_state.monitoring_active = True
+                historical_data[symbol] = {
+                    'volume': list(st.session_state.volume_history[symbol])[-2] if len(st.session_state.volume_history[symbol]) > 1 else current_volume,
+                    'price': list(st.session_state.price_history[symbol])[-2] if len(st.session_state.price_history[symbol]) > 1 else current_price,
+                    'orderbook_qty': list(st.session_state.orderbook_history[symbol])[-2] if len(st.session_state.orderbook_history[symbol]) > 1 else current_orderbook_qty,
+                    'avg_volume': avg_volume
+                }
                 
-                # Start WebSocket with tokens passed as argument
-                start_websocket_thread(
-                    st.session_state.api_key,
-                    st.session_state.access_token,
-                    list(token_map.values())  # Pass tokens directly
+                signal = signal_engine.generate_signal(
+                    symbol, quote_data, option_data, historical_data
                 )
                 
-                st.sidebar.success(f"✅ Monitoring {len(token_map)} stocks!")
-                time.sleep(1)
-                st.rerun()
-                
+                if signal:
+                    print(f"\n🎯 SIGNAL: {signal['signal_type']} - Confidence: {signal['confidence']}/10")
+                    all_signals.append(signal)
+                else:
+                    print(f"\n⚠️ No signal")
+                    
             except Exception as e:
-                st.sidebar.error(f"❌ Setup failed: {str(e)}")
-                logger.error(f"Monitoring setup error: {e}")
+                print(f"\n❌ Error: {str(e)}")
+        
+        time.sleep(0.5)
     
+    progress_bar.empty()
+    status_text.empty()
+    
+    all_signals.sort(key=lambda x: x['relative_score'], reverse=True)
+    
+    if all_signals:
+        st.session_state.signals_history.extend(all_signals)
+        st.session_state.signals_history = st.session_state.signals_history[-100:]
+    
+    st.header("🏆 Top Trading Opportunities")
+    
+    if not all_signals:
+        st.info("🔍 No signals detected yet.")
     else:
-        # Monitoring active
-        st.sidebar.success(f"✅ Monitoring Active")
-        st.sidebar.info(f"📈 Stocks: {', '.join(st.session_state.monitored_symbols[:3])}...")
-        st.sidebar.metric("Total Ticks Processed", st.session_state.total_ticks)
-        
-        ws_status = "🟢 Connected" if CONNECTED.is_set() else "🔴 Disconnected"
-        st.sidebar.info(f"WebSocket: {ws_status}")
-        
-        if st.sidebar.button("⏹️ Stop Monitoring"):
-            stop_websocket()
-            st.session_state.monitoring_active = False
-            st.session_state.monitored_symbols = []
-            st.session_state.tick_data = {}
-            st.session_state.previous_snapshots = {}
-            st.sidebar.success("Monitoring stopped")
-            st.rerun()
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# DASHBOARD UI
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def render_dashboard():
-    """Render main dashboard"""
+        for rank, signal in enumerate(all_signals[:6], 1):
+            display_signal_card(signal, rank)
     
-    st.title("📊 Order Flow Trading Dashboard")
-    st.markdown("### Institutional Activity Detection System")
+    st.markdown("---")
+    st.header("📊 Statistics")
     
-    if not st.session_state.monitoring_active:
-        st.info("👈 Configure monitoring in the sidebar to begin")
-        
-        # Display documentation
-        with st.expander("📖 How It Works"):
-            st.markdown("""
-            **Signal Types:**
-            
-            1. **ACCUMULATION** 🟢 (Best Signal)
-               - Visible selling but price stable
-               - High institutional ratio (hidden buying)
-               - Institutions accumulating via iceberg orders
-            
-            2. **DISTRIBUTION** 🔴
-               - Visible buying but price capped
-               - High institutional ratio (hidden selling)
-               - Institutions distributing via iceberg orders
-            
-            3. **BUY** 🔵
-               - Strong visible buying pressure
-               - High volume, rising price
-               - Confirmed by bullish PCR
-            
-            4. **SELL** 🟠
-               - Strong visible selling pressure
-               - High volume, falling price
-               - Confirmed by bearish PCR
-            
-            **Time Normalization:**
-            - Ticks arrive at irregular intervals (1-3 seconds)
-            - System normalizes volume/orderbook changes to per-second rates
-            - Enables accurate institutional detection regardless of tick frequency
-            
-            **Confidence Scoring:**
-            - Base signal type: 2-3 points
-            - PCR confirmation: 1-4 points
-            - Order imbalance: 2-3 points
-            - Institutional strength: 2-3 points
-            - Volume surge: 1-2 points
-            - Minimum threshold: 7/10
-            """)
-        
-        return
-    
-    # Process ticks
-    processed = process_tick_queue()
-    
-    # Update top signals
-    update_top_signals()
-    
-    # Metrics row
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        st.metric("📊 Monitored Stocks", len(st.session_state.monitored_symbols))
+        st.metric("Total Signals", len(st.session_state.signals_history))
+    with col2:
+        if all_signals:
+            st.metric("Avg Confidence", f"{np.mean([s['confidence'] for s in all_signals]):.1f}/10")
+        else:
+            st.metric("Avg Confidence", "N/A")
+    with col3:
+        if all_signals:
+            st.metric("Accumulation", sum(1 for s in all_signals if s['signal_type'] == 'ACCUMULATION'))
+        else:
+            st.metric("Accumulation", "0")
+    with col4:
+        st.metric("Stocks Monitored", len(st.session_state.monitoring_stocks))
+    
+    if st.session_state.signals_history:
+        st.subheader("📜 Recent Signals")
+        recent_df = pd.DataFrame(st.session_state.signals_history[-20:])
+        recent_df['timestamp'] = recent_df['timestamp'].dt.strftime('%H:%M:%S')
+        st.dataframe(recent_df[['timestamp', 'symbol', 'signal_type', 'confidence', 'relative_score', 'entry_price']], use_container_width=True, hide_index=True)
+    
+    if auto_refresh and is_market_hours:
+        time.sleep(refresh_interval)
+        st.rerun()
+
+def display_signal_card(signal, rank):
+    medal = "🥇" if rank == 1 else "🥈" if rank == 2 else "🥉" if rank == 3 else f"#{rank}"
+    signal_class = {'BUY': 'buy-signal', 'SELL': 'sell-signal', 'ACCUMULATION': 'accumulation-signal', 'DISTRIBUTION': 'distribution-signal'}.get(signal['signal_type'], '')
+    stars = "⭐" * min(int(signal['confidence']), 5)
+    
+    col1, col2, col3 = st.columns([2, 2, 1])
+    
+    with col1:
+        st.markdown(f"""<div class='signal-card {signal_class}'>
+            <h2>{medal} {signal['symbol']} - {signal['signal_type']}</h2>
+            <p><strong>Confidence:</strong> {signal['confidence']}/10 {stars}</p>
+            <p><strong>Score:</strong> {signal['relative_score']}/15</p>
+            <p><strong>Time:</strong> {signal['timestamp'].strftime('%H:%M:%S')}</p>
+        </div>""", unsafe_allow_html=True)
     
     with col2:
-        st.metric("📡 Ticks Processed", st.session_state.total_ticks)
+        st.markdown(f"""<div class='metric-card'>
+            <p><strong>Entry:</strong> ₹{signal['entry_price']}</p>
+            <p><strong>Target:</strong> ₹{signal['target_price']}</p>
+            <p><strong>SL:</strong> ₹{signal['stop_loss']}</p>
+            <p><strong>R:R:</strong> 1:{signal['risk_reward']}</p>
+        </div>""", unsafe_allow_html=True)
     
     with col3:
-        st.metric("🎯 Signals Generated", len(st.session_state.daily_signals_pool))
-    
-    with col4:
-        st.metric("⭐ Top Signals", len(st.session_state.top_signals))
-    
-    st.markdown("---")
-    
-    # Top signals display
-    if st.session_state.top_signals:
-        st.subheader("🏆 Top Trading Opportunities")
-        
-        for idx, signal in enumerate(st.session_state.top_signals, 1):
-            signal_type = signal['Signal Type']
-            
-            # Color coding
-            if signal_type == "ACCUMULATION":
-                color = "green"
-                emoji = "🟢"
-            elif signal_type == "DISTRIBUTION":
-                color = "red"
-                emoji = "🔴"
-            elif signal_type == "BUY":
-                color = "blue"
-                emoji = "🔵"
-            else:  # SELL
-                color = "orange"
-                emoji = "🟠"
-            
-            with st.expander(
-                f"#{idx} {emoji} {signal['Stock Symbol']} - {signal_type} "
-                f"(Confidence: {signal['Confidence Score']}/10, Score: {signal['Relative Score']}/15)",
-                expanded=(idx <= 2)
-            ):
-                col1, col2, col3 = st.columns(3)
-                
-                with col1:
-                    st.markdown("**📊 Price Levels**")
-                    st.metric("Current Price", f"₹{signal['Current Price']}")
-                    st.metric("Entry Price", f"₹{signal['Entry Price']}")
-                    st.metric("Target Price", f"₹{signal['Target Price']}")
-                    st.metric("Stop Loss", f"₹{signal['Stop Loss']}")
-                
-                with col2:
-                    st.markdown("**📈 Trade Metrics**")
-                    st.metric("Risk:Reward", signal['Risk:Reward'])
-                    st.metric("Potential Profit", f"{signal['Potential Profit %']}%")
-                    st.metric("Volume Status", signal['Volume Status'])
-                    st.metric("Institutional Ratio", signal['Institutional Ratio'])
-                
-                with col3:
-                    st.markdown("**🎯 Confirmations**")
-                    st.info(f"**Order Imbalance:** {signal['Order Imbalance']}")
-                    st.info(f"**PCR:** {signal['PCR']} ({signal['PCR Bias']})")
-                    st.info(f"**OI Trend:** {signal['OI Trend']} ({signal['OI Change']:+d})")
-                    st.info(f"**Detected:** {signal['Time Detected']}")
-    
-    else:
-        st.info("⏳ Analyzing market data... Signals will appear when high-quality opportunities are detected (min confidence: 7/10)")
-    
-    st.markdown("---")
-    
-    # Live tick data table
-    with st.expander("📡 Live Tick Data", expanded=False):
-        if st.session_state.tick_data:
-            tick_df_data = []
-            
-            for symbol, tick in st.session_state.tick_data.items():
-                tick_df_data.append({
-                    'Symbol': symbol,
-                    'Price': round(tick.get('last_price', 0), 2),
-                    'Volume': tick.get('volume', 0),
-                    'OI': tick.get('oi', 0),
-                    'Last Update': datetime.fromtimestamp(
-                        tick.get('exchange_timestamp', tick.get('timestamp', time.time()))
-                    ).strftime("%H:%M:%S")
-                })
-            
-            st.dataframe(
-                pd.DataFrame(tick_df_data),
-                use_container_width=True,
-                hide_index=True
-            )
-        else:
-            st.info("No tick data received yet")
-    
-    # Auto-refresh
-    time.sleep(0.5)
-    st.rerun()
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# MAIN APPLICATION
-# ═══════════════════════════════════════════════════════════════════════════════
+        st.markdown(f"""<div class='metric-card'>
+            <p><strong>Buy:</strong> {signal['buy_ratio']}%</p>
+            <p><strong>Inst:</strong> {signal['institutional_ratio']}</p>
+            <p><strong>PCR:</strong> {signal['pcr']}</p>
+            <p><strong>Vol:</strong> {signal['volume_multiplier']}x</p>
+        </div>""", unsafe_allow_html=True)
 
 def main():
-    """Main application entry point"""
-    
-    st.set_page_config(
-        page_title="Order Flow Dashboard",
-        page_icon="📊",
-        layout="wide",
-        initial_sidebar_state="expanded"
-    )
-    
-    # Initialize session state
-    init_session_state()
-    
-    # Render sidebar components
-    render_authentication_ui()
-    render_monitoring_setup()
-    
-    # Self-tests in sidebar
-    st.sidebar.markdown("---")
-    if st.sidebar.button("🔍 Run Self-Tests"):
-        with st.sidebar:
-            with st.spinner("Running tests..."):
-                test_results = run_self_tests()
-                st.subheader("Test Results")
-                for test_name, result in test_results.items():
-                    st.write(f"**{test_name.replace('_', ' ').title()}:** {result}")
-    
-    # Render main dashboard
-    render_dashboard()
+    if not st.session_state.authenticated:
+        render_authentication()
+    else:
+        if not hasattr(st.session_state, 'upstox_client'):
+            st.session_state.upstox_client = UpstoxAPI(st.session_state.access_token)
+        
+        signal_engine = TradingSignalEngine()
+        render_dashboard(st.session_state.upstox_client, signal_engine)
 
 if __name__ == "__main__":
     main()
