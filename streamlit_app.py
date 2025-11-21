@@ -629,7 +629,7 @@ class TradingSignalEngine:
                 'signal_type': signal_type,
                 'confidence': confidence,
                 'relative_score': round(relative_score, 2),
-                'timestamp': datetime.now(pytz.timezone('Asia/Kolkata')),  # Use IST
+                'timestamp': datetime.utcnow() + timedelta(hours=5, minutes=30),  # IST
                 'entry_price': round(entry, 2),
                 'target_price': round(target, 2),
                 'stop_loss': round(stop_loss, 2),
@@ -852,23 +852,42 @@ ALKEM""")
         st.warning("⚠️ Please add stocks to monitor in the sidebar")
         return
     
-    # FIX: Use Indian timezone (IST) instead of server timezone
-    ist = pytz.timezone('Asia/Kolkata')
-    now_ist = datetime.now(ist)
-    now = now_ist.time()
+    # FIX: Manually adjust to IST (UTC + 5:30)
+    utc_now = datetime.utcnow()
+    ist_now = utc_now + timedelta(hours=5, minutes=30)
+    now = ist_now.time()
+    
+    # Market hours: 9:15 AM to 3:30 PM IST
     market_open = dt_time(9, 15)
     market_close = dt_time(15, 30)
+    
+    # Check if current time is within market hours
     is_market_hours = market_open <= now <= market_close
     
-    # Also check if it's a weekday (Monday=0, Sunday=6)
-    is_weekday = now_ist.weekday() < 5  # Monday to Friday
+    # Check if it's a weekday (Monday=0, Sunday=6)
+    is_weekday = ist_now.weekday() < 5  # Monday to Friday
+    
+    # Display market status
+    current_time_str = ist_now.strftime('%H:%M:%S')
+    current_day_str = ist_now.strftime('%A')
     
     if not is_weekday:
-        st.warning(f"⏰ Market is closed (Weekend). Next trading day: Monday")
+        st.warning(f"⏰ Market is closed ({current_day_str}). Current IST: {current_time_str}")
     elif not is_market_hours:
-        st.warning(f"⏰ Market is closed. Market hours: 9:15 AM - 3:30 PM IST (Current IST: {now.strftime('%H:%M:%S')})")
+        st.warning(f"⏰ Market is closed. Market hours: 9:15 AM - 3:30 PM IST (Current: {current_time_str})")
     else:
-        st.success(f"✅ Market is OPEN (IST: {now.strftime('%H:%M:%S')})")
+        st.success(f"✅ Market is OPEN (IST: {current_time_str})")
+    
+    # Show debug info in sidebar
+    with st.sidebar:
+        with st.expander("🕐 Time Debug Info"):
+            st.write(f"**UTC Time:** {utc_now.strftime('%H:%M:%S')}")
+            st.write(f"**IST Time:** {current_time_str}")
+            st.write(f"**Day:** {current_day_str}")
+            st.write(f"**Is Weekday:** {is_weekday}")
+            st.write(f"**Market Open:** {market_open}")
+            st.write(f"**Market Close:** {market_close}")
+            st.write(f"**Is Market Hours:** {is_market_hours}")
     
     all_signals = []
     historical_data = {}
