@@ -5,6 +5,8 @@ from datetime import datetime, time as dt_time, timedelta
 import requests
 import json
 import time
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import hashlib
 from collections import defaultdict, deque
 import warnings
@@ -79,6 +81,9 @@ if 'instrument_map' not in st.session_state:
     st.session_state.instrument_map = {}
 if 'expiry_cache' not in st.session_state:
     st.session_state.expiry_cache = {}
+# FIX: Add cumulative volume tracking for better institutional detection
+if 'cumulative_volume_history' not in st.session_state:
+    st.session_state.cumulative_volume_history = defaultdict(lambda: deque(maxlen=50))
 
 class UpstoxAPI:
     def __init__(self, access_token):
@@ -108,9 +113,7 @@ class UpstoxAPI:
             'POWERGRID': 'POWERGRID',
             'ULTRACEMCO': 'ULTRACEMCO',
             'DRREDDY': 'DRREDDY',
-            'ALKEM': 'ALKEM',
-            'BIOCON': 'BIOCON',
-            'COFORGE': 'COFORGE'
+            'ALKEM': 'ALKEM'
         }
     
     def download_instruments(self):
@@ -126,7 +129,7 @@ class UpstoxAPI:
                 with gzip.GzipFile(fileobj=io.BytesIO(response.content)) as f:
                     instruments_data = json.loads(f.read().decode('utf-8'))
                 
-                for instrument in instruments_
+                for instrument in instruments_data:
                     if instrument.get('segment') == 'NSE_EQ' and instrument.get('instrument_type') == 'EQ':
                         trading_symbol = instrument.get('trading_symbol', '')
                         instrument_key = instrument.get('instrument_key', '')
@@ -288,7 +291,7 @@ class UpstoxAPI:
                 print(f"✓ Option chain fetched for {symbol} (Expiry: {expiry_date})")
                 return data
             else:
-                print(f"✗ Option chain failed for {symbol}: {response.status_code}")
+                print(f"✗ Option chain failed for {symbol}: {response.status_code} - {response.text[:200]}")
                 return None
         except Exception as e:
             print(f"✗ Option chain error for {symbol}: {str(e)}")
@@ -322,26 +325,63 @@ class TradingSignalEngine:
         
         return buy_ratio, total_buy_qty, total_sell_qty
     
-    def detect_hidden_orders(self, symbol, current_volume, prev_volume, 
-                            current_orderbook_qty, prev_orderbook_qty):
-        """Detect institutional hidden orders"""
-        if prev_volume == 0 or prev_orderbook_qty == 0:
+    def detect_hidden_orders(self, symbol, current_volume, volume_history, 
+                            current_orderbook_qty, orderbook_history):
+        """
+        FIX ISSUE #1: Improved institutional hidden orders detection
+        Uses cumulative changes over multiple scans instead of single scan comparison
+        """
+        # Need at least 3 data points for reliable detection
+        if len(volume_history) < 3 or len(orderbook_history) < 3:
             return 1.0
         
-        volume_change = abs(current_volume - prev_volume)
-        orderbook_change = abs(current_orderbook_qty - prev_orderbook_qty)
+        # Calculate changes over last 3 scans (more stable than single scan)
+        recent_volumes = list(volume_history)[-3:]
+        recent_orderbooks = list(orderbook_history)[-3:]
         
-        if orderbook_change == 0:
-            orderbook_change = 1
+        # Cumulative volume change
+        volume_change = sum([abs(recent_volumes[i] - recent_volumes[i-1]) 
+                           for i in range(1, len(recent_volumes))])
         
-        institutional_ratio = volume_change / orderbook_change
+        # Cumulative orderbook change
+        orderbook_change = sum([abs(recent_orderbooks[i] - recent_orderbooks[i-1]) 
+                               for i in range(1, len(recent_orderbooks))])
+        
+        # Dynamic threshold: Use 1% of average orderbook as minimum activity
+        avg_orderbook = np.mean(recent_orderbooks)
+        min_orderbook_change = max(avg_orderbook * 0.01, 1)  # At least 1% or minimum 1
+        
+        # If orderbook barely changed but volume changed significantly
+        if orderbook_change < min_orderbook_change:
+            # Use average volume to determine if volume change is significant
+            avg_volume = np.mean(recent_volumes)
+            min_volume_change = avg_volume * 0.05  # 5% of average volume
+            
+            if volume_change > min_volume_change:
+                # Strong institutional signal: volume moving without visible orderbook
+                institutional_ratio = 5.0
+            else:
+                # Not enough activity to determine
+                institutional_ratio = 1.0
+        else:
+            # Normal calculation
+            institutional_ratio = volume_change / orderbook_change
+        
+        # Cap at reasonable maximum to avoid outliers
+        institutional_ratio = min(institutional_ratio, 10.0)
+        
+        print(f"  └─ Institutional Ratio: {institutional_ratio:.2f} (Vol change: {volume_change:,.0f}, OB change: {orderbook_change:,.0f})")
         
         return institutional_ratio
     
     def calculate_pcr(self, option_data):
-        """Calculate Put-Call Ratio"""
-        if not option_data or 'data' not in option_
-            return 1.0
+        """
+        FIX ISSUE #2: Improved PCR calculation with better error handling
+        Returns None when data is invalid instead of defaulting to 1.0
+        """
+        if not option_data or 'data' not in option_data:
+            print("  └─ PCR: No option data available")
+            return None  # Changed from 1.0
         
         try:
             data = option_data['data']
@@ -349,7 +389,7 @@ class TradingSignalEngine:
             call_oi = 0
             
             # New format: data is a list of strike prices with call/put options
-            for strike_data in 
+            for strike_data in data:
                 if isinstance(strike_data, dict):
                     # Get call and put OI
                     call_options = strike_data.get('call_options', {})
@@ -361,18 +401,29 @@ class TradingSignalEngine:
                     call_oi += call_market_data.get('oi', 0)
                     put_oi += put_market_data.get('oi', 0)
             
-            if call_oi == 0:
-                return 1.0
+            # Validate we have meaningful data
+            if call_oi == 0 or put_oi == 0:
+                print(f"  └─ PCR: Insufficient OI data (Call OI: {call_oi}, Put OI: {put_oi})")
+                return None  # Changed from 1.0
+            
+            # Check for minimum OI threshold (e.g., at least 1000 contracts)
+            if call_oi < 1000 or put_oi < 1000:
+                print(f"  └─ PCR: Low liquidity (Call OI: {call_oi}, Put OI: {put_oi})")
+                return None
             
             pcr = put_oi / call_oi
+            print(f"  └─ PCR: {pcr:.2f} (Put OI: {put_oi:,}, Call OI: {call_oi:,})")
             return pcr
+            
         except Exception as e:
-            print(f"PCR calculation error: {str(e)}")
-            return 1.0
+            print(f"  └─ PCR calculation error: {str(e)}")
+            return None  # Changed from 1.0
     
     def generate_signal(self, symbol, quote_data, option_data, historical_data):
-        """Generate trading signal based on all factors"""
-        if not quote_
+        """
+        FIX ISSUE #3: Corrected ACCUMULATION vs DISTRIBUTION logic
+        """
+        if not quote_data:
             return None
         
         try:
@@ -396,17 +447,27 @@ class TradingSignalEngine:
             current_orderbook_qty = total_buy + total_sell
             
             hist = historical_data.get(symbol, {})
-            prev_volume = hist.get('volume', current_volume)
-            prev_orderbook_qty = hist.get('orderbook_qty', current_orderbook_qty)
+            volume_history = hist.get('volume_history', deque([current_volume]))
+            orderbook_history = hist.get('orderbook_history', deque([current_orderbook_qty]))
             prev_price = hist.get('price', current_price)
             avg_volume = hist.get('avg_volume', current_volume)
             
+            # FIX: Use improved institutional detection
             institutional_ratio = self.detect_hidden_orders(
-                symbol, current_volume, prev_volume,
-                current_orderbook_qty, prev_orderbook_qty
+                symbol, current_volume, volume_history,
+                current_orderbook_qty, orderbook_history
             )
             
+            # FIX: Handle None PCR properly
             pcr = self.calculate_pcr(option_data)
+            has_valid_pcr = pcr is not None
+            
+            # Use neutral PCR if not available (but track this)
+            if pcr is None:
+                pcr = 1.0
+                pcr_confidence_penalty = True
+            else:
+                pcr_confidence_penalty = False
             
             volume_multiplier = current_volume / avg_volume if avg_volume > 0 else 1.0
             
@@ -415,84 +476,153 @@ class TradingSignalEngine:
             signal_type = None
             confidence = 0
             
-            buyers_dominating = buy_ratio >= 0.65
-            sellers_dominating = buy_ratio <= 0.35
+            # Orderbook dominance
+            buyers_dominating = buy_ratio >= 0.65  # 65%+ buyers
+            sellers_dominating = buy_ratio <= 0.35  # 35%- buyers (65%+ sellers)
+            buyers_strong = buy_ratio >= 0.70  # 70%+ buyers
+            sellers_strong = buy_ratio <= 0.30  # 30%- buyers (70%+ sellers)
             
-            price_rising = price_change > 0.1
-            price_falling = price_change < -0.1
-            price_stable = abs(price_change) <= 0.1
+            # Price movement
+            price_rising = price_change > 0.2  # Changed threshold for clarity
+            price_falling = price_change < -0.2
+            price_stable = abs(price_change) <= 0.2
             
+            # Institutional activity
             has_hidden_orders = institutional_ratio >= self.min_institutional_ratio
             strong_hidden_orders = institutional_ratio >= self.strong_institutional_ratio
             
-            pcr_bullish = pcr < 0.9
-            pcr_bearish = pcr > 1.1
-            pcr_very_bullish = pcr < 0.7
-            pcr_very_bearish = pcr > 1.3
+            # PCR positioning (only use if valid)
+            if has_valid_pcr:
+                pcr_bullish = pcr < 0.9
+                pcr_bearish = pcr > 1.1
+                pcr_very_bullish = pcr < 0.7
+                pcr_very_bearish = pcr > 1.3
+            else:
+                # Don't use PCR for signal generation if invalid
+                pcr_bullish = False
+                pcr_bearish = False
+                pcr_very_bullish = False
+                pcr_very_bearish = False
             
+            print(f"\n  Signal Analysis for {symbol}:")
+            print(f"  ├─ Buy Ratio: {buy_ratio*100:.1f}%")
+            print(f"  ├─ Price Change: {price_change:.2f}%")
+            print(f"  ├─ Volume Multiplier: {volume_multiplier:.2f}x")
+            print(f"  ├─ Institutional Ratio: {institutional_ratio:.2f}")
+            print(f"  └─ PCR: {pcr:.2f} {'(Valid)' if has_valid_pcr else '(Invalid - Ignored)'}")
+            
+            # ==========================================
+            # FIX ISSUE #3: CORRECTED SIGNAL LOGIC
+            # ==========================================
+            
+            # Signal 1: BUY - Obvious buying with price rising
             if buyers_dominating and price_rising and volume_multiplier >= self.volume_multiplier_threshold:
                 signal_type = "BUY"
                 confidence += 3
+                print(f"  └─ Signal: BUY (Buyers: {buy_ratio*100:.1f}%, Price: +{price_change:.2f}%)")
                 
+            # Signal 2: SELL - Obvious selling with price falling
             elif sellers_dominating and price_falling and volume_multiplier >= self.volume_multiplier_threshold:
                 signal_type = "SELL"
                 confidence += 3
+                print(f"  └─ Signal: SELL (Sellers: {(1-buy_ratio)*100:.1f}%, Price: {price_change:.2f}%)")
                 
-            elif sellers_dominating and (price_stable or price_rising) and has_hidden_orders and pcr_bullish:
-                signal_type = "ACCUMULATION"
-                confidence += 4
+            # Signal 3: ACCUMULATION - Sellers dominating BUT price NOT falling (institutions buying)
+            # FIXED: Was checking wrong conditions
+            elif sellers_dominating and not price_falling and has_hidden_orders:
+                # Additional confirmation: PCR should be bullish if available
+                if has_valid_pcr and pcr_bullish:
+                    signal_type = "ACCUMULATION"
+                    confidence += 4
+                    print(f"  └─ Signal: ACCUMULATION (Sellers: {(1-buy_ratio)*100:.1f}%, Price stable/rising, Hidden buying)")
+                elif not has_valid_pcr:
+                    # Can still signal without PCR but lower confidence
+                    signal_type = "ACCUMULATION"
+                    confidence += 3
+                    print(f"  └─ Signal: ACCUMULATION (No PCR confirmation)")
                 
-            elif buyers_dominating and (price_stable or price_falling) and has_hidden_orders and pcr_bearish:
-                signal_type = "DISTRIBUTION"
-                confidence += 4
+            # Signal 4: DISTRIBUTION - Buyers dominating BUT price NOT rising (institutions selling)
+            # FIXED: This was not being detected properly
+            elif buyers_dominating and not price_rising and has_hidden_orders:
+                # Additional confirmation: PCR should be bearish if available
+                if has_valid_pcr and pcr_bearish:
+                    signal_type = "DISTRIBUTION"
+                    confidence += 4
+                    print(f"  └─ Signal: DISTRIBUTION (Buyers: {buy_ratio*100:.1f}%, Price stable/falling, Hidden selling)")
+                elif not has_valid_pcr:
+                    # Can still signal without PCR but lower confidence
+                    signal_type = "DISTRIBUTION"
+                    confidence += 3
+                    print(f"  └─ Signal: DISTRIBUTION (No PCR confirmation)")
             
             if signal_type is None:
+                print(f"  └─ No signal generated")
                 return None
             
-            if buy_ratio >= 0.70 or buy_ratio <= 0.30:
+            # ==========================================
+            # CONFIDENCE SCORING
+            # ==========================================
+            
+            # Strong orderbook imbalance
+            if buyers_strong or sellers_strong:
                 confidence += 3
             
+            # Institutional activity level
             if strong_hidden_orders:
                 confidence += 3
             elif has_hidden_orders:
                 confidence += 2
             
-            if (signal_type in ["BUY", "ACCUMULATION"] and pcr_very_bullish) or \
-               (signal_type in ["SELL", "DISTRIBUTION"] and pcr_very_bearish):
-                confidence += 4
-            elif (signal_type in ["BUY", "ACCUMULATION"] and pcr_bullish) or \
-                 (signal_type in ["SELL", "DISTRIBUTION"] and pcr_bearish):
-                confidence += 2
+            # PCR alignment (only if valid)
+            if has_valid_pcr:
+                if (signal_type in ["BUY", "ACCUMULATION"] and pcr_very_bullish) or \
+                   (signal_type in ["SELL", "DISTRIBUTION"] and pcr_very_bearish):
+                    confidence += 4
+                elif (signal_type in ["BUY", "ACCUMULATION"] and pcr_bullish) or \
+                     (signal_type in ["SELL", "DISTRIBUTION"] and pcr_bearish):
+                    confidence += 2
+            else:
+                # Penalty for no PCR confirmation
+                confidence -= 1
             
+            # Volume spike
             if volume_multiplier >= 2.0:
                 confidence += 2
             elif volume_multiplier >= 1.5:
                 confidence += 1
             
+            # Premium for institutional signals
             if signal_type in ["ACCUMULATION", "DISTRIBUTION"]:
                 confidence += 1
             
-            confidence = min(confidence, 10)
+            confidence = max(0, min(confidence, 10))  # Clamp 0-10
             
+            print(f"  └─ Final Confidence: {confidence}/10")
+            
+            # Calculate relative score
             pcr_score = 0
-            if signal_type in ["BUY", "ACCUMULATION"]:
-                pcr_score = max(0, (1.0 - pcr) * 5)
-            else:
-                pcr_score = max(0, (pcr - 1.0) * 5)
+            if has_valid_pcr:
+                if signal_type in ["BUY", "ACCUMULATION"]:
+                    pcr_score = max(0, (1.0 - pcr) * 5)
+                else:
+                    pcr_score = max(0, (pcr - 1.0) * 5)
             
             institutional_score = min(institutional_ratio / 2, 5)
             
             relative_score = confidence + pcr_score + institutional_score
             relative_score = min(relative_score, 15)
             
+            # Minimum confidence filter
             if confidence < self.min_confidence:
+                print(f"  └─ Signal rejected: Confidence {confidence} < {self.min_confidence}")
                 return None
             
+            # Entry/Target/Stop Loss
             if signal_type in ["BUY", "ACCUMULATION"]:
                 entry = current_price
                 target = entry * 1.01
                 stop_loss = entry * 0.996
-            else:
+            else:  # SELL or DISTRIBUTION
                 entry = current_price
                 target = entry * 0.99
                 stop_loss = entry * 1.004
@@ -512,10 +642,13 @@ class TradingSignalEngine:
                 'buy_ratio': round(buy_ratio * 100, 1),
                 'institutional_ratio': round(institutional_ratio, 2),
                 'pcr': round(pcr, 2),
+                'pcr_valid': has_valid_pcr,
                 'volume_multiplier': round(volume_multiplier, 2),
                 'price_change': round(price_change, 2),
                 'current_price': round(current_price, 2)
             }
+            
+            print(f"  └─ ✓ Signal Generated: {signal_type} (Score: {relative_score:.2f}/15)")
             
             return signal
             
@@ -674,9 +807,7 @@ MARUTI
 TATAMOTORS
 AXISBANK
 DRREDDY
-ALKEM
-BIOCON
-COFORGE""")
+ALKEM""")
         
         stock_input = st.text_area(
             "Enter stocks (one per line, max 10)",
@@ -754,7 +885,7 @@ COFORGE""")
         print(f"Quote Data: {'✓ Available' if quote_data else '✗ Failed'}")
         print(f"Option Data: {'✓ Available' if option_data else '✗ Failed'}")
         
-        if quote_
+        if quote_data:
             try:
                 data_keys = list(quote_data['data'].keys())
                 if not data_keys:
@@ -783,16 +914,18 @@ COFORGE""")
                 else:
                     current_orderbook_qty = 0
                 
+                # Store history
                 st.session_state.volume_history[symbol].append(current_volume)
                 st.session_state.price_history[symbol].append(current_price)
                 st.session_state.orderbook_history[symbol].append(current_orderbook_qty)
                 
                 avg_volume = np.mean(list(st.session_state.volume_history[symbol])) if len(st.session_state.volume_history[symbol]) > 0 else current_volume
                 
+                # FIX: Pass full histories instead of single previous values
                 historical_data[symbol] = {
-                    'volume': list(st.session_state.volume_history[symbol])[-2] if len(st.session_state.volume_history[symbol]) > 1 else current_volume,
+                    'volume_history': st.session_state.volume_history[symbol],
+                    'orderbook_history': st.session_state.orderbook_history[symbol],
                     'price': list(st.session_state.price_history[symbol])[-2] if len(st.session_state.price_history[symbol]) > 1 else current_price,
-                    'orderbook_qty': list(st.session_state.orderbook_history[symbol])[-2] if len(st.session_state.orderbook_history[symbol]) > 1 else current_orderbook_qty,
                     'avg_volume': avg_volume
                 }
                 
@@ -842,9 +975,11 @@ COFORGE""")
             st.metric("Avg Confidence", "N/A")
     with col3:
         if all_signals:
-            st.metric("Accumulation", sum(1 for s in all_signals if s['signal_type'] == 'ACCUMULATION'))
+            accum_count = sum(1 for s in all_signals if s['signal_type'] == 'ACCUMULATION')
+            dist_count = sum(1 for s in all_signals if s['signal_type'] == 'DISTRIBUTION')
+            st.metric("Accum/Dist", f"{accum_count}/{dist_count}")
         else:
-            st.metric("Accumulation", "0")
+            st.metric("Accum/Dist", "0/0")
     with col4:
         st.metric("Stocks Monitored", len(st.session_state.monitoring_stocks))
     
@@ -852,22 +987,26 @@ COFORGE""")
         st.subheader("📜 Recent Signals")
         recent_df = pd.DataFrame(st.session_state.signals_history[-20:])
         recent_df['timestamp'] = recent_df['timestamp'].dt.strftime('%H:%M:%S')
-        st.dataframe(recent_df[['timestamp', 'symbol', 'signal_type', 'confidence', 'relative_score', 'entry_price']], use_container_width=True, hide_index=True)
+        
+        # Add PCR validity indicator
+        display_cols = ['timestamp', 'symbol', 'signal_type', 'confidence', 'relative_score', 'entry_price']
+        if 'pcr_valid' in recent_df.columns:
+            recent_df['pcr_status'] = recent_df['pcr_valid'].apply(lambda x: '✓' if x else '✗')
+            display_cols.append('pcr_status')
+        
+        st.dataframe(recent_df[display_cols], use_container_width=True, hide_index=True)
     
     if auto_refresh and is_market_hours:
         time.sleep(refresh_interval)
         st.rerun()
 
 def display_signal_card(signal, rank):
-    """Display individual signal card"""
     medal = "🥇" if rank == 1 else "🥈" if rank == 2 else "🥉" if rank == 3 else f"#{rank}"
-    signal_class = {
-        'BUY': 'buy-signal',
-        'SELL': 'sell-signal',
-        'ACCUMULATION': 'accumulation-signal',
-        'DISTRIBUTION': 'distribution-signal'
-    }.get(signal['signal_type'], '')
+    signal_class = {'BUY': 'buy-signal', 'SELL': 'sell-signal', 'ACCUMULATION': 'accumulation-signal', 'DISTRIBUTION': 'distribution-signal'}.get(signal['signal_type'], '')
     stars = "⭐" * min(int(signal['confidence']), 5)
+    
+    # PCR validity indicator
+    pcr_indicator = "✓" if signal.get('pcr_valid', False) else "✗"
     
     col1, col2, col3 = st.columns([2, 2, 1])
     
@@ -891,49 +1030,11 @@ def display_signal_card(signal, rank):
         st.markdown(f"""<div class='metric-card'>
             <p><strong>Buy:</strong> {signal['buy_ratio']}%</p>
             <p><strong>Inst:</strong> {signal['institutional_ratio']}</p>
-            <p><strong>PCR:</strong> {signal['pcr']}</p>
+            <p><strong>PCR:</strong> {signal['pcr']} {pcr_indicator}</p>
             <p><strong>Vol:</strong> {signal['volume_multiplier']}x</p>
         </div>""", unsafe_allow_html=True)
-    
-    with st.expander(f"📖 Why {signal['symbol']} is ranked #{rank}"):
-        st.write(f"""
-        **Signal Analysis:**
-        - **Order Book:** {signal['buy_ratio']}% buy pressure
-        - **Hidden Orders:** Institutional ratio of {signal['institutional_ratio']} 
-          {'(STRONG institutional activity)' if signal['institutional_ratio'] >= 4.0 else '(institutional activity detected)'}
-        - **Options Market:** PCR of {signal['pcr']} 
-          {'(Very Bullish)' if signal['pcr'] < 0.7 else '(Bullish)' if signal['pcr'] < 0.9 else '(Very Bearish)' if signal['pcr'] > 1.3 else '(Bearish)' if signal['pcr'] > 1.1 else '(Neutral)'}
-        - **Volume:** {signal['volume_multiplier']}x average volume
-        - **Price Action:** {signal['price_change']:+.2f}% change
-        
-        **Why this signal?**
-        """)
-        
-        if signal['signal_type'] == 'ACCUMULATION':
-            st.success("""
-            🔵 **ACCUMULATION detected**: Retail selling (low buy %), but institutions are absorbing 
-            with hidden orders. Price staying stable despite selling pressure. Once retail panic ends, 
-            expect sharp upward move.
-            """)
-        elif signal['signal_type'] == 'DISTRIBUTION':
-            st.warning("""
-            🟠 **DISTRIBUTION detected**: Retail buying (high buy %), but institutions are dumping 
-            with hidden orders. Price not rising despite buying pressure. Once retail demand exhausts, 
-            expect sharp downward move.
-            """)
-        elif signal['signal_type'] == 'BUY':
-            st.info("""
-            🟢 **BUY signal**: Clear buying pressure visible in order book, high volume, and price 
-            rising. Market consensus is bullish. Momentum trade opportunity.
-            """)
-        else:
-            st.info("""
-            🔴 **SELL signal**: Clear selling pressure visible in order book, high volume, and price 
-            falling. Market consensus is bearish. Momentum short trade opportunity.
-            """)
 
 def main():
-    """Main application logic"""
     if not st.session_state.authenticated:
         render_authentication()
     else:
