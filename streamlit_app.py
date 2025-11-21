@@ -81,11 +81,10 @@ if 'instrument_map' not in st.session_state:
     st.session_state.instrument_map = {}
 if 'expiry_cache' not in st.session_state:
     st.session_state.expiry_cache = {}
-if 'cumulative_volume_history' not in st.session_state:
-    st.session_state.cumulative_volume_history = defaultdict(lambda: deque(maxlen=50))
-# ✨ NEW: Delta history tracking
-if 'delta_history' not in st.session_state:
-    st.session_state.delta_history = defaultdict(lambda: deque(maxlen=50))
+if 'equity_delta_history' not in st.session_state:
+    st.session_state.equity_delta_history = defaultdict(lambda: deque(maxlen=50))
+if 'efficiency_history' not in st.session_state:
+    st.session_state.efficiency_history = defaultdict(lambda: deque(maxlen=50))
 
 class UpstoxAPI:
     def __init__(self, access_token):
@@ -258,7 +257,7 @@ class UpstoxAPI:
             return None
     
     def get_option_chain(self, symbol):
-        """Get option chain data for PCR calculation and Delta analysis"""
+        """Get option chain data for PCR calculation"""
         if not self.access_token:
             return None
         
@@ -304,9 +303,9 @@ class TradingSignalEngine:
         self.orderbook_imbalance_threshold = 0.60
         self.volume_multiplier_threshold = 1.5
         
-        # ✨ NEW: Delta thresholds for absorption trap detection
-        self.delta_threshold_strong = 5000  # Strong delta signal
-        self.delta_threshold_moderate = 1000  # Moderate delta signal
+        # Dynamic thresholds (will be calculated per stock)
+        self.delta_threshold_multiplier = 0.10  # 10% of avg volume
+        self.efficiency_multiplier = 3.0  # 3x average efficiency = squat candle
         
     def calculate_orderbook_imbalance(self, depth):
         """Calculate buy/sell imbalance from order book"""
@@ -397,157 +396,123 @@ class TradingSignalEngine:
             print(f"  └─ PCR error: {str(e)}")
             return None
     
-    # ✨ NEW METHOD: Extract delta from option chain
-    def extract_delta_from_chain(self, option_data):
+    def calculate_equity_delta(self, open_p, close_p, high, low, volume):
         """
-        Extract net delta exposure from option chain data
-        Returns: (net_delta, normalized_delta, has_delta_data)
+        Calculate equity delta from OHLC candle data
+        Returns positive for buy pressure, negative for sell pressure
         """
-        if not option_data or 'data' not in option_data:
-            print("  └─ Delta: No option data available")
-            return 0, 0, False
+        range_len = high - low
+        if range_len == 0:
+            return 0
         
-        try:
-            data = option_data['data']
-            net_delta = 0
-            total_oi = 0
-            delta_strikes_count = 0
-            
-            for strike_data in data:
-                if isinstance(strike_data, dict):
-                    # Extract call options delta
-                    call_options = strike_data.get('call_options', {})
-                    call_greeks = call_options.get('option_greeks', {})
-                    call_market_data = call_options.get('market_data', {})
-                    
-                    call_delta = call_greeks.get('delta', 0)
-                    call_oi = call_market_data.get('oi', 0)
-                    
-                    # Extract put options delta
-                    put_options = strike_data.get('put_options', {})
-                    put_greeks = put_options.get('option_greeks', {})
-                    put_market_data = put_options.get('market_data', {})
-                    
-                    put_delta = put_greeks.get('delta', 0)
-                    put_oi = put_market_data.get('oi', 0)
-                    
-                    # Accumulate weighted delta
-                    if call_delta != 0 or put_delta != 0:
-                        delta_strikes_count += 1
-                        net_delta += (call_delta * call_oi) + (put_delta * put_oi)
-                        total_oi += call_oi + put_oi
-            
-            # Check if we have valid delta data
-            if delta_strikes_count == 0:
-                print("  └─ Delta: No Greeks data in option chain")
-                return 0, 0, False
-            
-            # Normalize delta per 1000 contracts for comparison
-            if total_oi > 0:
-                normalized_delta = net_delta / (total_oi / 1000)
-            else:
-                normalized_delta = 0
-            
-            print(f"  └─ Delta: Net={net_delta:,.0f} | Normalized={normalized_delta:.2f} | Strikes={delta_strikes_count}")
-            return net_delta, normalized_delta, True
-            
-        except Exception as e:
-            print(f"  └─ Delta extraction error: {str(e)}")
-            return 0, 0, False
+        # Calculate where price closed in the range (0 = low, 1 = high)
+        buy_pressure = (close_p - low) / range_len
+        
+        # Convert to delta: +100% = all buying, -100% = all selling
+        equity_delta = volume * (2 * buy_pressure - 1)
+        
+        return equity_delta
     
-    # ✨ NEW METHOD: Detect absorption trap using delta
-    def detect_absorption_trap(self, signal_type, buy_ratio, net_delta, has_delta_data):
+    def check_wick_rejection(self, ohlc, signal_type):
         """
-        Detect absorption traps using delta-orderbook divergence
-        Returns: (is_trap, trap_reason)
+        Check for rejection wicks that invalidate signals
+        Returns: (is_rejected, reason)
         """
-        if not has_delta_data:
-            # No delta data available, can't detect absorption trap
+        open_p = ohlc.get('open', 0)
+        close_p = ohlc.get('close', 0)
+        high = ohlc.get('high', 0)
+        low = ohlc.get('low', 0)
+        
+        if high == low:
             return False, None
         
-        # Define thresholds
-        buyers_dominating = buy_ratio >= 0.65
-        sellers_dominating = buy_ratio <= 0.35
+        # Calculate body and wicks
+        body_top = max(open_p, close_p)
+        body_bottom = min(open_p, close_p)
+        body_size = abs(close_p - open_p)
         
-        delta_bullish = net_delta > self.delta_threshold_moderate
-        delta_bearish = net_delta < -self.delta_threshold_moderate
-        delta_very_bullish = net_delta > self.delta_threshold_strong
-        delta_very_bearish = net_delta < -self.delta_threshold_strong
+        upper_wick = high - body_top
+        lower_wick = body_bottom - low
         
-        # ACCUMULATION signal validation
-        if signal_type == "ACCUMULATION":
-            # Sellers dominating orderbook (should see selling pressure)
-            # But if delta is BEARISH (negative), it's a trap
-            # Real accumulation should have BULLISH delta (positive)
-            
-            if delta_bearish:
-                return True, f"TRAP: Sellers dominating with bearish delta ({net_delta:,.0f})"
-            elif delta_very_bearish:
-                return True, f"STRONG TRAP: Very bearish delta ({net_delta:,.0f}) contradicts accumulation"
+        # Avoid division by zero
+        if body_size == 0:
+            body_size = 0.01
         
-        # DISTRIBUTION signal validation
-        elif signal_type == "DISTRIBUTION":
-            # Buyers dominating orderbook (should see buying pressure)
-            # But if delta is BULLISH (positive), it's a trap
-            # Real distribution should have BEARISH delta (negative)
-            
-            if delta_bullish:
-                return True, f"TRAP: Buyers dominating with bullish delta ({net_delta:,.0f})"
-            elif delta_very_bullish:
-                return True, f"STRONG TRAP: Very bullish delta ({net_delta:,.0f}) contradicts distribution"
+        # BUY signal: Check for upper wick rejection
+        if signal_type == "BUY":
+            if upper_wick > (body_size * 1.5):
+                return True, f"Upper wick ({upper_wick:.2f}) > 1.5x body ({body_size:.2f})"
         
-        # BUY signal validation
-        elif signal_type == "BUY":
-            # Buy signal with bearish delta could be a trap
-            if delta_very_bearish:
-                return True, f"TRAP: Buy signal with very bearish delta ({net_delta:,.0f})"
-        
-        # SELL signal validation
+        # SELL signal: Check for lower wick rejection
         elif signal_type == "SELL":
-            # Sell signal with bullish delta could be a trap
-            if delta_very_bullish:
-                return True, f"TRAP: Sell signal with very bullish delta ({net_delta:,.0f})"
+            if lower_wick > (body_size * 1.5):
+                return True, f"Lower wick ({lower_wick:.2f}) > 1.5x body ({body_size:.2f})"
+        
+        # ACCUMULATION: Strong lower wick is good (support)
+        # DISTRIBUTION: Strong upper wick is good (resistance)
         
         return False, None
     
-    # ✨ NEW METHOD: Calculate delta alignment score
-    def calculate_delta_alignment_score(self, signal_type, net_delta, has_delta_data):
+    def detect_squat_candle(self, equity_delta, candle_range, avg_volume, efficiency_history):
         """
-        Calculate confidence boost based on delta alignment with signal
-        Returns: confidence_boost (0-3 points)
+        Detect squat candles: High effort (volume/delta) but low result (price movement)
+        Returns: (is_squat, reason)
         """
-        if not has_delta_data:
-            return 0
+        if candle_range == 0:
+            candle_range = 0.05
         
-        delta_bullish = net_delta > self.delta_threshold_moderate
-        delta_bearish = net_delta < -self.delta_threshold_moderate
-        delta_very_bullish = net_delta > self.delta_threshold_strong
-        delta_very_bearish = net_delta < -self.delta_threshold_strong
+        # Calculate efficiency: How much delta per rupee moved
+        efficiency = abs(equity_delta) / candle_range
         
-        confidence_boost = 0
+        # Calculate average efficiency from history
+        if len(efficiency_history) >= 3:
+            avg_efficiency = np.mean(list(efficiency_history)[-10:])
+        else:
+            # Default baseline: 10% of average volume per rupee
+            avg_efficiency = avg_volume * 0.10
         
-        # ACCUMULATION/BUY signals benefit from bullish delta
-        if signal_type in ["ACCUMULATION", "BUY"]:
-            if delta_very_bullish:
-                confidence_boost = 3
-                print(f"  └─ Delta Boost: +3 (Very bullish delta {net_delta:,.0f})")
-            elif delta_bullish:
-                confidence_boost = 2
-                print(f"  └─ Delta Boost: +2 (Bullish delta {net_delta:,.0f})")
+        # If current efficiency is 3x higher than average = SQUAT
+        if efficiency > (avg_efficiency * self.efficiency_multiplier):
+            return True, f"Efficiency {efficiency:.0f} > {avg_efficiency * self.efficiency_multiplier:.0f} (SQUAT)"
         
-        # DISTRIBUTION/SELL signals benefit from bearish delta
-        elif signal_type in ["DISTRIBUTION", "SELL"]:
-            if delta_very_bearish:
-                confidence_boost = 3
-                print(f"  └─ Delta Boost: +3 (Very bearish delta {net_delta:,.0f})")
-            elif delta_bearish:
-                confidence_boost = 2
-                print(f"  └─ Delta Boost: +2 (Bearish delta {net_delta:,.0f})")
+        return False, None
+    
+    def detect_delta_divergence(self, signal_type, equity_delta, price_change):
+        """
+        Detect delta-price divergence (absorption traps)
+        Returns: (is_divergence, reason)
+        """
+        delta_bullish = equity_delta > 0
+        delta_bearish = equity_delta < 0
+        price_bullish = price_change > 0.2
+        price_bearish = price_change < -0.2
         
-        return confidence_boost
+        # ACCUMULATION: Expecting selling pressure but delta shows buying
+        if signal_type == "ACCUMULATION":
+            # This is GOOD - sellers in orderbook but delta is positive (buying)
+            if delta_bearish:
+                return True, f"TRAP: Accumulation signal but delta is negative ({equity_delta:.0f})"
+        
+        # DISTRIBUTION: Expecting buying pressure but delta shows selling
+        elif signal_type == "DISTRIBUTION":
+            # This is GOOD - buyers in orderbook but delta is negative (selling)
+            if delta_bullish:
+                return True, f"TRAP: Distribution signal but delta is positive ({equity_delta:.0f})"
+        
+        # BUY: Price rising but delta negative = absorption
+        elif signal_type == "BUY":
+            if delta_bearish and abs(equity_delta) > 1000:
+                return True, f"TRAP: Price rising but strong sell delta ({equity_delta:.0f})"
+        
+        # SELL: Price falling but delta positive = absorption
+        elif signal_type == "SELL":
+            if delta_bullish and abs(equity_delta) > 1000:
+                return True, f"TRAP: Price falling but strong buy delta ({equity_delta:.0f})"
+        
+        return False, None
     
     def generate_signal(self, symbol, quote_data, option_data, historical_data):
-        """Generate trading signal with delta-enhanced absorption trap detection"""
+        """Generate trading signal with comprehensive absorption trap detection"""
         if not quote_data:
             return None
         
@@ -562,11 +527,16 @@ class TradingSignalEngine:
             ohlc = market_data.get('ohlc', {})
             depth = market_data.get('depth', {})
             
-            current_price = ohlc.get('close', 0)
-            if current_price == 0:
-                current_price = market_data.get('last_price', 0)
+            open_p = ohlc.get('open', 0)
+            close_p = ohlc.get('close', 0)
+            high = ohlc.get('high', 0)
+            low = ohlc.get('low', 0)
             
+            current_price = close_p if close_p > 0 else market_data.get('last_price', 0)
             current_volume = market_data.get('volume', 0)
+            
+            # Calculate equity delta from candle
+            equity_delta = self.calculate_equity_delta(open_p, close_p, high, low, current_volume)
             
             buy_ratio, total_buy, total_sell = self.calculate_orderbook_imbalance(depth)
             current_orderbook_qty = total_buy + total_sell
@@ -574,6 +544,7 @@ class TradingSignalEngine:
             hist = historical_data.get(symbol, {})
             volume_history = hist.get('volume_history', deque([current_volume]))
             orderbook_history = hist.get('orderbook_history', deque([current_orderbook_qty]))
+            efficiency_history = hist.get('efficiency_history', deque())
             prev_price = hist.get('price', current_price)
             avg_volume = hist.get('avg_volume', current_volume)
             
@@ -587,15 +558,10 @@ class TradingSignalEngine:
             
             if pcr is None:
                 pcr = 1.0
-                pcr_confidence_penalty = True
-            else:
-                pcr_confidence_penalty = False
-            
-            # ✨ NEW: Extract delta from option chain
-            net_delta, normalized_delta, has_delta_data = self.extract_delta_from_chain(option_data)
             
             volume_multiplier = current_volume / avg_volume if avg_volume > 0 else 1.0
             price_change = ((current_price - prev_price) / prev_price * 100) if prev_price > 0 else 0
+            candle_range = high - low
             
             signal_type = None
             confidence = 0
@@ -607,7 +573,6 @@ class TradingSignalEngine:
             
             price_rising = price_change > 0.2
             price_falling = price_change < -0.2
-            price_stable = abs(price_change) <= 0.2
             
             has_hidden_orders = institutional_ratio >= self.min_institutional_ratio
             strong_hidden_orders = institutional_ratio >= self.strong_institutional_ratio
@@ -623,13 +588,18 @@ class TradingSignalEngine:
                 pcr_very_bullish = False
                 pcr_very_bearish = False
             
+            # Dynamic delta threshold based on average volume
+            delta_threshold_strong = avg_volume * self.delta_threshold_multiplier
+            delta_threshold_moderate = delta_threshold_strong * 0.5
+            
             print(f"\n  Signal Analysis for {symbol}:")
             print(f"  ├─ Buy Ratio: {buy_ratio*100:.1f}%")
             print(f"  ├─ Price Change: {price_change:.2f}%")
             print(f"  ├─ Volume Multiplier: {volume_multiplier:.2f}x")
             print(f"  ├─ Institutional Ratio: {institutional_ratio:.2f}")
             print(f"  ├─ PCR: {pcr:.2f} {'(Valid)' if has_valid_pcr else '(Invalid)'}")
-            print(f"  └─ Net Delta: {net_delta:,.0f} {'(Valid)' if has_delta_data else '(No data)'}")
+            print(f"  ├─ Equity Delta: {equity_delta:,.0f}")
+            print(f"  └─ Candle Range: ₹{candle_range:.2f}")
             
             # Signal Logic
             if buyers_dominating and price_rising and volume_multiplier >= self.volume_multiplier_threshold:
@@ -666,14 +636,28 @@ class TradingSignalEngine:
                 print(f"  └─ No signal")
                 return None
             
-            # ✨ NEW: Check for absorption trap using delta
-            is_trap, trap_reason = self.detect_absorption_trap(
-                signal_type, buy_ratio, net_delta, has_delta_data
-            )
+            # TRAP DETECTION FILTERS
             
-            if is_trap:
-                print(f"  └─ 🚫 {trap_reason}")
-                print(f"  └─ Signal REJECTED due to absorption trap")
+            # Filter 1: Wick Rejection
+            is_rejected, reject_reason = self.check_wick_rejection(ohlc, signal_type)
+            if is_rejected:
+                print(f"  └─ 🚫 REJECTED: {reject_reason}")
+                return None
+            
+            # Filter 2: Squat Candle Detection
+            is_squat, squat_reason = self.detect_squat_candle(
+                equity_delta, candle_range, avg_volume, efficiency_history
+            )
+            if is_squat:
+                print(f"  └─ 🚫 REJECTED: {squat_reason}")
+                return None
+            
+            # Filter 3: Delta-Price Divergence
+            is_divergence, div_reason = self.detect_delta_divergence(
+                signal_type, equity_delta, price_change
+            )
+            if is_divergence:
+                print(f"  └─ 🚫 REJECTED: {div_reason}")
                 return None
             
             # Confidence scoring
@@ -703,9 +687,19 @@ class TradingSignalEngine:
             if signal_type in ["ACCUMULATION", "DISTRIBUTION"]:
                 confidence += 1
             
-            # ✨ NEW: Add delta alignment confidence boost
-            delta_boost = self.calculate_delta_alignment_score(signal_type, net_delta, has_delta_data)
-            confidence += delta_boost
+            # Delta alignment boost
+            if signal_type in ["BUY", "ACCUMULATION"] and equity_delta > delta_threshold_strong:
+                confidence += 3
+                print(f"  └─ Delta Boost: +3 (Strong buy delta)")
+            elif signal_type in ["BUY", "ACCUMULATION"] and equity_delta > delta_threshold_moderate:
+                confidence += 2
+                print(f"  └─ Delta Boost: +2 (Moderate buy delta)")
+            elif signal_type in ["SELL", "DISTRIBUTION"] and equity_delta < -delta_threshold_strong:
+                confidence += 3
+                print(f"  └─ Delta Boost: +3 (Strong sell delta)")
+            elif signal_type in ["SELL", "DISTRIBUTION"] and equity_delta < -delta_threshold_moderate:
+                confidence += 2
+                print(f"  └─ Delta Boost: +2 (Moderate sell delta)")
             
             confidence = max(0, min(confidence, 10))
             
@@ -720,16 +714,11 @@ class TradingSignalEngine:
             
             institutional_score = min(institutional_ratio / 2, 5)
             
-            # ✨ NEW: Add delta to relative score
-            delta_score = 0
-            if has_delta_data:
-                if signal_type in ["BUY", "ACCUMULATION"]:
-                    delta_score = min(abs(net_delta) / 2000, 3)
-                else:
-                    delta_score = min(abs(net_delta) / 2000, 3)
+            # Delta score contribution
+            delta_score = min(abs(equity_delta) / (avg_volume * 0.5), 3)
             
             relative_score = confidence + pcr_score + institutional_score + delta_score
-            relative_score = min(relative_score, 18)  # Increased max from 15 to 18
+            relative_score = min(relative_score, 18)
             
             if confidence < self.min_confidence:
                 print(f"  └─ Rejected: Confidence {confidence} < {self.min_confidence}")
@@ -767,10 +756,10 @@ class TradingSignalEngine:
                 'volume_multiplier': round(volume_multiplier, 2),
                 'price_change': round(price_change, 2),
                 'current_price': round(current_price, 2),
-                # ✨ NEW: Add delta fields to signal
-                'net_delta': round(net_delta, 2),
-                'normalized_delta': round(normalized_delta, 2),
-                'has_delta': has_delta_data
+                'equity_delta': round(equity_delta, 2),
+                'candle_range': round(candle_range, 2),
+                'upper_wick': round(high - max(open_p, close_p), 2),
+                'lower_wick': round(min(open_p, close_p) - low, 2)
             }
             
             print(f"  └─ ✓ Generated: {signal_type} (Score: {relative_score:.2f}/18)")
@@ -952,16 +941,12 @@ ALKEM""")
         min_confidence = st.slider("Minimum Confidence", 5, 10, 7)
         signal_engine.min_confidence = min_confidence
         
-        # ✨ NEW: Delta threshold controls
         st.subheader("🔢 Delta Parameters")
-        delta_moderate = st.number_input("Moderate Delta Threshold", 
-                                         min_value=500, max_value=5000, 
-                                         value=1000, step=100)
-        delta_strong = st.number_input("Strong Delta Threshold", 
-                                       min_value=2000, max_value=10000, 
-                                       value=5000, step=500)
-        signal_engine.delta_threshold_moderate = delta_moderate
-        signal_engine.delta_threshold_strong = delta_strong
+        delta_multiplier = st.slider("Delta Threshold (%)", 5, 20, 10)
+        signal_engine.delta_threshold_multiplier = delta_multiplier / 100
+        
+        efficiency_mult = st.slider("Efficiency Multiplier", 2.0, 5.0, 3.0, 0.5)
+        signal_engine.efficiency_multiplier = efficiency_mult
         
         st.subheader("⏱️ Refresh Settings")
         auto_refresh = st.checkbox("Auto Refresh", value=True)
@@ -985,7 +970,6 @@ ALKEM""")
         
         st.markdown("---")
         
-        # Debug info
         with st.expander("🕐 Time Debug Info"):
             utc_now = datetime.utcnow()
             ist_now = utc_now + timedelta(hours=5, minutes=30)
@@ -1003,7 +987,6 @@ ALKEM""")
         st.warning("⚠️ Please add stocks to monitor in the sidebar")
         return
     
-    # Get IST time
     utc_now = datetime.utcnow()
     ist_now = utc_now + timedelta(hours=5, minutes=30)
     now = ist_now.time()
@@ -1060,6 +1043,15 @@ ALKEM""")
                 
                 print(f"Price: ₹{current_price}, Volume: {current_volume}")
                 
+                # Calculate equity delta
+                open_p = ohlc.get('open', current_price)
+                high = ohlc.get('high', current_price)
+                low = ohlc.get('low', current_price)
+                
+                equity_delta = signal_engine.calculate_equity_delta(
+                    open_p, current_price, high, low, current_volume
+                )
+                
                 if depth and 'buy' in depth and 'sell' in depth:
                     buy_ratio, total_buy, total_sell = signal_engine.calculate_orderbook_imbalance(depth)
                     current_orderbook_qty = total_buy + total_sell
@@ -1070,18 +1062,20 @@ ALKEM""")
                 st.session_state.volume_history[symbol].append(current_volume)
                 st.session_state.price_history[symbol].append(current_price)
                 st.session_state.orderbook_history[symbol].append(current_orderbook_qty)
+                st.session_state.equity_delta_history[symbol].append(equity_delta)
                 
-                # ✨ NEW: Extract and track delta
-                if option_data:
-                    net_delta, norm_delta, has_delta = signal_engine.extract_delta_from_chain(option_data)
-                    if has_delta:
-                        st.session_state.delta_history[symbol].append(net_delta)
+                # Calculate and store efficiency
+                candle_range = high - low
+                if candle_range > 0:
+                    efficiency = abs(equity_delta) / candle_range
+                    st.session_state.efficiency_history[symbol].append(efficiency)
                 
                 avg_volume = np.mean(list(st.session_state.volume_history[symbol])) if len(st.session_state.volume_history[symbol]) > 0 else current_volume
                 
                 historical_data[symbol] = {
                     'volume_history': st.session_state.volume_history[symbol],
                     'orderbook_history': st.session_state.orderbook_history[symbol],
+                    'efficiency_history': st.session_state.efficiency_history[symbol],
                     'price': list(st.session_state.price_history[symbol])[-2] if len(st.session_state.price_history[symbol]) > 1 else current_price,
                     'avg_volume': avg_volume
                 }
@@ -1147,13 +1141,9 @@ ALKEM""")
         
         display_cols = ['timestamp', 'symbol', 'signal_type', 'confidence', 'relative_score', 'entry_price']
         
-        # ✨ NEW: Add delta column if available
-        if 'has_delta' in recent_df.columns:
-            recent_df['delta_status'] = recent_df.apply(
-                lambda row: f"{row['net_delta']:,.0f}" if row['has_delta'] else 'N/A',
-                axis=1
-            )
-            display_cols.append('delta_status')
+        if 'equity_delta' in recent_df.columns:
+            recent_df['delta'] = recent_df['equity_delta'].apply(lambda x: f"{x:,.0f}")
+            display_cols.append('delta')
         
         if 'pcr_valid' in recent_df.columns:
             recent_df['pcr_status'] = recent_df['pcr_valid'].apply(lambda x: '✓' if x else '✗')
@@ -1171,7 +1161,6 @@ def display_signal_card(signal, rank):
     stars = "⭐" * min(int(signal['confidence']), 5)
     
     pcr_indicator = "✓" if signal.get('pcr_valid', False) else "✗"
-    delta_indicator = "✓" if signal.get('has_delta', False) else "✗"
     
     col1, col2, col3 = st.columns([2, 2, 1])
     
@@ -1192,13 +1181,13 @@ def display_signal_card(signal, rank):
         </div>""", unsafe_allow_html=True)
     
     with col3:
-        # ✨ NEW: Display delta in signal card
-        delta_display = f"{signal.get('net_delta', 0):,.0f}" if signal.get('has_delta', False) else "N/A"
+        delta_display = f"{signal.get('equity_delta', 0):,.0f}"
+        delta_color = "green" if signal.get('equity_delta', 0) > 0 else "red"
         st.markdown(f"""<div class='metric-card'>
             <p><strong>Buy:</strong> {signal['buy_ratio']}%</p>
             <p><strong>Inst:</strong> {signal['institutional_ratio']}</p>
             <p><strong>PCR:</strong> {signal['pcr']} {pcr_indicator}</p>
-            <p><strong>Delta:</strong> {delta_display} {delta_indicator}</p>
+            <p><strong>Delta:</strong> <span style="color:{delta_color}">{delta_display}</span></p>
         </div>""", unsafe_allow_html=True)
 
 def main():
