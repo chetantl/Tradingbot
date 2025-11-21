@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from datetime import datetime, time as dt_time, timedelta
+import pytz
 import requests
 import json
 import time
@@ -381,7 +382,7 @@ class TradingSignalEngine:
         """
         if not option_data or 'data' not in option_data:
             print("  └─ PCR: No option data available")
-            return None  # Changed from 1.0
+            return None
         
         try:
             data = option_data['data']
@@ -401,14 +402,9 @@ class TradingSignalEngine:
                     call_oi += call_market_data.get('oi', 0)
                     put_oi += put_market_data.get('oi', 0)
             
-            # Validate we have meaningful data
+            # Just check if we have any data at all
             if call_oi == 0 or put_oi == 0:
-                print(f"  └─ PCR: Insufficient OI data (Call OI: {call_oi}, Put OI: {put_oi})")
-                return None  # Changed from 1.0
-            
-            # Check for minimum OI threshold (e.g., at least 1000 contracts)
-            if call_oi < 1000 or put_oi < 1000:
-                print(f"  └─ PCR: Low liquidity (Call OI: {call_oi}, Put OI: {put_oi})")
+                print(f"  └─ PCR: No OI data (Call OI: {call_oi}, Put OI: {put_oi})")
                 return None
             
             pcr = put_oi / call_oi
@@ -417,7 +413,7 @@ class TradingSignalEngine:
             
         except Exception as e:
             print(f"  └─ PCR calculation error: {str(e)}")
-            return None  # Changed from 1.0
+            return None
     
     def generate_signal(self, symbol, quote_data, option_data, historical_data):
         """
