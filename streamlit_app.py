@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from datetime import datetime, time as dt_time, timedelta
-import pytz
 import requests
 import json
 import time
@@ -630,7 +629,7 @@ class TradingSignalEngine:
                 'signal_type': signal_type,
                 'confidence': confidence,
                 'relative_score': round(relative_score, 2),
-                'timestamp': datetime.now(),
+                'timestamp': datetime.now(pytz.timezone('Asia/Kolkata')),  # Use IST
                 'entry_price': round(entry, 2),
                 'target_price': round(target, 2),
                 'stop_loss': round(stop_loss, 2),
@@ -853,13 +852,23 @@ ALKEM""")
         st.warning("⚠️ Please add stocks to monitor in the sidebar")
         return
     
-    now = datetime.now().time()
+    # FIX: Use Indian timezone (IST) instead of server timezone
+    ist = pytz.timezone('Asia/Kolkata')
+    now_ist = datetime.now(ist)
+    now = now_ist.time()
     market_open = dt_time(9, 15)
     market_close = dt_time(15, 30)
     is_market_hours = market_open <= now <= market_close
     
-    if not is_market_hours:
-        st.warning(f"⏰ Market is closed. Market hours: 9:15 AM - 3:30 PM (Current: {now.strftime('%H:%M')})")
+    # Also check if it's a weekday (Monday=0, Sunday=6)
+    is_weekday = now_ist.weekday() < 5  # Monday to Friday
+    
+    if not is_weekday:
+        st.warning(f"⏰ Market is closed (Weekend). Next trading day: Monday")
+    elif not is_market_hours:
+        st.warning(f"⏰ Market is closed. Market hours: 9:15 AM - 3:30 PM IST (Current IST: {now.strftime('%H:%M:%S')})")
+    else:
+        st.success(f"✅ Market is OPEN (IST: {now.strftime('%H:%M:%S')})")
     
     all_signals = []
     historical_data = {}
@@ -992,7 +1001,7 @@ ALKEM""")
         
         st.dataframe(recent_df[display_cols], use_container_width=True, hide_index=True)
     
-    if auto_refresh and is_market_hours:
+    if auto_refresh and is_market_hours and is_weekday:
         time.sleep(refresh_interval)
         st.rerun()
 
@@ -1042,4 +1051,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
