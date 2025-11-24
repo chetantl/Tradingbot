@@ -206,7 +206,8 @@ def equity_and_option_engine(symbols):
         qdata = fetch_market_quote(symbols)
         for sym in symbols:
             api_key = f"NSE_EQ|{sym}"
-            if api_key not in q continue
+            if api_key not in q:
+                 continue
             quote_data = qdata[api_key]
             sdata = state.stock_data.setdefault(sym, {})
             ohlc = quote_data.get('ohlc', {})
