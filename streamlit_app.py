@@ -161,7 +161,8 @@ def rvol_candidates(symbol_list):
     slot = get_current_5min_index()
     for sym in symbol_list:
         candles = fetch_5min_historical(sym)
-        if not candles or len(candles) < slot+1: continue
+        if not candles or len(candles) < slot+1: 
+            continue
         volumes_by_slot = [[] for _ in range(79)]  # 79 bins per day 9:15–15:30
         for candle in candles:
             c_time = datetime.fromtimestamp(candle[0]//1000)
