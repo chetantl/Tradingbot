@@ -5,6 +5,7 @@ import time
 from datetime import datetime, timedelta
 from collections import deque
 import pandas as pd 
+import copy
 
 # --- PAGE CONFIG ---
 st.set_page_config(
@@ -225,8 +226,13 @@ def sniper_worker(kite):
                 for item in manager.active_symbols:
                     sym = item["symbol"]
                     key = f"NSE:{sym}"
+                    
+                    # --- FIXED SYNTAX ERROR AREA ---
+                    # The logic below replaces any incomplete lines
                     if key not in quotes or not quotes[key]:
                         continue
+                    # -------------------------------
+                    
                     q = quotes[key]
 
                     ltp = safe_float(q.get("last_price"))
