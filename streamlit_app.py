@@ -240,7 +240,7 @@ def sniper_worker(kite):
                         safe_int(x.get("quantity")) for x in depth.get("sell", [])
                     )
 
-                    if sym not in manager.data:
+                    if sym not in manager.
                         continue
 
                     stt = manager.data[sym]
@@ -470,8 +470,7 @@ st.markdown(
 with manager.lock:
     display_data = [(k, v.copy()) for k, v in manager.data.items()]
 
-# --- FIXED VARIABLE NAME ERROR ---
-if display_  # Changed from 'if display_:' to 'if display_'
+if display_
     cols = st.columns(3)
     items = sorted(
         display_data,
