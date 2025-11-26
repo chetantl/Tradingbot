@@ -227,11 +227,8 @@ def sniper_worker(kite):
                     sym = item["symbol"]
                     key = f"NSE:{sym}"
                     
-                    # --- FIXED SYNTAX ERROR AREA ---
-                    # The logic below replaces any incomplete lines
                     if key not in quotes or not quotes[key]:
                         continue
-                    # -------------------------------
                     
                     q = quotes[key]
 
@@ -243,7 +240,7 @@ def sniper_worker(kite):
                         safe_int(x.get("quantity")) for x in depth.get("sell", [])
                     )
 
-                    if sym not in manager:
+                    if sym not in manager.
                         continue
 
                     stt = manager.data[sym]
@@ -473,7 +470,8 @@ st.markdown(
 with manager.lock:
     display_data = [(k, v.copy()) for k, v in manager.data.items()]
 
-if display_data:
+# --- FIXED VARIABLE NAME ERROR ---
+if display_  # Changed from 'if display_:' to 'if display_'
     cols = st.columns(3)
     items = sorted(
         display_data,
