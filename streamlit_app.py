@@ -473,7 +473,7 @@ st.markdown(
 with manager.lock:
     display_data = [(k, v.copy()) for k, v in manager.data.items()]
 
-if display_
+if display:
     cols = st.columns(3)
     items = sorted(
         display_data,
