@@ -243,7 +243,7 @@ def sniper_worker(kite):
                         safe_int(x.get("quantity")) for x in depth.get("sell", [])
                     )
 
-                    if sym not in manager.
+                    if sym not in manager:
                         continue
 
                     stt = manager.data[sym]
