@@ -4,8 +4,9 @@ import threading
 import time
 from datetime import datetime, timedelta
 from collections import deque
-import pandas as pd 
+import pandas as pd
 import copy
+from collections import defaultdict
 
 # --- PAGE CONFIG ---
 st.set_page_config(
@@ -14,35 +15,20 @@ st.set_page_config(
     layout="wide",
 )
 
-st.markdown("""
-<style>
-/* Streamlit UI Overrides */
-.stMetric { background-color: #111827; border: 1px solid #374151; border-radius: 8px; padding: 10px; }
-.metric-value { font-size: 1.2rem; font-weight: bold; color: #f3f4f6; }
-.badge { padding: 4px 8px; border-radius: 4px; font-weight: bold; font-size: 0.8rem; }
-/* Signal Colors */
-.accum { background: #064e3b; color: #6ee7b7; border: 1px solid #059669; }
-.dist { background: #7f1d1d; color: #fca5a5; border: 1px solid #dc2626; }
-.idle { background: #374151; color: #d1d5db; border: 1px solid #4b5563; }
-/* Confirmed Border */
-.conf { border: 3px solid #fbbf24; box-shadow: 0 0 12px #fbbf24; }
-</style>
-""", unsafe_allow_html=True)
-
 # --- CONFIGURATION ---
 CONFIG = {
-    "rvol_threshold": 1.5,          # now only for labeling (High/Low), not gating
+    "rvol_threshold": 1.5,
     "ratio_threshold": 2.5,
     "strong_ratio_threshold": 4.0,
     "persistence_count": 3,
     "strong_persistence": 1,
     "imbalance_mult": 1.5,
     "history_days": 10,
-    "redirect_url": "http://127.0.0.1/"
 }
 
-# --- UTILITIES ---
+IDLE_DROP_COUNT = 2  # consecutive IDLE raw reads needed to reset final signal
 
+# --- UTILITIES ---
 def safe_float(val, default=0.0):
     try:
         return float(val) if val is not None else default
@@ -55,21 +41,20 @@ def safe_int(val, default=0):
     except:
         return default
 
-# --- SINGLETON STATE MANAGEMENT ---
-
+# --- STATE MANAGEMENT ---
 class SniperManager:
     def __init__(self):
         self.lock = threading.Lock()
-        self.logs = deque(maxlen=50)
-        self.data = {}           # symbol -> state dict
-        self.active_symbols = [] # list of {"symbol":..., "token":...}
+        self.logs = deque(maxlen=200)
+        self.data = {}
+        self.active_symbols = []
         self.is_running = False
         self.stop_event = threading.Event()
         self.kite = None
-        self.last_beat = 0       # heartbeat for worker
+        self.last_beat = 0
 
     def log(self, msg, level="INFO"):
-        ts = datetime.now().strftime('%H:%M:%S')
+        ts = datetime.now().strftime("%H:%M:%S")
         with self.lock:
             self.logs.appendleft(f"[{ts}] {level}: {msg}")
 
@@ -79,447 +64,302 @@ def get_manager():
 
 manager = get_manager()
 
-# hotfix for stale cache
-if not hasattr(manager, "last_beat"):
-    manager.last_beat = 0
-
-# --- STRATEGY FUNCTIONS ---
-
-def get_instrument_token(kite, symbol):
-    """Fetch NSE instrument token for a given symbol."""
-    try:
-        instruments = kite.instruments("NSE")
-        search = symbol.upper().strip()
-        for i in instruments:
-            if i["tradingsymbol"] == search and i["segment"] == "NSE":
-                return i["instrument_token"]
-    except:
-        pass
-    return None
-
-def fetch_time_slot_rvol(kite, token, days=10):
-    """RVol for current 5‑min slot vs same slot over history."""
+# --- RVOL CALC: current 5m vs 750 previous 5m candles ---
+def calc_rvol(kite, token, days=10):
     try:
         now = datetime.now()
-        minute = (now.minute // 5) * 5
-        start_time = now.replace(minute=minute, second=0, microsecond=0)
-
         from_date = now - timedelta(days=days + 5)
+
         candles = kite.historical_data(token, from_date, now, "5minute")
         df = pd.DataFrame(candles)
-        if df.empty:
-            return 0.0, 0
+        if df.empty or len(df) < 2:
+            return 0.0, 0, 0.0
 
         df["date"] = pd.to_datetime(df["date"])
-        target_time = start_time.time()
-        slot_df = df[df["date"].dt.time == target_time]
+        df = df.sort_values("date")
 
-        if len(slot_df) < 2:
-            return 1.0, 0
+        # Latest 5m candle volume
+        current_vol = int(df["volume"].iloc[-1])
+        history = df["volume"].iloc[:-1]
 
-        historical_vols = slot_df["volume"].iloc[:-1]
-        avg_vol = historical_vols.mean()
-        current_vol = slot_df["volume"].iloc[-1]
+        # Take max 750 previous candles
+        if len(history) > 750:
+            history = history.iloc[-750:]
+        avg_vol = float(history.mean()) if len(history) > 0 else 0.0
 
-        rvol = current_vol / max(1, avg_vol)
-        return rvol, current_vol
+        # Compute RVol
+        rvol = (current_vol / avg_vol) if avg_vol > 0 else 0.0
+        return float(rvol), current_vol, avg_vol
     except Exception as e:
-        manager.log(f"RVol calc failed: {e}", "ERROR")
-        return 0.0, 0
+        manager.log(f"RVol calculation failed: {e}", "ERROR")
+        return 0.0, 0, 0.0
 
-def get_option_confirmation(kite, symbol, signal_type, spot_price):
-    """Option OI/volume confirmation for ACCUMULATION/DISTRIBUTION."""
+# --- FULL OPTIONS POWER SCAN ---
+def scan_opt_power(kite, symbol):
+    """Scan ALL CE & PE strikes for nearest expiry and return net millions, CE millions, PE millions."""
     try:
-        opts = [
-            i for i in kite.instruments("NFO")
-            if i.get("name") == symbol and i.get("segment") == "NFO-OPT"
-        ]
-        if not opts:
-            return False, 0.0
+        all_opts = [i for i in kite.instruments("NFO") if i["segment"]=="NFO-OPT" and i["name"]==symbol]
+        if not all_opts:
+            return 0.0, 0.0, 0.0
 
         today = datetime.now().date()
-        expiries = sorted(
-            {i["expiry"].date() for i in opts if i["expiry"].date() >= today}
-        )
+        expiries = sorted({o["expiry"].date() for o in all_opts if o["expiry"].date() >= today})
         if not expiries:
-            return False, 0.0
+            return 0.0, 0.0, 0.0
 
-        curr_expiry = expiries[0]
-        opts = [i for i in opts if i["expiry"].date() == curr_expiry]
+        nearest_exp = expiries[0]
+        scoped = [o for o in all_opts if o["expiry"].date()==nearest_exp]
 
-        strikes = sorted({i["strike"] for i in opts})
-        atm_strike = min(strikes, key=lambda x: abs(x - spot_price))
-        atm_idx = strikes.index(atm_strike)
+        ce_syms = [f"NFO:{o['tradingsymbol']}" for o in scoped if o["instrument_type"]=="CE"]
+        pe_syms = [f"NFO:{o['tradingsymbol']}" for o in scoped if o["instrument_type"]=="PE"]
 
-        if signal_type == "ACCUMULATION":
-            target_indices = [atm_idx - 1, atm_idx + 1, atm_idx + 2]
-            opt_type = "CE"
-        else:
-            target_indices = [atm_idx + 1, atm_idx - 1, atm_idx - 2]
-            opt_type = "PE"
+        ce_vol = 0
+        pe_vol = 0
+        
+        if ce_syms:
+            qc = kite.quote(ce_syms)
+            for v in qc.values():
+                ce_vol += safe_int(v.get("volume", 0))
+        if pe_syms:
+            qp = kite.quote(pe_syms)
+            for v in qp.values():
+                pe_vol += safe_int(v.get("volume", 0))
 
-        q_params = []
-        for idx in target_indices:
-            if 0 <= idx < len(strikes):
-                strike = strikes[idx]
-                inst = next(
-                    (
-                        i for i in opts
-                        if i["strike"] == strike and i["instrument_type"] == opt_type
-                    ),
-                    None,
-                )
-                if inst:
-                    q_params.append(f"NFO:{inst['tradingsymbol']}")
-
-        if not q_params:
-            return False, 0.0
-
-        quotes = kite.quote(q_params)
-        total_power = 0.0
-        for k, v in quotes.items():
-            oi_chg = safe_int(v.get("oi", 0)) - safe_int(
-                v.get("ohlc", {}).get("open_oi", 0)
-            )
-            vol = safe_int(v.get("volume", 0))
-            total_power += (oi_chg * vol) / 1_000_000
-
-        return total_power > 0.5, total_power
+        ce_m = round(ce_vol/1_000_000,2)
+        pe_m = round(pe_vol/1_000_000,2)
+        net_m = round(ce_m - pe_m,2)
+        return net_m, ce_m, pe_m
     except Exception as e:
-        manager.log(f"Opt logic error: {e}", "ERROR")
-        return False, 0.0
+        manager.log(f"Options power scan failed: {e}", "ERROR")
+        return 0.0, 0.0, 0.0
 
-# --- CORE WORKER THREAD ---
+# --- CLASSIFY RAW ABSORPTION SIGNAL ---
+def classify_raw_signal(sym, ratio, ltp, vwap, buy_q, sell_q):
+    raw = "IDLE"
+    if ratio > CONFIG["ratio_threshold"]:
+        strong = ratio > CONFIG["strong_ratio_threshold"]
+        if ltp > vwap and (sell_q > buy_q * CONFIG["imbalance_mult"] or strong):
+            raw = "ACCUMULATION"
+        elif ltp < vwap and (buy_q > sell_q * CONFIG["imbalance_mult"] or strong):
+            raw = "DISTRIBUTION"
+    return raw
 
-def sniper_worker(kite):
+# --- SIGNAL PROMOTION (ensures stickiness and persistence) ---
+def promote_signal(state, raw, ratio):
+    last_raw = state.get("raw_signal", raw)
+
+    if raw == last_raw:
+        state["persist"] = state.get("persist", 0) + 1
+    else:
+        state["persist"] = 1
+
+    state["raw_signal"] = raw
+
+    # Promote only after persist threshold reached
+    needed = CONFIG["persistence_count"]
+    if ratio > CONFIG["strong_ratio_threshold"]:
+        needed = CONFIG["strong_persistence"]
+
+    if state["persist"] >= needed and raw != "IDLE":
+        state["signal"] = raw
+
+    # Drop to IDLE only after 2 consecutive raw=IDLE
+    if raw == "IDLE":
+        state["idle_persist"] = state.get("idle_persist", 0) + 1
+        if state["idle_persist"] >= IDLE_DROP_COUNT:
+            state["signal"] = "IDLE"
+            state["persist"] = 0
+            state["already_logged_conf"] = False
+    else:
+        state["idle_persist"] = 0
+
+    return state["signal"]
+
+# --- WORKER ENGINE ---
+def sniper_worker_loop(kite):
     manager.is_running = True
-    manager.log("Sniper Engine Started", "SUCCESS")
+    manager.log("Sniper engine started", "SUCCESS")
 
-    try:
-        kite.instruments("NFO")
-    except:
-        pass
+    last_vol = {}
+    last_book = {}
 
     while not manager.stop_event.is_set():
         try:
             manager.last_beat = time.time()
 
-            with manager.lock:
-                active_list = list(manager.active_symbols)
-
-            if not active_list:
+            symbols = list(manager.active_symbols)
+            if not symbols:
                 time.sleep(1)
                 continue
 
-            query = [f"NSE:{i['symbol']}" for i in active_list]
-
-            try:
-                quotes = kite.quote(query)
-            except Exception as e:
-                manager.log(f"Network Error (Retrying): {e}", "WARNING")
-                time.sleep(2)
-                continue
-
-            now_ts = time.time()
+            batch = [f"NSE:{s}" for s in symbols]
+            quotes = kite.quote(batch)
 
             with manager.lock:
-                for item in manager.active_symbols:
-                    sym = item["symbol"]
+                for sym in symbols:
                     key = f"NSE:{sym}"
-                    
-                    if key not in quotes or not quotes[key]:
+                    q = quotes.get(key)
+                    if not q:
                         continue
-                    
-                    q = quotes[key]
 
                     ltp = safe_float(q.get("last_price"))
-                    vol = safe_int(q.get("volume"))
+                    cum_vol = safe_int(q.get("volume"))
+                    vwap = safe_float(q.get("average_price"), ltp)
+
                     depth = q.get("depth", {})
-                    buy_q = sum(safe_int(x.get("quantity")) for x in depth.get("buy", []))
-                    sell_q = sum(
-                        safe_int(x.get("quantity")) for x in depth.get("sell", [])
-                    )
+                    buy_q = sum(safe_int(x.get("quantity")) for x in depth.get("buy",[])[:5])
+                    sell_q = sum(safe_int(x.get("quantity")) for x in depth.get("sell",[])[:5])
 
-                    if sym not in manager.
-                        continue
+                    now = time.time()
+                    prev_ts = last_book.get(sym,{}).get("ts", now - 2)
+                    dt = now - prev_ts if now>prev_ts else 1
 
-                    stt = manager.data[sym]
-                    dt = now_ts - stt.get("prev_ts", now_ts - 2)
-                    if dt < 1.0:
-                        continue
+                    # Compute deltas
+                    prev_vol = last_vol.get(sym, cum_vol)
+                    d_vol = cum_vol - prev_vol
+                    if d_vol < 0: d_vol = 0
+                    last_vol[sym] = cum_vol
 
-                    d_vol = vol - stt.get("prev_vol", vol)
-                    if d_vol < 0:
-                        d_vol = 0
+                    prev_buy = last_book.get(sym,{}).get("buy", buy_q)
+                    prev_sell = last_book.get(sym,{}).get("sell", sell_q)
+                    d_ob = abs(buy_q - prev_buy) + abs(sell_q - prev_sell)
 
-                    stt["cum_pv"] += ltp * d_vol
-                    stt["cum_v"] += d_vol
-                    vwap = (
-                        stt["cum_pv"] / max(1, stt["cum_v"])
-                        if stt["cum_v"] > 0
-                        else ltp
-                    )
+                    last_book[sym] = {"buy":buy_q, "sell":sell_q, "ts":now, "ts":now}
 
-                    d_ob = abs(buy_q - stt.get("prev_buy", buy_q)) + abs(
-                        sell_q - stt.get("prev_sell", sell_q)
-                    )
+                    # Absorption Ratio ≈ ΔVol/ΔOB
+                    ratio = d_vol / max(1, (d_ob := d_ob));
 
-                    vol_rate = d_vol / dt
-                    ob_rate = d_ob / max(1.0, dt)
-                    ratio = vol_rate / max(1, ob_rate)
+                    # Raw footprint classification
+                    raw = classify_raw_signal(sym, ratio,ltp, vwap,buy_q, sell_q)
 
-                    raw_signal = "IDLE"
-                    if ratio > CONFIG["ratio_threshold"]:
-                        if (
-                            sell_q > buy_q * CONFIG["imbalance_mult"]
-                            and ltp >= vwap
-                        ):
-                            raw_signal = "ACCUMULATION"
-                        elif (
-                            buy_q > sell_q * CONFIG["imbalance_mult"]
-                            and ltp <= vwap
-                        ):
-                            raw_signal = "DISTRIBUTION"
+                    # Persistence & sticky promotion
+                    stt = manager.data.setdefault(sym, {})
+                    prev_signal = stt.get("signal", "IDLE")
 
-                    req_persistence = CONFIG["persistence_count"]
-                    if ratio > CONFIG["strong_ratio_threshold"]:
-                        req_persistence = CONFIG["strong_persistence"]
+                    final_signal = promote_signal(stt, raw, ratio)
 
-                    if raw_signal == stt["signal"] and raw_signal != "IDLE":
-                        stt["persist"] += 1
-                    elif raw_signal != stt["signal"]:
-                        stt["persist"] = 1
-                        stt["signal"] = raw_signal
+                    # Option power confirmation (stored separately for CE/PE)
+                    if now - stt.get("last_opt_ts",0) > 10:
+                        stt["last_opt_ts"] = now
+                        net, ce, pe = scan_opt_power(kite, sym,ltp)
+                        stt["opt_power"] = net
+                        stt["opt_power_ce"] = ce
+                        stt["opt_power_pe"] = pe
+
+                    call_bias = stt["opt_power_ce"] > stt["opt_power_pe"] * 1.2
+                    put_bias  = stt["opt_power_pe"] > stt["opt_power_ce"] * 1.2
+                    
+                    # Convert final signal into actual trade label
+                    trade_label = prev_signal
+                    if final_signal == "ACCUMULATION" and call_bias:
+                        trade_label = "BUY CALL"
+                    elif final_signal == "DISTRIBUTION" and put_bias:
+                        trade_label = "BUY PUT"
+                    else:
+                        trade_label = "IDLE"
+
+                    if trade_label != prev_signal:
+                        stt["signal"] = trade_label
                         stt["confirmed"] = False
-                        stt["opt_power"] = 0.0
+                        if trade_label != "IDLE":
+                            manager.log(f"{sym} → {trade_label} promoted after persistence", "INFO")
 
-                    if (
-                        stt["signal"] != "IDLE"
-                        and stt["persist"] >= req_persistence
-                        and not stt["confirmed"]
-                    ):
-                        confirmed, power = get_option_confirmation(
-                            kite, sym, stt["signal"], ltp
-                        )
-                        stt["confirmed"] = confirmed
-                        stt["opt_power"] = power
-                        if confirmed:
-                            manager.log(
-                                f"CONFIRMED {stt['signal']} on {sym} | OptPower: {power:.2f}",
-                                "SUCCESS",
-                            )
+                    # Finally update state
+                    stt.update({
+                        "ltp":ltp,
+                        "vwap":vwap,
+                        "ratio":ratio,
+                        "buy_q":buy_q,
+                        "sell_q":sell_q,
+                        "opt_power":stt.get("opt_power",0.0),
+                        "opt_power_ce":stt.get("opt_power_ce",0.0),
+                        "opt_power_pe":stt.get("opt_power_pe",0.0),
+                        "persist":stt.get("persist",0),
+                        "idle_persist":stt.get("persist",0),
+                    })
 
-                    stt.update(
-                        {
-                            "ltp": ltp,
-                            "vol": vol,
-                            "vwap": vwap,
-                            "ratio": ratio if d_vol > 0 else stt.get("ratio", 0.0),
-                            "buy_q": buy_q,
-                            "sell_q": sell_q,
-                            "prev_vol": vol,
-                            "prev_buy": buy_q,
-                            "prev_sell": sell_q,
-                            "prev_ts": now_ts,
-                        }
-                    )
+                    # Tape log for debug
+                    line = f"{datetime.now().strftime('%H:%M:%S')} | ΔVol={d_vol:,} ΔOB={d_ob:,} ratio={ratio:.2f} raw={raw} final={manager.data[sym]['signal']}"
+                    t = manager.data[sym].get("tape", [])
+                    t.insert(0, line)
+                    manager.data[sym]["tape"] = t[:15]
 
             time.sleep(2)
-
         except Exception as e:
-            manager.log(f"Worker Fatal Error: {e}", "ERROR")
+            manager.log(f"Worker loop error: {e}", "ERROR")
             time.sleep(2)
 
-# --- STREAMLIT UI: AUTH ---
+    manager.is_running = False
+    manager.log("Engine stopped","INFO")
 
+
+# --- STREAMLIT UI ---
 st.sidebar.title("🔐 Zerodha Kite Connect")
-
-if "api_key" not in st.session_state:
-    st.session_state.api_key = ""
-if "api_sec" not in st.session_state:
-    st.session_state.api_sec = ""
-
-api_key = st.sidebar.text_input("API Key", value=st.session_state.api_key)
-api_sec = st.sidebar.text_input("API Secret", value=st.session_state.api_sec, type="password")
+api_key = st.sidebar.text_input("API Key")
+api_sec = st.sidebar.text_input("API Secret", type="password")
 req_token = st.sidebar.text_input("Request Token")
 
-st.sidebar.markdown("---")
-st.sidebar.markdown("**Step 1: Get Request Token**")
-
-if api_key:
-    try:
-        temp_kite = KiteConnect(api_key=api_key)
-        login_link = temp_kite.login_url()
-        st.sidebar.markdown(f"[Click here to log in]({login_link})")
-    except Exception as e:
-        st.sidebar.error(f"Error: {e}")
-
 if st.sidebar.button("🚀 Connect"):
-    if api_key and api_sec and req_token:
-        try:
-            k = KiteConnect(api_key=api_key)
-            d = k.generate_session(req_token, api_secret=api_sec)
-            k.set_access_token(d["access_token"])
-            manager.kite = k
-            st.session_state.api_key = api_key
-            st.session_state.api_sec = api_sec
-            st.sidebar.success("✅ Connected")
-        except Exception as e:
-            st.sidebar.error(f"Auth failed: {e}")
-            manager.kite = None
-    else:
-        st.sidebar.warning("Fill all fields.")
+    try:
+        manager.kite = KiteConnect(api_key=api_key)
+        ss = manager.kite.generate_session(req_token, api_secret=api_sec)
+        manager.kite.set_access_token(ss["access_token"])
+        st.sidebar.success("✅ Connected")
+    except Exception as e:
+        st.sidebar.error(str(e))
 
-st.sidebar.markdown("---")
-
-# --- MONITORING CONTROLS ---
-
-user_input = st.sidebar.text_area("Symbols (F&O Stocks)", "RELIANCE, TCS, HDFCBANK")
-
-col1, col2 = st.sidebar.columns(2)
-
-if col1.button("▶ START SNIPER"):
-    if not manager.kite:
-        st.error("Login first")
-    elif manager.is_running:
-        st.warning("Already running!")
-    else:
-        syms = [s.strip().upper() for s in user_input.split(",") if s.strip()]
-        valid = []
-
-        with manager.lock:
-            manager.active_symbols = []
-            manager.data = {}
-
-        st.toast("Initializing symbols & calculating RVol...")
-
-        for s in syms:
-            tkn = get_instrument_token(manager.kite, s)
-            if not tkn:
-                manager.log(f"No NSE instrument for {s}", "WARNING")
-                continue
-
-            rvol, _ = fetch_time_slot_rvol(
-                manager.kite, tkn, days=CONFIG["history_days"]
-            )
-
-            # Just log whether RVol is high or low; DO NOT block monitoring
-            lvl = "High" if rvol >= CONFIG["rvol_threshold"] else "Low"
-            manager.log(f"Init {s}: RVol {rvol:.2f} ({lvl})", "INFO")
-
-            valid.append({"symbol": s, "token": tkn})
-
-            try:
-                q = manager.kite.quote(f"NSE:{s}")[f"NSE:{s}"]
-                with manager.lock:
-                    manager.data[s] = {
-                        "ltp": safe_float(q.get("last_price")),
-                        "vol": safe_int(q.get("volume")),
-                        "vwap": safe_float(q.get("last_price")),
-                        "ratio": 0.0,
-                        "signal": "IDLE",
-                        "confirmed": False,
-                        "opt_power": 0.0,
-                        "prev_vol": safe_int(q.get("volume")),
-                        "prev_buy": 0,
-                        "prev_sell": 0,
-                        "prev_ts": time.time(),
-                        "cum_pv": 0.0,
-                        "cum_v": 0.0,
-                        "persist": 0,
-                        "buy_q": 0,
-                        "sell_q": 0,
-                        "rvol": rvol,
-                    }
-            except Exception as e:
-                manager.log(f"Init quote failed for {s}: {e}", "WARNING")
-
-        if not valid:
-            st.error("No valid NSE instruments found for given symbols.")
-        else:
-            with manager.lock:
-                manager.active_symbols = valid
-                manager.stop_event.clear()
-
-            t = threading.Thread(target=sniper_worker, args=(manager.kite,), daemon=True)
-            t.start()
-            st.success(f"Monitoring {len(valid)} stocks.")
-            time.sleep(1)
-            st.rerun()
-
-if col2.button("⏹ STOP"):
-    manager.stop_event.set()
-    manager.is_running = False
+symbols = st.sidebar.text_area("Stocks to snipe", "EICHERMOT, TCS, RELIANCE").split(",")
+if st.sidebar.button("▶ START"):
+    for sym in symbols:
+        sym_clean = sym.strip().upper()
+        token = get_instrument_secret(manager.kite,sym_clean)
+        if token:
+            rvol, curr5, av = calc_rvol(manager.kite,token)
+            manager.active_symbols.append(sym_clean)
+            manager.data[sym_clean].update({
+                "rvol":round(rvol,2),
+                "rvol_curr":curr5,
+                "rvol_avg":av
+            })
+    t = threading.Thread(target=sniper_engine, args=(manager.kite,), daemon=True)
+    t.start()
     st.rerun()
 
-# --- DASHBOARD ---
+if st.sidebar.button("🟥 STOP"):
+    manager.stop_event.set()
 
+
+# --- DASHBOARD UI ---
 st.title("🎯 Institutional Sniper Dashboard")
 
-last_beat = manager.last_beat
-delta = time.time() - last_beat
-hb_color = "#22c55e" if delta < 5 else "#ef4444"
-hb_text = "RUNNING" if delta < 5 else "STALLED / STOPPED"
-ts_text = datetime.fromtimestamp(last_beat).strftime("%H:%M:%S") if last_beat > 0 else "Never"
-st.markdown(
-    f"**Status:** <span style='color:{hb_color}; font-weight:bold'>● {hb_text}</span> "
-    f"(Last Update: {ts_text})",
-    unsafe_allow_html=True,
-)
-
 with manager.lock:
-    display_data = [(k, v.copy()) for k, v in manager.data.items()]
+    items = copy.deepcopy(list(manager.data.items()))
 
-if display_
-    cols = st.columns(3)
-    items = sorted(
-        display_data,
-        key=lambda x: (x[1].get("confirmed", False), x[1].get("ratio", 0.0)),
-        reverse=True,
-    )
+if items:
+    cols = st.cols = st.columns = st.columns(3)
+    sorted_syms = sorted(items, key=lambda x:(x[1].get("confirmed",False), x[1].get("ratio",0.0)), reverse=True)
 
-    for i, (sym, d) in enumerate(items):
-        with cols[i % 3]:
-            sig = d["signal"]
-            conf = d["confirmed"]
-            css_class = (
-                "accum" if sig == "ACCUMULATION"
-                else "dist" if sig == "DISTRIBUTION"
-                else "idle"
-            )
-            border_cls = "conf" if conf else ""
-
-            st.markdown(
-                f"""
-            <div class="stMetric {border_cls}">
-                <div style="display:flex; justify-content:space-between; align-items:center;">
-                    <span style="font-size:1.4em; font-weight:bold; color:white">{sym}</span>
-                    <span class="badge {css_class}">{sig} {'✅' if conf else ''}</span>
-                </div>
-                <div style="margin-top:10px; display:flex; justify-content:space-between;">
-                    <div>
-                        <div style="color:#9ca3af; font-size:0.8em">LTP</div>
-                        <div class="metric-value">₹{d['ltp']:.2f}</div>
-                    </div>
-                    <div>
-                        <div style="color:#9ca3af; font-size:0.8em">Absorp. Ratio</div>
-                        <div class="metric-value">{d['ratio']:.2f}x</div>
-                    </div>
-                </div>
-                <hr style="border-color:#374151; margin: 5px 0;">
-                <div style="font-size:0.8em; color:#d1d5db">
-                    VWAP: ₹{d['vwap']:.2f} | RVOL: {d['rvol']:.2f}x <br>
-                    Vol: {d['vol']:,} | Opt Power: {d['opt_power']:.2f} <br>
-                    <span style="color:#6ee7b7">Buy: {d['buy_q']:,}</span> vs <span style="color:#fca5a5">Sell: {d['sell_q']:,}</span>
-                    <br>Persist: {d['persist']}
-                </div>
+    for i,(sym,d) in enumerate(sorted_syms):
+         with cols[i%3]:
+              css_class = "accum" if d.get("signal")=="BUY CALL" else "dist" if d.get("signal")=="BUY PUT" else "idle"
+              st.markdown(f"""
+        <div class="stMetric {"conf" if d.get("confirmed") else ""}">
+            <div style="display:flex;justify-content:space-between;">
+                <span>{sym}</span>
+                <span class="badge {sig_badge}">{txt}</span>
             </div>
-            """,
-                unsafe_allow_html=True,
-            )
+            <small>₹{d.get("ltp", 0):.2f} | VWAP ₹{d.get("vwap", 0):.2f} | Ratio {d.get("ratio", 0):.2f}x<br>
+            CE Vol {d.get("opt_power_ce",0):.2f} vs PE Vol {d.get("opt_power_pe",0):.2f}<br>
+            OptBias {d.get("opt_power",0):.2f} M | Persist {d.get("persist",0)} | IdlePersist {d.get("idle_persist",0)}</small>
+        </div>
+        """,unsafe_allow_html=True)
 
-st.write("---")
-st.text_area("System Logs", "\n".join(manager.logs), height=200, disabled=True)
+    with st.expander("📟 DEBUG TAPE"):
+         for sym,d in sorted_syms:
+              st.write(sym)
+              st.text("\n".join(d.get("tape","")[:10]))
+
+st.text_area("System logs","\n".join([l for l in manager.logs]),height=200)
 
 if manager.is_running:
     time.sleep(2)
