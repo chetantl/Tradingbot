@@ -583,3 +583,4 @@ st.text_area("System Logs", "\n".join(manager.logs), height=200, disabled=True)
 if manager.is_running:
     time.sleep(2)
     st.rerun()
+
