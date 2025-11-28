@@ -42,6 +42,13 @@ st.markdown(
 .accum { background: #064e3b; color: #6ee7b7; border: 1px solid #059669; }
 .dist  { background: #7f1d1d; color: #fca5a5; border: 1px solid #dc2626; }
 .idle  { background: #374151; color: #d1d5db; border: 1px solid #4b5563; }
+.card-container {
+    background-color: #111827;
+    border: 1px solid #374151;
+    border-radius: 8px;
+    padding: 15px;
+    margin-bottom: 12px;
+}
 </style>
 """,
     unsafe_allow_html=True,
@@ -51,13 +58,12 @@ st.markdown(
 CONFIG = {
     "ratio_threshold": 2.5,
     "strong_ratio_threshold": 4.0,
-    "persistence_count": 2,   # bars
+    "persistence_count": 2,
     "strong_persistence": 1,
     "imbalance_mult": 1.5,
     "history_days": 10,
 }
-IDLE_DROP_COUNT = 2  # bars
-
+IDLE_DROP_COUNT = 2
 POLL_INTERVAL_SEC = 2
 
 
@@ -85,26 +91,46 @@ def current_bar_id_5m():
     now = now_ist()
     minute_slot = (now.minute // 5) * 5
     bar_start = now.replace(minute=minute_slot, second=0, microsecond=0)
-    # Use timestamp as ID
     return int(bar_start.timestamp()), bar_start
 
 
 # ====== MANAGER ====== #
 class SniperManager:
     def __init__(self):
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()  # Changed to RLock for reentrant locking
         self.logs = deque(maxlen=200)
-        self.data = defaultdict(dict)   # symbol -> state
-        self.active_symbols = []        # list of {"symbol":..., "token":...}
+        self.data = {}  # Changed from defaultdict to regular dict
+        self.active_symbols = []
         self.is_running = False
         self.stop_event = threading.Event()
         self.kite = None
         self.last_beat = 0.0
+        self.initialized = False
 
     def log(self, msg, level="INFO"):
         ts = now_ist().strftime("%H:%M:%S")
         with self.lock:
             self.logs.appendleft(f"[{ts}] {level}: {msg}")
+
+    def get_data_snapshot(self):
+        """Thread-safe way to get data snapshot"""
+        with self.lock:
+            return copy.deepcopy(self.data)
+
+    def get_logs_snapshot(self):
+        """Thread-safe way to get logs snapshot"""
+        with self.lock:
+            return list(self.logs)
+
+    def set_symbol_data(self, symbol, data):
+        """Thread-safe way to set symbol data"""
+        with self.lock:
+            self.data[symbol] = data
+
+    def get_symbol_data(self, symbol):
+        """Thread-safe way to get symbol data"""
+        with self.lock:
+            return self.data.get(symbol, {}).copy()
 
 
 @st.cache_resource
@@ -123,18 +149,15 @@ def get_instrument_token(kite, symbol):
         for inst in instruments:
             if inst["tradingsymbol"] == sym and inst["segment"] == "NSE":
                 return inst["instrument_token"]
-    except Exception:
-        pass
+    except Exception as e:
+        manager.log(f"Instrument lookup error for {symbol}: {e}", "ERROR")
     return None
 
 
 def calc_rvol(kite, token, days=10):
-    """
-    RVol = last 5m candle volume / average volume of last 750 5m candles.
-    For display only.
-    """
+    """RVol = last 5m candle volume / average volume of last 750 5m candles."""
     try:
-        now = now_ist().replace(tzinfo=None)  # Kite expects naive
+        now = now_ist().replace(tzinfo=None)
         from_date = now - timedelta(days=days + 5)
         candles = kite.historical_data(token, from_date, now, "5minute")
         df = pd.DataFrame(candles)
@@ -157,9 +180,7 @@ def calc_rvol(kite, token, days=10):
 
 
 def scan_opt_power(kite, symbol):
-    """
-    Returns (net_million, ce_m, pe_m) using nearest expiry CE/PE volume, ignoring junk OTM (prem < 20).
-    """
+    """Returns (net_million, ce_m, pe_m) using nearest expiry CE/PE volume."""
     try:
         all_opts = [
             i for i in kite.instruments("NFO")
@@ -183,18 +204,23 @@ def scan_opt_power(kite, symbol):
         pe_vol = 0
 
         if ce_syms:
-            q_ce = kite.quote(ce_syms)
-            for v in q_ce.values():
-                prem = safe_float(v.get("last_price", 0.0))
-                if prem >= 20:
-                    ce_vol += safe_int(v.get("volume", 0))
+            # Process in batches to avoid API limits
+            for i in range(0, len(ce_syms), 50):
+                batch = ce_syms[i:i+50]
+                q_ce = kite.quote(batch)
+                for v in q_ce.values():
+                    prem = safe_float(v.get("last_price", 0.0))
+                    if prem >= 20:
+                        ce_vol += safe_int(v.get("volume", 0))
 
         if pe_syms:
-            q_pe = kite.quote(pe_syms)
-            for v in q_pe.values():
-                prem = safe_float(v.get("last_price", 0.0))
-                if prem >= 20:
-                    pe_vol += safe_int(v.get("volume", 0))
+            for i in range(0, len(pe_syms), 50):
+                batch = pe_syms[i:i+50]
+                q_pe = kite.quote(batch)
+                for v in q_pe.values():
+                    prem = safe_float(v.get("last_price", 0.0))
+                    if prem >= 20:
+                        pe_vol += safe_int(v.get("volume", 0))
 
         ce_m = round(ce_vol / 1_000_000, 2)
         pe_m = round(pe_vol / 1_000_000, 2)
@@ -213,10 +239,8 @@ def classify_raw_signal(ratio, ltp, vwap, buy_q, sell_q):
         sell_dom = sell_q > buy_q * CONFIG["imbalance_mult"]
         buy_dom = buy_q > sell_q * CONFIG["imbalance_mult"]
 
-        # Above VWAP + sellers absorbed => ACCUM
         if ltp >= vwap and (sell_dom or strong):
             raw = "ACCUMULATION"
-        # Below VWAP + buyers absorbed => DIST
         elif ltp <= vwap and (buy_dom or strong):
             raw = "DISTRIBUTION"
     return raw
@@ -258,13 +282,11 @@ def sniper_worker(kite):
     manager.is_running = True
     manager.log("Sniper worker started (5m footprint, IST aligned)", "INFO")
 
-    last_cum_vol = defaultdict(int)
-    last_buy = defaultdict(int)
-    last_sell = defaultdict(int)
-
+    last_cum_vol = {}
+    last_buy = {}
+    last_sell = {}
     last_opt_scan = 0.0
 
-    # initialize bar id
     curr_bar_id, curr_bar_start = current_bar_id_5m()
 
     while not manager.stop_event.is_set():
@@ -279,11 +301,9 @@ def sniper_worker(kite):
                 time.sleep(1)
                 continue
 
-            # Check if new bar started (IST)
             new_bar_id, new_bar_start = current_bar_id_5m()
             bar_changed = new_bar_id != curr_bar_id
 
-            # Get quotes for all symbols
             keys = [f"NSE:{row['symbol']}" for row in active_list]
             try:
                 quotes = kite.quote(keys)
@@ -292,130 +312,117 @@ def sniper_worker(kite):
                 time.sleep(2)
                 continue
 
-            do_opt_scan = (now_ts - last_opt_scan) > 60  # once per minute
+            do_opt_scan = (now_ts - last_opt_scan) > 60
             if do_opt_scan:
                 last_opt_scan = now_ts
 
-            with manager.lock:
-                for row in manager.active_symbols:
-                    sym = row["symbol"]
-                    key = f"NSE:{sym}"
-                    q = quotes.get(key)
-                    if not q:
-                        continue
+            for row in active_list:
+                sym = row["symbol"]
+                key = f"NSE:{sym}"
+                q = quotes.get(key)
+                if not q:
+                    continue
 
-                    stt = manager.data.get(sym, {})
+                stt = manager.get_symbol_data(sym)
 
-                    ltp = safe_float(q.get("last_price"))
-                    vwap = safe_float(q.get("average_price"), ltp)
-                    depth = q.get("depth", {})
+                ltp = safe_float(q.get("last_price"))
+                vwap = safe_float(q.get("average_price"), ltp)
+                depth = q.get("depth", {})
 
-                    buy_q = sum(safe_int(x.get("quantity")) for x in depth.get("buy", [])[:5])
-                    sell_q = sum(safe_int(x.get("quantity")) for x in depth.get("sell", [])[:5])
+                buy_q = sum(safe_int(x.get("quantity")) for x in depth.get("buy", [])[:5])
+                sell_q = sum(safe_int(x.get("quantity")) for x in depth.get("sell", [])[:5])
 
-                    cum_vol = safe_int(q.get("volume"))
+                cum_vol = safe_int(q.get("volume"))
 
-                    # tick deltas
-                    prev_cum = last_cum_vol[sym]
-                    d_vol = cum_vol - prev_cum
-                    if d_vol < 0:
-                        d_vol = 0
-                    last_cum_vol[sym] = cum_vol
+                prev_cum = last_cum_vol.get(sym, cum_vol)
+                d_vol = max(0, cum_vol - prev_cum)
+                last_cum_vol[sym] = cum_vol
 
-                    prev_b = last_buy[sym]
-                    prev_s = last_sell[sym]
-                    d_ob = abs(buy_q - prev_b) + abs(sell_q - prev_s)
-                    last_buy[sym] = buy_q
-                    last_sell[sym] = sell_q
+                prev_b = last_buy.get(sym, buy_q)
+                prev_s = last_sell.get(sym, sell_q)
+                d_ob = abs(buy_q - prev_b) + abs(sell_q - prev_s)
+                last_buy[sym] = buy_q
+                last_sell[sym] = sell_q
 
-                    # init state if empty
-                    if not stt:
-                        stt = {
-                            "ltp": ltp,
-                            "vwap": vwap,
-                            "buy_q": buy_q,
-                            "sell_q": sell_q,
-                            "bar_id": curr_bar_id,
-                            "bar_d_vol": d_vol,
-                            "bar_d_ob": d_ob,
-                            "ratio_bar": 0.0,
-                            "raw_signal": "IDLE",
-                            "base_signal": "IDLE",
-                            "persist": 0,
-                            "idle_persist": 0,
-                            "opt_power": 0.0,
-                            "opt_ce": 0.0,
-                            "opt_pe": 0.0,
-                            "rvol": 0.0,
-                            "rvol_avg": 0.0,
-                            "rvol_curr": 0,
-                        }
+                if not stt:
+                    stt = {
+                        "ltp": ltp,
+                        "vwap": vwap,
+                        "buy_q": buy_q,
+                        "sell_q": sell_q,
+                        "bar_id": curr_bar_id,
+                        "bar_d_vol": d_vol,
+                        "bar_d_ob": d_ob,
+                        "ratio_bar": 0.0,
+                        "raw_signal": "IDLE",
+                        "base_signal": "IDLE",
+                        "persist": 0,
+                        "idle_persist": 0,
+                        "opt_power": 0.0,
+                        "opt_ce": 0.0,
+                        "opt_pe": 0.0,
+                        "rvol": 0.0,
+                        "rvol_avg": 0.0,
+                        "rvol_curr": 0,
+                        "trade_signal": "IDLE",
+                    }
 
-                    # If bar changed -> finalize old bar
-                    if bar_changed and stt.get("bar_id", curr_bar_id) == curr_bar_id:
-                        bar_vol = stt.get("bar_d_vol", 0)
-                        bar_ob = stt.get("bar_d_ob", 0)
-                        ratio_bar = bar_vol / max(1, bar_ob) if bar_ob > 0 else 0.0
+                if bar_changed and stt.get("bar_id", curr_bar_id) == curr_bar_id:
+                    bar_vol = stt.get("bar_d_vol", 0)
+                    bar_ob = stt.get("bar_d_ob", 0)
+                    ratio_bar = bar_vol / max(1, bar_ob) if bar_ob > 0 else 0.0
 
-                        # classify footprint on the last known LTP/VWAP/depth of that bar
-                        raw = classify_raw_signal(ratio_bar, stt["ltp"], stt["vwap"],
-                                                  stt["buy_q"], stt["sell_q"])
-                        base_signal = apply_persistence(stt, raw, ratio_bar)
+                    raw = classify_raw_signal(ratio_bar, stt["ltp"], stt["vwap"],
+                                              stt["buy_q"], stt["sell_q"])
+                    base_signal = apply_persistence(stt, raw, ratio_bar)
 
-                        stt["ratio_bar"] = ratio_bar
+                    stt["ratio_bar"] = ratio_bar
 
-                        # update RVol for this bar (if we have avg)
-                        avg_vol = stt.get("rvol_avg", 0.0)
-                        if avg_vol > 0:
-                            stt["rvol"] = bar_vol / avg_vol
+                    avg_vol = stt.get("rvol_avg", 0.0)
+                    if avg_vol > 0:
+                        stt["rvol"] = round(bar_vol / avg_vol, 2)
 
-                        manager.log(
-                            f"{sym} BAR CLOSE @ {curr_bar_start.strftime('%H:%M')} "
-                            f"Vol={bar_vol} Absorp={ratio_bar:.2f} "
-                            f"Raw={raw} Base={base_signal}",
-                            "INFO",
-                        )
+                    manager.log(
+                        f"{sym} BAR CLOSE @ {curr_bar_start.strftime('%H:%M')} "
+                        f"Vol={bar_vol} Absorp={ratio_bar:.2f} "
+                        f"Raw={raw} Base={base_signal}",
+                        "INFO",
+                    )
 
-                        # reset for new bar
-                        stt["bar_id"] = new_bar_id
-                        stt["bar_d_vol"] = d_vol
-                        stt["bar_d_ob"] = d_ob
+                    stt["bar_id"] = new_bar_id
+                    stt["bar_d_vol"] = d_vol
+                    stt["bar_d_ob"] = d_ob
+                else:
+                    stt["bar_id"] = curr_bar_id
+                    stt["bar_d_vol"] = stt.get("bar_d_vol", 0) + d_vol
+                    stt["bar_d_ob"] = stt.get("bar_d_ob", 0) + d_ob
 
-                    else:
-                        # same bar: accumulate
-                        stt["bar_id"] = curr_bar_id
-                        stt["bar_d_vol"] = stt.get("bar_d_vol", 0) + d_vol
-                        stt["bar_d_ob"] = stt.get("bar_d_ob", 0) + d_ob
+                if do_opt_scan:
+                    net, ce_m, pe_m = scan_opt_power(kite, sym)
+                    stt["opt_power"] = net
+                    stt["opt_ce"] = ce_m
+                    stt["opt_pe"] = pe_m
 
-                    # options scan occasionally
-                    if do_opt_scan:
-                        net, ce_m, pe_m = scan_opt_power(kite, sym)
-                        stt["opt_power"] = net
-                        stt["opt_ce"] = ce_m
-                        stt["opt_pe"] = pe_m
+                ce_m = stt.get("opt_ce", 0.0)
+                pe_m = stt.get("opt_pe", 0.0)
 
-                    ce_m = stt.get("opt_ce", 0.0)
-                    pe_m = stt.get("opt_pe", 0.0)
+                call_bias = ce_m > pe_m * 1.2
+                put_bias = pe_m > ce_m * 1.2
 
-                    call_bias = ce_m > pe_m * 1.2
-                    put_bias = pe_m > ce_m * 1.2
+                base_signal = stt.get("base_signal", "IDLE")
+                trade_signal = "IDLE"
+                if base_signal == "ACCUMULATION" and call_bias:
+                    trade_signal = "BUY CALL"
+                elif base_signal == "DISTRIBUTION" and put_bias:
+                    trade_signal = "BUY PUT"
 
-                    base_signal = stt.get("base_signal", "IDLE")
-                    trade_signal = "IDLE"
-                    if base_signal == "ACCUMULATION" and call_bias:
-                        trade_signal = "BUY CALL"
-                    elif base_signal == "DISTRIBUTION" and put_bias:
-                        trade_signal = "BUY PUT"
+                stt["trade_signal"] = trade_signal
+                stt["ltp"] = ltp
+                stt["vwap"] = vwap
+                stt["buy_q"] = buy_q
+                stt["sell_q"] = sell_q
 
-                    stt["trade_signal"] = trade_signal
-
-                    # always keep latest tick for display
-                    stt["ltp"] = ltp
-                    stt["vwap"] = vwap
-                    stt["buy_q"] = buy_q
-                    stt["sell_q"] = sell_q
-
-                    manager.data[sym] = stt
+                manager.set_symbol_data(sym, stt)
 
             if bar_changed:
                 curr_bar_id = new_bar_id
@@ -431,7 +438,7 @@ def sniper_worker(kite):
     manager.log("Sniper worker stopped", "INFO")
 
 
-# ====== SIDEBAR AUTH (KITE + LOGIN LINK) ====== #
+# ====== SIDEBAR AUTH ====== #
 st.sidebar.title("🔐 Zerodha Kite Connect (IST)")
 
 if "api_key" not in st.session_state:
@@ -496,49 +503,47 @@ if btn1.button("▶ START"):
 
         with manager.lock:
             manager.active_symbols = []
-            manager.data = defaultdict(dict)
+            manager.data = {}
 
-        st.toast("Initializing symbols & pre-computing RVol...")
+        with st.spinner("Initializing symbols & pre-computing RVol..."):
+            for s in syms:
+                tkn = get_instrument_token(manager.kite, s)
+                if not tkn:
+                    manager.log(f"No NSE instrument for {s}", "WARNING")
+                    continue
 
-        for s in syms:
-            tkn = get_instrument_token(manager.kite, s)
-            if not tkn:
-                manager.log(f"No NSE instrument for {s}", "WARNING")
-                continue
+                rvol, rvol_curr, rvol_avg = calc_rvol(manager.kite, tkn, days=CONFIG["history_days"])
+                valid.append({"symbol": s, "token": tkn})
 
-            rvol, rvol_curr, rvol_avg = calc_rvol(manager.kite, tkn, days=CONFIG["history_days"])
+                try:
+                    q = manager.kite.quote(f"NSE:{s}")[f"NSE:{s}"]
+                    ltp = safe_float(q.get("last_price"))
+                    vwap = safe_float(q.get("average_price"), ltp)
 
-            valid.append({"symbol": s, "token": tkn})
-
-            try:
-                q = manager.kite.quote(f"NSE:{s}")[f"NSE:{s}"]
-                ltp = safe_float(q.get("last_price"))
-                vwap = safe_float(q.get("average_price"), ltp)
-
-                stt = {
-                    "ltp": ltp,
-                    "vwap": vwap,
-                    "buy_q": 0,
-                    "sell_q": 0,
-                    "bar_id": current_bar_id_5m()[0],
-                    "bar_d_vol": 0,
-                    "bar_d_ob": 0,
-                    "ratio_bar": 0.0,
-                    "raw_signal": "IDLE",
-                    "base_signal": "IDLE",
-                    "persist": 0,
-                    "idle_persist": 0,
-                    "opt_power": 0.0,
-                    "opt_ce": 0.0,
-                    "opt_pe": 0.0,
-                    "rvol": rvol,
-                    "rvol_curr": rvol_curr,
-                    "rvol_avg": rvol_avg,
-                }
-                with manager.lock:
-                    manager.data[s] = stt
-            except Exception as e:
-                manager.log(f"Init quote failed for {s}: {e}", "WARNING")
+                    stt = {
+                        "ltp": ltp,
+                        "vwap": vwap,
+                        "buy_q": 0,
+                        "sell_q": 0,
+                        "bar_id": current_bar_id_5m()[0],
+                        "bar_d_vol": 0,
+                        "bar_d_ob": 0,
+                        "ratio_bar": 0.0,
+                        "raw_signal": "IDLE",
+                        "base_signal": "IDLE",
+                        "persist": 0,
+                        "idle_persist": 0,
+                        "opt_power": 0.0,
+                        "opt_ce": 0.0,
+                        "opt_pe": 0.0,
+                        "rvol": rvol,
+                        "rvol_curr": rvol_curr,
+                        "rvol_avg": rvol_avg,
+                        "trade_signal": "IDLE",
+                    }
+                    manager.set_symbol_data(s, stt)
+                except Exception as e:
+                    manager.log(f"Init quote failed for {s}: {e}", "WARNING")
 
         if not valid:
             st.error("No valid instruments found.")
@@ -546,16 +551,16 @@ if btn1.button("▶ START"):
             with manager.lock:
                 manager.active_symbols = valid
                 manager.stop_event.clear()
+                manager.initialized = True
             t = threading.Thread(target=sniper_worker, args=(manager.kite,), daemon=True)
             t.start()
             manager.is_running = True
             st.success(f"Monitoring {len(valid)} stocks (IST 5m bars).")
-            time.sleep(1)
-            st.rerun()
 
 if btn2.button("⏹ STOP"):
     manager.stop_event.set()
     manager.is_running = False
+    manager.initialized = False
     st.rerun()
 
 # ====== DASHBOARD ====== #
@@ -572,7 +577,7 @@ beat_time = (
 
 st.markdown(
     f"""
-<div class="stMetric">
+<div class="card-container">
   <div style="display:flex;justify-content:space-between;align-items:center;">
     <div style="display:flex;align-items:center;gap:10px;">
       <div style="width:18px;height:18px;border-radius:50%;background:{hb_color};"></div>
@@ -590,12 +595,19 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-with manager.lock:
-    snapshot = copy.deepcopy(manager.data)
+# Get snapshot safely
+snapshot = manager.get_data_snapshot()
+
+# Debug info
+st.sidebar.markdown("---")
+st.sidebar.markdown(f"**Debug:** Data count: {len(snapshot)}")
+st.sidebar.markdown(f"**Running:** {manager.is_running}")
+st.sidebar.markdown(f"**Initialized:** {manager.initialized}")
 
 if snapshot:
+    st.subheader(f"📊 Monitoring {len(snapshot)} Symbols")
+    
     cols = st.columns(3)
-    # Sort: active trade signals first, then by absorption ratio
     items = sorted(
         snapshot.items(),
         key=lambda x: (
@@ -612,17 +624,19 @@ if snapshot:
 
             if trade_sig == "BUY CALL":
                 cls = "accum"
+                badge_style = "background:#064e3b;color:#6ee7b7;border:1px solid #059669;"
             elif trade_sig == "BUY PUT":
                 cls = "dist"
+                badge_style = "background:#7f1d1d;color:#fca5a5;border:1px solid #dc2626;"
             else:
                 cls = "idle"
+                badge_style = "background:#374151;color:#d1d5db;border:1px solid #4b5563;"
 
-            st.markdown(
-                f"""
-<div class="stMetric">
+            card_html = f"""
+<div class="card-container">
   <div style="display:flex;justify-content:space-between;align-items:center;">
     <span style="font-size:1.3em;font-weight:bold;color:white;">{sym}</span>
-    <span class="badge {cls}">{trade_sig}</span>
+    <span style="padding:4px 8px;border-radius:4px;font-weight:bold;font-size:0.8rem;{badge_style}">{trade_sig}</span>
   </div>
   <div style="margin-top:8px;color:#9ca3af;font-size:0.85em;">
     LTP ₹{d.get('ltp',0):.2f} | VWAP ₹{d.get('vwap',0):.2f}<br>
@@ -633,13 +647,20 @@ if snapshot:
     Persist: {d.get('persist',0)} | IdlePersist: {d.get('idle_persist',0)}
   </div>
 </div>
-""",
-                unsafe_allow_html=True,
-            )
+"""
+            st.markdown(card_html, unsafe_allow_html=True)
+else:
+    st.info("👆 Enter symbols and click START to begin monitoring")
 
 st.write("---")
-st.text_area("System Logs", "\n".join(manager.logs), height=220, disabled=True)
 
+# Logs section
+logs_list = manager.get_logs_snapshot()
+st.subheader("📝 System Logs")
+log_text = "\n".join(logs_list) if logs_list else "No logs yet..."
+st.text_area("", log_text, height=220, disabled=True, key="logs_area")
+
+# Auto-refresh only when running
 if manager.is_running:
-    time.sleep(2)
+    time.sleep(3)
     st.rerun()
