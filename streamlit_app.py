@@ -761,7 +761,7 @@ def sniper_worker(kite, mgr):
                 sell_q = sum(safe_int(x.get("quantity")) for x in depth.get("sell", [])[:5])
                 cum_vol = safe_int(q.get("volume"))
 
-                bar_stats, is_new_bar = mgr.update_bar_tracker(sym, curr_bar_id, cum_vol, buy_q, sell_q)
+                bar_stats, is_new_bar = mgr.update_bar_tracker(sym, new_bar_id, cum_vol, buy_q, sell_q)
                 
                 if not stt:
                     stt = {
