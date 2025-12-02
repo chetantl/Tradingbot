@@ -13,7 +13,7 @@ INDIA_TZ = timezone("Asia/Kolkata")
 
 # ====== PAGE CONFIG ====== #
 st.set_page_config(
-    page_title="Institutional Sniper (Absorption Model)",
+    page_title="Institutional Sniper (Net Absorption)",
     page_icon="🎯",
     layout="wide",
 )
@@ -42,6 +42,21 @@ st.markdown(
     box-shadow: 0 0 15px rgba(239, 68, 68, 0.4);
     border: 1px solid #ef4444;
 }
+.bias-bar {
+    height: 12px;
+    border-radius: 6px;
+    background: linear-gradient(to right, #22c55e 0%, #22c55e 50%, #ef4444 50%, #ef4444 100%);
+    position: relative;
+    overflow: hidden;
+}
+.bias-indicator {
+    position: absolute;
+    width: 4px;
+    height: 100%;
+    background: white;
+    border-radius: 2px;
+    transition: left 0.3s;
+}
 </style>
 """,
     unsafe_allow_html=True,
@@ -49,17 +64,12 @@ st.markdown(
 
 # ====== CONFIG ====== #
 CONFIG = {
-    # Base absorption thresholds (will be scaled per-symbol using avg_vol)
-    "absorption_threshold": 50000,
-    "strong_absorption": 100000,
+    # Net absorption thresholds
+    "neutral_zone_pct": 0.3,          # If |net_bias| < 30% of max absorption, it's neutral
+    "strong_signal_pct": 0.6,         # If |net_bias| > 60% of max absorption, it's strong
     
-    # Efficiency thresholds
-    "low_efficiency_threshold": 0.00005,
-    "high_efficiency_threshold": 0.0005,
-    
-    # Signal confirmation
-    "absorption_bars_needed": 2,
-    "score_threshold": 70,
+    # Minimum volume for valid signal
+    "min_volume_for_signal": 5000,
     
     # Price movement minimum (base, will be made dynamic)
     "min_price_move": 0.01,
@@ -76,6 +86,10 @@ CONFIG = {
     
     # Minimum ticks for valid classification
     "min_ticks_for_signal": 5,
+    
+    # Confirmation settings
+    "bars_to_confirm": 2,             # Consecutive bars needed
+    "bars_to_reset": 2,               # Neutral bars to reset signal
 }
 
 POLL_INTERVAL_SEC = 2
@@ -108,14 +122,10 @@ def current_bar_id_5m():
 
 
 def safe_quote_batch(kite, batch, manager_log_func, attempts=2, sleep_s=0.3):
-    """
-    Safely fetch quotes with retry logic.
-    Returns dict of quotes (may be partial if some fail).
-    """
+    """Safely fetch quotes with retry logic."""
     for attempt in range(attempts):
         try:
             q = kite.quote(batch)
-            # Check completeness
             if len(q) < len(batch):
                 manager_log_func(
                     f"Quote batch incomplete: got {len(q)}/{len(batch)} symbols",
@@ -126,28 +136,31 @@ def safe_quote_batch(kite, batch, manager_log_func, attempts=2, sleep_s=0.3):
             if attempt < attempts - 1:
                 time.sleep(sleep_s)
             else:
-                manager_log_func(f"Quote batch failed after {attempts} attempts: {e}", "WARNING")
+                manager_log_func(f"Quote batch failed: {e}", "WARNING")
     return {}
 
 
-# ====== ABSORPTION ENGINE (Thread-Safe, Adaptive) ====== #
+# ====== ABSORPTION ENGINE (Net Bias Model) ====== #
 class AbsorptionEngine:
     """
-    Real institutional detection using:
-    1. ABSORPTION = Volume absorbed without price impact
-    2. EFFICIENCY = Price move per unit volume
-    3. IMBALANCE = Aggressive volume vs price direction
+    Simplified institutional detection using NET ABSORPTION BIAS.
     
-    Thread-safe with adaptive parameters per symbol.
+    Core Formula:
+        net_bias = dist_absorption - accu_absorption
+        
+        net_bias > 0 → Distribution (hidden sellers absorbing buys)
+        net_bias < 0 → Accumulation (hidden buyers absorbing sells)
+        net_bias ≈ 0 → Neutral (no clear institutional activity)
+    
+    This eliminates confusion from dual-scoring systems.
     """
     
     def __init__(self):
-        self.tick_history = {}  # symbol -> deque of ticks
+        self.tick_history = {}
         self.lock = threading.RLock()
         self.default_max_ticks = CONFIG["default_max_ticks"]
 
     def _get_max_ticks_for_symbol(self, avg_vol):
-        """Adaptive tick history size based on symbol liquidity."""
         if not avg_vol or avg_vol < 1000:
             return 200
         elif avg_vol < 5000:
@@ -179,41 +192,32 @@ class AbsorptionEngine:
                 self.tick_history[symbol].clear()
 
     def get_ticks_snapshot(self, symbol):
-        """Get thread-safe copy of tick history."""
         with self.lock:
             return list(self.tick_history.get(symbol, []))
 
     def get_tick_count(self, symbol):
-        """Get current tick count for a symbol."""
         with self.lock:
             return len(self.tick_history.get(symbol, []))
 
-    def calculate_absorption_metrics(self, symbol, current_ltp, avg_vol=None, 
-                                      abs_threshold=None, strong_abs=None):
+    def calculate_net_absorption(self, symbol, current_ltp, avg_vol=None):
         """
-        Calculate absorption metrics from tick history.
-        
-        Args:
-            symbol: Stock symbol
-            current_ltp: Current LTP for dynamic calculations
-            avg_vol: Average volume for adaptive thresholds
-            abs_threshold: Per-symbol absorption threshold (if pre-computed)
-            strong_abs: Per-symbol strong absorption threshold
+        Calculate NET ABSORPTION BIAS - the ONLY metric that matters.
         
         Returns:
-            dict with absorption scores and classifications
+            dict with net_bias, classification, and supporting metrics
         """
         ticks = self.get_ticks_snapshot(symbol)
         
-        # Minimum ticks required for valid analysis
         min_ticks = CONFIG["min_ticks_for_signal"]
         if len(ticks) < min_ticks:
-            return self._empty_metrics(tick_count=len(ticks))
+            return self._empty_metrics(tick_count=len(ticks), reason="Insufficient ticks")
 
         # ========== PRICE ANALYSIS ==========
         first_price = ticks[0]["ltp"]
         last_price = ticks[-1]["ltp"]
         price_change = last_price - first_price
+        
+        # Separate up and down movements
         price_up = max(0, price_change)
         price_down = abs(min(0, price_change))
         
@@ -227,205 +231,189 @@ class AbsorptionEngine:
         total_buy_vol = sum(t["buy_delta"] for t in ticks)
         total_sell_vol = sum(t["sell_delta"] for t in ticks)
 
+        # Check minimum volume
+        if total_volume < CONFIG["min_volume_for_signal"]:
+            return self._empty_metrics(
+                tick_count=len(ticks), 
+                reason=f"Low volume ({total_volume:,})",
+                total_volume=total_volume,
+                buy_volume=total_buy_vol,
+                sell_volume=total_sell_vol
+            )
+
         # ========== DYNAMIC MIN PRICE MOVE ==========
-        # Scale based on current price to handle both low and high-priced stocks
         base_min = CONFIG["min_price_move"]
-        ltp_based_min = (current_ltp or 100.0) * 0.0002  # 0.02% of price
+        ltp_based_min = (current_ltp or 100.0) * 0.0002
         
-        # For high-volume stocks, use tighter threshold
         if avg_vol and avg_vol > 50000:
-            ltp_based_min = (current_ltp or 100.0) * 0.0001  # 0.01%
+            ltp_based_min = (current_ltp or 100.0) * 0.0001
         
         min_move = max(base_min, ltp_based_min)
 
-        # ========== ABSORPTION METRICS ==========
-        # Accumulation: High sell volume absorbed without price drop
-        # Distribution: High buy volume absorbed without price rise
-        
+        # ========== ABSORPTION CALCULATION ==========
+        # Accumulation Absorption: Sell volume absorbed per unit price drop
+        # High value = hidden buyer absorbing sells
         accu_absorption = 0
-        dist_absorption = 0
-        
         if total_sell_vol > 0:
             accu_absorption = total_sell_vol / max(price_down, min_move)
         
+        # Distribution Absorption: Buy volume absorbed per unit price rise
+        # High value = hidden seller absorbing buys
+        dist_absorption = 0
         if total_buy_vol > 0:
             dist_absorption = total_buy_vol / max(price_up, min_move)
 
-        # ========== EFFICIENCY ==========
-        efficiency = 0
-        inverse_efficiency = 0
+        # ========== NET ABSORPTION BIAS ==========
+        # THE KEY METRIC: Which side is absorbing more?
+        # Positive = Distribution dominates (sellers absorbing)
+        # Negative = Accumulation dominates (buyers absorbing)
+        net_bias = dist_absorption - accu_absorption
         
-        if total_volume > 0:
-            efficiency = price_range / total_volume
-            if efficiency > 0:
-                inverse_efficiency = 1 / efficiency
+        # Max absorption for normalization
+        max_absorption = max(accu_absorption, dist_absorption, 1)
+        
+        # Normalized bias (-100 to +100 scale)
+        # -100 = Pure Accumulation
+        # +100 = Pure Distribution
+        # 0 = Neutral
+        if max_absorption > 0:
+            normalized_bias = (net_bias / max_absorption) * 100
+        else:
+            normalized_bias = 0
+        
+        normalized_bias = max(-100, min(100, normalized_bias))
 
-        volume_imbalance = total_buy_vol - total_sell_vol
-
-        # ========== ADAPTIVE THRESHOLDS ==========
-        # Use passed thresholds or compute from avg_vol
-        if abs_threshold is None:
-            if avg_vol and avg_vol > 0:
-                abs_threshold = max(500, avg_vol * 0.02)  # 2% of avg volume
+        # ========== CLASSIFICATION (Simple and Clear) ==========
+        neutral_threshold = CONFIG["neutral_zone_pct"] * 100  # 30
+        strong_threshold = CONFIG["strong_signal_pct"] * 100  # 60
+        
+        if abs(normalized_bias) < neutral_threshold:
+            classification = "NEUTRAL"
+            strength = "none"
+        elif normalized_bias > 0:
+            # Distribution
+            if normalized_bias >= strong_threshold:
+                classification = "DISTRIBUTION"
+                strength = "strong"
             else:
-                abs_threshold = CONFIG["absorption_threshold"]
-        
-        if strong_abs is None:
-            if avg_vol and avg_vol > 0:
-                strong_abs = max(abs_threshold * 2.5, avg_vol * 0.05)
+                classification = "DISTRIBUTION"
+                strength = "moderate"
+        else:
+            # Accumulation
+            if normalized_bias <= -strong_threshold:
+                classification = "ACCUMULATION"
+                strength = "strong"
             else:
-                strong_abs = CONFIG["strong_absorption"]
+                classification = "ACCUMULATION"
+                strength = "moderate"
 
-        # Adaptive efficiency threshold (scale with price)
-        low_eff_threshold = CONFIG["low_efficiency_threshold"]
-        if current_ltp and current_ltp > 0:
-            # Normalize: higher priced stocks have smaller relative moves
-            low_eff_threshold = CONFIG["low_efficiency_threshold"] * (100 / current_ltp)
-
-        # Adaptive volume threshold for bonus
-        vol_threshold = max(10000, avg_vol * 0.05) if avg_vol else 10000
-
-        # ========== SCORING ==========
-        accu_score = 0
-        dist_score = 0
-
-        # Accumulation scoring
-        if accu_absorption > abs_threshold:
-            # Base score from absorption ratio
-            accu_score += min(40, (accu_absorption / strong_abs) * 40)
-            
-            # Bonus: Price went UP despite heavy selling (strong absorption)
-            if price_change > 0 and total_sell_vol > total_buy_vol:
-                accu_score += 30
-            # Bonus: Price stable despite selling
-            elif price_change >= -min_move:
-                accu_score += 20
-            
-            # Bonus: Low efficiency (volume not moving price)
-            if efficiency < low_eff_threshold:
-                accu_score += 20
-            
-            # Bonus: Significant volume
-            if total_volume > vol_threshold:
-                accu_score += 10
-
-        # Distribution scoring
-        if dist_absorption > abs_threshold:
-            # Base score from absorption ratio
-            dist_score += min(40, (dist_absorption / strong_abs) * 40)
-            
-            # Bonus: Price went DOWN despite heavy buying (strong distribution)
-            if price_change < 0 and total_buy_vol > total_sell_vol:
-                dist_score += 30
-            # Bonus: Price stable despite buying
-            elif price_change <= min_move:
-                dist_score += 20
-            
-            # Bonus: Low efficiency
-            if efficiency < low_eff_threshold:
-                dist_score += 20
-            
-            # Bonus: Significant volume
-            if total_volume > vol_threshold:
-                dist_score += 10
-
-        # Cap scores at 100
-        accu_score = min(100, round(accu_score, 1))
-        dist_score = min(100, round(dist_score, 1))
-
-        # ========== CLASSIFICATION ==========
-        classification = "NEUTRAL"
-        threshold = CONFIG["score_threshold"]
-        
-        if accu_score >= threshold and accu_score > dist_score:
-            classification = "ACCUMULATION"
-        elif dist_score >= threshold and dist_score > accu_score:
-            classification = "DISTRIBUTION"
-        elif accu_score >= threshold * 0.7 and accu_score > dist_score:
-            classification = "POSSIBLE_ACCUM"
-        elif dist_score >= threshold * 0.7 and dist_score > accu_score:
-            classification = "POSSIBLE_DIST"
+        # ========== EFFICIENCY (For reference only) ==========
+        efficiency = price_range / total_volume if total_volume > 0 else 0
 
         return {
+            # Primary metrics
+            "net_bias": round(net_bias, 2),
+            "normalized_bias": round(normalized_bias, 1),
+            "classification": classification,
+            "strength": strength,
+            
+            # Supporting metrics
             "accu_absorption": round(accu_absorption, 2),
             "dist_absorption": round(dist_absorption, 2),
-            "accu_score": accu_score,
-            "dist_score": dist_score,
-            "efficiency": efficiency,
-            "inverse_efficiency": round(inverse_efficiency, 2),
-            "price_change": round(price_change, 2),
-            "price_range": round(price_range, 2),
+            
+            # Volume breakdown
             "total_volume": total_volume,
             "buy_volume": total_buy_vol,
             "sell_volume": total_sell_vol,
-            "volume_imbalance": volume_imbalance,
-            "classification": classification,
+            "volume_delta": total_buy_vol - total_sell_vol,
+            
+            # Price metrics
+            "price_change": round(price_change, 2),
+            "price_range": round(price_range, 2),
+            "price_up": round(price_up, 2),
+            "price_down": round(price_down, 2),
+            
+            # Meta
+            "efficiency": efficiency,
             "tick_count": len(ticks),
-            # Include thresholds used for debugging
-            "abs_threshold_used": round(abs_threshold, 0),
             "min_move_used": round(min_move, 4),
+            "reason": None,
         }
 
-    def _empty_metrics(self, tick_count=0):
-        return {
+    def _empty_metrics(self, tick_count=0, reason=None, **kwargs):
+        base = {
+            "net_bias": 0,
+            "normalized_bias": 0,
+            "classification": "NEUTRAL",
+            "strength": "none",
             "accu_absorption": 0,
             "dist_absorption": 0,
-            "accu_score": 0,
-            "dist_score": 0,
-            "efficiency": 0,
-            "inverse_efficiency": 0,
-            "price_change": 0,
-            "price_range": 0,
             "total_volume": 0,
             "buy_volume": 0,
             "sell_volume": 0,
-            "volume_imbalance": 0,
-            "classification": "NEUTRAL",
+            "volume_delta": 0,
+            "price_change": 0,
+            "price_range": 0,
+            "price_up": 0,
+            "price_down": 0,
+            "efficiency": 0,
             "tick_count": tick_count,
-            "abs_threshold_used": 0,
             "min_move_used": 0,
+            "reason": reason,
         }
+        base.update(kwargs)
+        return base
 
 
-# ====== SIGNAL PERSISTENCE ====== #
-def apply_absorption_persistence(stt, current_classification, accu_score, dist_score):
+# ====== SIGNAL CONFIRMATION (Simplified) ====== #
+def apply_signal_confirmation(stt, current_classification, strength):
     """
-    Apply persistence logic based on absorption scores.
-    Requires consecutive confirmations for signal generation.
+    Simple confirmation logic that NEVER contradicts itself.
+    
+    Rules:
+    1. Same classification for N bars → Confirmed
+    2. Neutral for M bars → Reset to Neutral
+    3. Classification change → Reset counter, start fresh
+    
+    Returns: confirmed_signal (same as classification once confirmed)
     """
-    prev_class = stt.get("raw_classification", "NEUTRAL")
-    
-    # Track consecutive classifications
-    if current_classification == prev_class:
-        stt["class_persist"] = stt.get("class_persist", 0) + 1
-    else:
-        stt["class_persist"] = 1
-    
-    stt["raw_classification"] = current_classification
-    
+    prev_class = stt.get("last_classification", "NEUTRAL")
     confirmed = stt.get("confirmed_signal", "NEUTRAL")
-    needed = CONFIG["absorption_bars_needed"]
     
-    # Strong signals (score > 85) need less confirmation
-    max_score = max(accu_score, dist_score)
-    if max_score >= 85:
-        needed = 1
-    elif max_score >= 75:
-        needed = max(1, needed - 1)
+    # Track consecutive same classifications
+    if current_classification == prev_class:
+        stt["same_class_count"] = stt.get("same_class_count", 0) + 1
+    else:
+        # Classification changed - reset
+        stt["same_class_count"] = 1
+    
+    stt["last_classification"] = current_classification
+    
+    # Confirmation logic
+    bars_needed = CONFIG["bars_to_confirm"]
+    
+    # Strong signals need fewer bars
+    if strength == "strong":
+        bars_needed = 1
     
     if current_classification in ("ACCUMULATION", "DISTRIBUTION"):
-        if stt["class_persist"] >= needed:
+        if stt["same_class_count"] >= bars_needed:
             confirmed = current_classification
-            stt["neutral_persist"] = 0
+            stt["neutral_count"] = 0
     elif current_classification == "NEUTRAL":
-        stt["neutral_persist"] = stt.get("neutral_persist", 0) + 1
-        if stt["neutral_persist"] >= 3:
+        stt["neutral_count"] = stt.get("neutral_count", 0) + 1
+        if stt["neutral_count"] >= CONFIG["bars_to_reset"]:
             confirmed = "NEUTRAL"
-            stt["class_persist"] = 0
-    else:
-        stt["neutral_persist"] = 0
+            stt["same_class_count"] = 0
     
     stt["confirmed_signal"] = confirmed
+    
+    # IMPORTANT: Ensure classification and confirmed are NEVER contradictory
+    # If current is strong and different from confirmed, update confirmed immediately
+    if strength == "strong" and current_classification != "NEUTRAL":
+        confirmed = current_classification
+        stt["confirmed_signal"] = confirmed
+    
     return confirmed
 
 
@@ -441,7 +429,7 @@ class SniperManager:
         self.kite = None
         self.last_beat = 0.0
         self.initialized = False
-        self.avg_volumes = {}  # symbol -> {avg_vol, bar_count, abs_threshold, strong_abs, ...}
+        self.avg_volumes = {}
         self.absorption_engine = AbsorptionEngine()
 
     def log(self, msg, level="INFO"):
@@ -466,37 +454,16 @@ class SniperManager:
             return self.data.get(symbol, {}).copy()
 
     def set_avg_volume(self, symbol, avg_vol, bar_count):
-        """Store pre-calculated average volume and derived thresholds for a symbol."""
         with self.lock:
-            # Compute adaptive thresholds
-            if avg_vol and avg_vol > 0:
-                abs_threshold = max(500, avg_vol * 0.02)  # 2% of avg volume
-                strong_abs = max(abs_threshold * 2.5, avg_vol * 0.05)
-            else:
-                abs_threshold = CONFIG["absorption_threshold"]
-                strong_abs = CONFIG["strong_absorption"]
-            
             self.avg_volumes[symbol] = {
                 "avg_vol": avg_vol,
                 "bar_count": bar_count,
-                "abs_threshold": abs_threshold,
-                "strong_abs": strong_abs,
                 "calculated_at": now_ist().strftime("%H:%M:%S")
             }
 
     def get_avg_volume(self, symbol):
         with self.lock:
             return self.avg_volumes.get(symbol, {}).get("avg_vol", 0.0)
-
-    def get_symbol_thresholds(self, symbol):
-        """Get per-symbol adaptive thresholds."""
-        with self.lock:
-            info = self.avg_volumes.get(symbol, {})
-            return {
-                "avg_vol": info.get("avg_vol", 0),
-                "abs_threshold": info.get("abs_threshold", CONFIG["absorption_threshold"]),
-                "strong_abs": info.get("strong_abs", CONFIG["strong_absorption"]),
-            }
 
 
 @st.cache_resource
@@ -521,7 +488,7 @@ def get_instrument_token(kite, symbol):
 
 
 def calc_avg_volume_750(kite, token):
-    """Calculate average volume of last 750 completed 5-min bars (once at start)."""
+    """Calculate average volume of last 750 completed 5-min bars."""
     try:
         now = now_ist().replace(tzinfo=None)
         from_date = now - timedelta(days=15)
@@ -585,7 +552,6 @@ def scan_opt_power(kite, symbol):
         ce_vol = 0
         pe_vol = 0
 
-        # Process CE options in batches
         if ce_syms:
             for i in range(0, len(ce_syms), 50):
                 batch = ce_syms[i:i+50]
@@ -595,7 +561,6 @@ def scan_opt_power(kite, symbol):
                     if prem >= 20:
                         ce_vol += safe_int(v.get("volume", 0))
 
-        # Process PE options in batches
         if pe_syms:
             for i in range(0, len(pe_syms), 50):
                 batch = pe_syms[i:i+50]
@@ -620,23 +585,18 @@ def estimate_buy_sell_volume(vol_delta, ltp, prev_ltp, buy_q, sell_q, prev_buy_q
     Improved buy/sell volume estimation combining:
     1. Tick rule (price direction)
     2. Orderbook delta (bid/ask quantity changes)
-    
-    Returns: (buy_vol_delta, sell_vol_delta)
     """
     if vol_delta <= 0:
         return 0, 0
     
-    # ========== TICK RULE ==========
+    # Tick rule
     if ltp > prev_ltp:
-        # Price up = aggressive buying
         tick_buy = vol_delta
         tick_sell = 0
     elif ltp < prev_ltp:
-        # Price down = aggressive selling
         tick_buy = 0
         tick_sell = vol_delta
     else:
-        # Price unchanged - split based on orderbook imbalance
         total_q = buy_q + sell_q
         if total_q > 0:
             tick_buy = int(vol_delta * (buy_q / total_q))
@@ -645,13 +605,10 @@ def estimate_buy_sell_volume(vol_delta, ltp, prev_ltp, buy_q, sell_q, prev_buy_q
             tick_buy = vol_delta // 2
             tick_sell = vol_delta - tick_buy
     
-    # ========== ORDERBOOK DELTA ==========
-    # Positive delta = quantity increased (possible spoofing/real orders)
-    # Negative delta = quantity consumed (real trades)
-    book_buy_delta = max(0, prev_buy_q - buy_q)   # Buy qty decreased = buys executed
-    book_sell_delta = max(0, prev_sell_q - sell_q)  # Sell qty decreased = sells executed
+    # Orderbook delta
+    book_buy_delta = max(0, prev_buy_q - buy_q)
+    book_sell_delta = max(0, prev_sell_q - sell_q)
     
-    # Normalize book deltas to vol_delta scale
     book_total = book_buy_delta + book_sell_delta
     if book_total > 0:
         book_buy_normalized = int(vol_delta * (book_buy_delta / book_total))
@@ -660,17 +617,16 @@ def estimate_buy_sell_volume(vol_delta, ltp, prev_ltp, buy_q, sell_q, prev_buy_q
         book_buy_normalized = 0
         book_sell_normalized = 0
     
-    # ========== COMBINE WITH WEIGHTS ==========
+    # Combine with weights
     tick_weight = CONFIG["tick_rule_weight"]
     book_weight = CONFIG["book_delta_weight"]
     
     buy_vol_delta = int(tick_buy * tick_weight + book_buy_normalized * book_weight)
     sell_vol_delta = int(tick_sell * tick_weight + book_sell_normalized * book_weight)
     
-    # Ensure total matches vol_delta
+    # Normalize to match vol_delta
     total_estimated = buy_vol_delta + sell_vol_delta
     if total_estimated > 0 and total_estimated != vol_delta:
-        # Scale to match
         scale = vol_delta / total_estimated
         buy_vol_delta = int(buy_vol_delta * scale)
         sell_vol_delta = vol_delta - buy_vol_delta
@@ -681,17 +637,13 @@ def estimate_buy_sell_volume(vol_delta, ltp, prev_ltp, buy_q, sell_q, prev_buy_q
 # ====== WORKER THREAD ====== #
 def sniper_worker(kite):
     manager.is_running = True
-    manager.log("Sniper worker started (Absorption Model v2)", "INFO")
+    manager.log("Sniper worker started (Net Absorption Model)", "INFO")
 
-    # Track cumulative volume from exchange
     last_cum_vol = {}
     bar_start_cum_vol = {}
-    
-    # Track for buy/sell estimation
     last_ltp = {}
     last_buy_q = {}
     last_sell_q = {}
-    
     last_opt_scan = 0.0
 
     curr_bar_id, curr_bar_start = current_bar_id_5m()
@@ -711,7 +663,6 @@ def sniper_worker(kite):
             new_bar_id, new_bar_start = current_bar_id_5m()
             bar_changed = new_bar_id != curr_bar_id
 
-            # Fetch quotes for all symbols
             keys = [f"NSE:{row['symbol']}" for row in active_list]
             quotes = safe_quote_batch(kite, keys, manager.log)
             
@@ -731,7 +682,7 @@ def sniper_worker(kite):
                     continue
 
                 stt = manager.get_symbol_data(sym)
-                thresholds = manager.get_symbol_thresholds(sym)
+                avg_750 = manager.get_avg_volume(sym)
 
                 ltp = safe_float(q.get("last_price"))
                 depth = q.get("depth", {})
@@ -741,12 +692,12 @@ def sniper_worker(kite):
 
                 cum_vol = safe_int(q.get("volume"))
 
-                # ========== VOLUME DELTA ==========
+                # Volume delta
                 prev_cum = last_cum_vol.get(sym, cum_vol)
                 vol_delta = max(0, cum_vol - prev_cum)
                 last_cum_vol[sym] = cum_vol
 
-                # ========== BUY/SELL ESTIMATION ==========
+                # Buy/sell estimation
                 prev_ltp = last_ltp.get(sym, ltp)
                 prev_buy_q = last_buy_q.get(sym, buy_q)
                 prev_sell_q = last_sell_q.get(sym, sell_q)
@@ -756,19 +707,17 @@ def sniper_worker(kite):
                     buy_q, sell_q, prev_buy_q, prev_sell_q
                 )
                 
-                # Update tracking
                 last_ltp[sym] = ltp
                 last_buy_q[sym] = buy_q
                 last_sell_q[sym] = sell_q
 
-                # ========== RECORD TICK ==========
-                avg_750 = thresholds["avg_vol"]
+                # Record tick
                 if vol_delta > 0:
                     manager.absorption_engine.record_tick(
                         sym, ltp, vol_delta, buy_vol_delta, sell_vol_delta, avg_vol=avg_750
                     )
 
-                # ========== BAR VOLUME TRACKING ==========
+                # Bar volume tracking
                 if sym not in bar_start_cum_vol:
                     bar_start_cum_vol[sym] = cum_vol
 
@@ -777,18 +726,15 @@ def sniper_worker(kite):
 
                 current_bar_vol = max(0, cum_vol - bar_start_cum_vol.get(sym, cum_vol))
 
-                # ========== LIVE RVOL ==========
+                # Live RVol
                 live_rvol = calc_live_rvol(current_bar_vol, avg_750)
 
-                # ========== ABSORPTION METRICS ==========
-                absorption_metrics = manager.absorption_engine.calculate_absorption_metrics(
-                    sym, ltp, 
-                    avg_vol=avg_750,
-                    abs_threshold=thresholds["abs_threshold"],
-                    strong_abs=thresholds["strong_abs"]
+                # Net Absorption calculation
+                absorption_metrics = manager.absorption_engine.calculate_net_absorption(
+                    sym, ltp, avg_vol=avg_750
                 )
 
-                # ========== INITIALIZE STATE ==========
+                # Initialize state
                 if not stt:
                     stt = {
                         "ltp": ltp,
@@ -796,10 +742,10 @@ def sniper_worker(kite):
                         "sell_q": sell_q,
                         "bar_id": curr_bar_id,
                         "bar_vol": current_bar_vol,
-                        "raw_classification": "NEUTRAL",
+                        "last_classification": "NEUTRAL",
                         "confirmed_signal": "NEUTRAL",
-                        "class_persist": 0,
-                        "neutral_persist": 0,
+                        "same_class_count": 0,
+                        "neutral_count": 0,
                         "opt_power": 0.0,
                         "opt_ce": 0.0,
                         "opt_pe": 0.0,
@@ -809,36 +755,27 @@ def sniper_worker(kite):
                         "last_bar_vol": 0,
                         "last_bar_rvol": 0.0,
                         "absorption": absorption_metrics,
-                        "last_buy_q": buy_q,
-                        "last_sell_q": sell_q,
                     }
 
-                # ========== BAR CLOSE LOGIC ==========
+                # Bar close logic
                 if bar_changed and stt.get("bar_id", curr_bar_id) == curr_bar_id:
-                    # Get final absorption metrics for the bar
-                    final_metrics = manager.absorption_engine.calculate_absorption_metrics(
-                        sym, ltp,
-                        avg_vol=avg_750,
-                        abs_threshold=thresholds["abs_threshold"],
-                        strong_abs=thresholds["strong_abs"]
+                    final_metrics = manager.absorption_engine.calculate_net_absorption(
+                        sym, ltp, avg_vol=avg_750
                     )
                     
-                    # Check if we have enough ticks for valid signal
                     tick_count = final_metrics["tick_count"]
                     min_ticks = CONFIG["min_ticks_for_signal"]
                     
                     if tick_count >= min_ticks:
-                        # Apply persistence
-                        confirmed = apply_absorption_persistence(
+                        confirmed = apply_signal_confirmation(
                             stt, 
                             final_metrics["classification"],
-                            final_metrics["accu_score"],
-                            final_metrics["dist_score"]
+                            final_metrics["strength"]
                         )
                     else:
                         confirmed = stt.get("confirmed_signal", "NEUTRAL")
                         manager.log(
-                            f"{sym}: Low tick count ({tick_count}) at bar close, skipping classification",
+                            f"{sym}: Low ticks ({tick_count}), keeping {confirmed}",
                             "WARNING"
                         )
 
@@ -850,33 +787,23 @@ def sniper_worker(kite):
                     stt["absorption"] = final_metrics
 
                     # Log bar close
-                    accu_s = final_metrics["accu_score"]
-                    dist_s = final_metrics["dist_score"]
+                    net_bias = final_metrics["normalized_bias"]
                     cls = final_metrics["classification"]
+                    strength = final_metrics["strength"]
                     
-                    emoji = ""
-                    if cls == "ACCUMULATION":
-                        emoji = "🟢"
-                    elif cls == "DISTRIBUTION":
-                        emoji = "🔴"
-                    elif "POSSIBLE" in cls:
-                        emoji = "🟡"
-                    
+                    emoji = "🟢" if cls == "ACCUMULATION" else "🔴" if cls == "DISTRIBUTION" else "⚪"
+                    strength_emoji = "💪" if strength == "strong" else ""
                     rvol_flag = "🔥" if final_rvol >= 2.0 else ""
                     
                     manager.log(
                         f"{emoji} {sym} BAR @ {curr_bar_start.strftime('%H:%M')} | "
-                        f"Vol={final_bar_vol:,} RVol={final_rvol}x{rvol_flag} | "
-                        f"Ticks={tick_count} | "
-                        f"Accu={accu_s:.0f} Dist={dist_s:.0f} → {cls} "
-                        f"[Confirmed: {confirmed}]",
+                        f"Bias={net_bias:+.0f} → {cls} {strength_emoji} | "
+                        f"Confirmed={confirmed} | "
+                        f"Vol={final_bar_vol:,} RVol={final_rvol}x{rvol_flag}",
                         "INFO",
                     )
 
-                    # Reset absorption engine for new bar
                     manager.absorption_engine.reset_bar(sym)
-
-                    # Reset for new bar
                     stt["bar_id"] = new_bar_id
                     stt["bar_vol"] = current_bar_vol
 
@@ -885,20 +812,17 @@ def sniper_worker(kite):
                     stt["bar_vol"] = current_bar_vol
                     stt["absorption"] = absorption_metrics
 
-                # Update live values
                 stt["rvol"] = live_rvol
                 stt["avg_750"] = avg_750
-                stt["last_buy_q"] = buy_q
-                stt["last_sell_q"] = sell_q
 
-                # ========== OPTIONS SCAN ==========
+                # Options scan
                 if do_opt_scan:
                     net, ce_m, pe_m = scan_opt_power(kite, sym)
                     stt["opt_power"] = net
                     stt["opt_ce"] = ce_m
                     stt["opt_pe"] = pe_m
 
-                # ========== TRADE SIGNAL LOGIC ==========
+                # Trade signal logic
                 ce_m = stt.get("opt_ce", 0.0)
                 pe_m = stt.get("opt_pe", 0.0)
                 call_bias = ce_m > pe_m * 1.2
@@ -912,9 +836,9 @@ def sniper_worker(kite):
                 elif confirmed_signal == "DISTRIBUTION" and put_bias:
                     trade_signal = "🔴 BUY PUT"
                 elif confirmed_signal == "ACCUMULATION":
-                    trade_signal = "ACCUM ⏳"
+                    trade_signal = "🟢 ACCUM ⏳"
                 elif confirmed_signal == "DISTRIBUTION":
-                    trade_signal = "DIST ⏳"
+                    trade_signal = "🔴 DIST ⏳"
 
                 stt["trade_signal"] = trade_signal
                 stt["ltp"] = ltp
@@ -1008,7 +932,7 @@ if btn1.button("▶ START"):
             manager.avg_volumes = {}
             manager.absorption_engine = AbsorptionEngine()
 
-        with st.spinner("Initializing symbols and calculating baselines..."):
+        with st.spinner("Initializing symbols..."):
             progress_bar = st.progress(0)
             
             for idx, s in enumerate(syms):
@@ -1017,22 +941,13 @@ if btn1.button("▶ START"):
                     manager.log(f"No NSE instrument for {s}", "WARNING")
                     continue
 
-                # Calculate 750-bar average and set adaptive thresholds
                 avg_vol, bar_count = calc_avg_volume_750(manager.kite, tkn)
                 manager.set_avg_volume(s, avg_vol, bar_count)
                 
-                thresholds = manager.get_symbol_thresholds(s)
-                
-                manager.log(
-                    f"{s}: Avg Vol={avg_vol:,.0f} ({bar_count} bars) | "
-                    f"AbsThresh={thresholds['abs_threshold']:,.0f} | "
-                    f"StrongAbs={thresholds['strong_abs']:,.0f}",
-                    "INFO"
-                )
+                manager.log(f"{s}: Avg Vol={avg_vol:,.0f} ({bar_count} bars)", "INFO")
 
                 valid.append({"symbol": s, "token": tkn})
 
-                # Initialize symbol data
                 try:
                     q = manager.kite.quote(f"NSE:{s}")[f"NSE:{s}"]
                     ltp = safe_float(q.get("last_price"))
@@ -1046,10 +961,10 @@ if btn1.button("▶ START"):
                         "sell_q": sell_q,
                         "bar_id": current_bar_id_5m()[0],
                         "bar_vol": 0,
-                        "raw_classification": "NEUTRAL",
+                        "last_classification": "NEUTRAL",
                         "confirmed_signal": "NEUTRAL",
-                        "class_persist": 0,
-                        "neutral_persist": 0,
+                        "same_class_count": 0,
+                        "neutral_count": 0,
                         "opt_power": 0.0,
                         "opt_ce": 0.0,
                         "opt_pe": 0.0,
@@ -1059,8 +974,6 @@ if btn1.button("▶ START"):
                         "last_bar_vol": 0,
                         "last_bar_rvol": 0.0,
                         "absorption": manager.absorption_engine._empty_metrics(),
-                        "last_buy_q": buy_q,
-                        "last_sell_q": sell_q,
                     }
                     manager.set_symbol_data(s, stt)
                 except Exception as e:
@@ -1080,7 +993,7 @@ if btn1.button("▶ START"):
             t = threading.Thread(target=sniper_worker, args=(manager.kite,), daemon=True)
             t.start()
             manager.is_running = True
-            st.success(f"✅ Monitoring {len(valid)} stocks (Absorption Model v2)")
+            st.success(f"✅ Monitoring {len(valid)} stocks (Net Absorption Model)")
 
 if btn2.button("⏹ STOP"):
     manager.stop_event.set()
@@ -1089,8 +1002,8 @@ if btn2.button("⏹ STOP"):
     st.rerun()
 
 # ====== DASHBOARD ====== #
-st.title("🎯 Institutional Sniper – Absorption Model v2")
-st.caption("Detects hidden accumulation/distribution via absorption + efficiency + imbalance (adaptive thresholds)")
+st.title("🎯 Institutional Sniper – Net Absorption Model")
+st.caption("Single directional bias: Negative = Accumulation | Positive = Distribution")
 
 # Status indicator
 last_beat = manager.last_beat
@@ -1123,35 +1036,20 @@ st.markdown(
 # Get snapshot
 snapshot = manager.get_data_snapshot()
 
-# Sidebar debug info
+# Sidebar debug
 st.sidebar.markdown("---")
 st.sidebar.markdown(f"**Symbols:** {len(snapshot)}")
 st.sidebar.markdown(f"**Running:** {manager.is_running}")
-
-# Show thresholds
-if manager.avg_volumes:
-    with st.sidebar.expander("📊 Adaptive Thresholds"):
-        for sym, info in manager.avg_volumes.items():
-            st.markdown(
-                f"**{sym}**  \n"
-                f"Avg: {info['avg_vol']:,.0f}  \n"
-                f"AbsThresh: {info['abs_threshold']:,.0f}  \n"
-                f"StrongAbs: {info['strong_abs']:,.0f}"
-            )
-            st.markdown("---")
 
 if snapshot:
     st.subheader(f"📊 Monitoring {len(snapshot)} Symbols")
     
     cols = st.columns(3)
     
-    # Sort by max absorption score
+    # Sort by absolute bias (strongest signals first)
     items = sorted(
         snapshot.items(),
-        key=lambda x: max(
-            x[1].get("absorption", {}).get("accu_score", 0),
-            x[1].get("absorption", {}).get("dist_score", 0)
-        ),
+        key=lambda x: abs(x[1].get("absorption", {}).get("normalized_bias", 0)),
         reverse=True
     )
 
@@ -1161,12 +1059,13 @@ if snapshot:
             confirmed = d.get("confirmed_signal", "NEUTRAL")
             
             absorp = d.get("absorption", {})
-            accu_score = absorp.get("accu_score", 0)
-            dist_score = absorp.get("dist_score", 0)
+            net_bias = absorp.get("normalized_bias", 0)
             classification = absorp.get("classification", "NEUTRAL")
+            strength = absorp.get("strength", "none")
             tick_count = absorp.get("tick_count", 0)
+            reason = absorp.get("reason")
             
-            # Card styling
+            # Card styling based on confirmed signal (NOT classification)
             card_class = ""
             if confirmed == "ACCUMULATION":
                 badge_style = "background:#064e3b;color:#6ee7b7;border:1px solid #059669;"
@@ -1177,16 +1076,32 @@ if snapshot:
             else:
                 badge_style = "background:#374151;color:#d1d5db;border:1px solid #4b5563;"
 
-            # Score bar colors
-            accu_bar_color = "#22c55e" if accu_score >= 70 else "#4ade80" if accu_score >= 50 else "#6b7280"
-            dist_bar_color = "#ef4444" if dist_score >= 70 else "#f87171" if dist_score >= 50 else "#6b7280"
+            # Bias bar position (50% = neutral, 0% = full accum, 100% = full dist)
+            bias_position = 50 + (net_bias / 2)  # Convert -100..+100 to 0..100
+            bias_position = max(0, min(100, bias_position))
+            
+            # Bias color
+            if net_bias < -30:
+                bias_color = "#22c55e"  # Green for accumulation
+                bias_text_color = "#22c55e"
+            elif net_bias > 30:
+                bias_color = "#ef4444"  # Red for distribution
+                bias_text_color = "#ef4444"
+            else:
+                bias_color = "#6b7280"  # Gray for neutral
+                bias_text_color = "#9ca3af"
 
             # RVol styling
             rvol = d.get('rvol', 0.0)
             rvol_emoji = "🔥" if rvol >= 2.0 else "⚡" if rvol >= 1.5 else ""
 
-            # Tick count indicator
+            # Tick indicator
             tick_status = "🟢" if tick_count >= 10 else "🟡" if tick_count >= 5 else "🔴"
+
+            # Strength indicator
+            strength_badge = ""
+            if strength == "strong":
+                strength_badge = '<span style="background:#fbbf24;color:#000;padding:2px 6px;border-radius:3px;font-size:0.7em;margin-left:5px;">STRONG</span>'
 
             card_html = f"""
 <div class="card-container {card_class}">
@@ -1199,36 +1114,45 @@ if snapshot:
     <b>LTP</b> ₹{d.get('ltp',0):.2f} | <b>Ticks</b> {tick_status} {tick_count}
   </div>
   
-  <!-- Absorption Scores -->
-  <div class="metric-box">
-    <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
-      <span style="color:#22c55e;">🟢 Accumulation</span>
-      <span style="color:#22c55e;font-weight:bold;">{accu_score:.0f}/100</span>
+  <!-- NET BIAS METER (The Only Metric That Matters) -->
+  <div class="metric-box" style="margin-top:10px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+      <span style="color:#9ca3af;font-size:0.8em;">Net Absorption Bias</span>
+      <span style="color:{bias_text_color};font-weight:bold;font-size:1.1em;">{net_bias:+.0f}</span>
     </div>
-    <div style="background:#374151;border-radius:4px;height:8px;overflow:hidden;">
-      <div style="background:{accu_bar_color};height:100%;width:{min(accu_score, 100)}%;transition:width 0.3s;"></div>
+    
+    <!-- Bias Bar -->
+    <div style="position:relative;height:16px;background:linear-gradient(to right, #22c55e 0%, #22c55e 45%, #374151 45%, #374151 55%, #ef4444 55%, #ef4444 100%);border-radius:8px;">
+      <!-- Center marker -->
+      <div style="position:absolute;left:50%;top:-2px;width:2px;height:20px;background:#fff;transform:translateX(-50%);"></div>
+      <!-- Bias indicator -->
+      <div style="position:absolute;left:{bias_position}%;top:50%;width:12px;height:12px;background:{bias_color};border:2px solid #fff;border-radius:50%;transform:translate(-50%,-50%);box-shadow:0 0 8px {bias_color};"></div>
+    </div>
+    
+    <div style="display:flex;justify-content:space-between;margin-top:4px;font-size:0.7em;color:#6b7280;">
+      <span>🟢 ACCUM</span>
+      <span>NEUTRAL</span>
+      <span>DIST 🔴</span>
     </div>
   </div>
   
-  <div class="metric-box">
-    <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
-      <span style="color:#ef4444;">🔴 Distribution</span>
-      <span style="color:#ef4444;font-weight:bold;">{dist_score:.0f}/100</span>
+  <!-- Classification & Confirmed -->
+  <div style="margin-top:10px;display:flex;gap:10px;">
+    <div style="flex:1;background:#1f2937;padding:6px;border-radius:4px;text-align:center;">
+      <div style="font-size:0.7em;color:#6b7280;">Current</div>
+      <div style="font-weight:bold;color:{'#22c55e' if classification=='ACCUMULATION' else '#ef4444' if classification=='DISTRIBUTION' else '#9ca3af'};">
+        {classification}{strength_badge}
+      </div>
     </div>
-    <div style="background:#374151;border-radius:4px;height:8px;overflow:hidden;">
-      <div style="background:{dist_bar_color};height:100%;width:{min(dist_score, 100)}%;transition:width 0.3s;"></div>
+    <div style="flex:1;background:#1f2937;padding:6px;border-radius:4px;text-align:center;">
+      <div style="font-size:0.7em;color:#6b7280;">Confirmed</div>
+      <div style="font-weight:bold;color:{'#22c55e' if confirmed=='ACCUMULATION' else '#ef4444' if confirmed=='DISTRIBUTION' else '#9ca3af'};">
+        {confirmed}
+      </div>
     </div>
   </div>
   
   <div style="margin-top:8px;color:#9ca3af;font-size:0.8em;">
-    <div style="display:flex;justify-content:space-between;">
-      <span>Classification:</span>
-      <span style="font-weight:bold;">{classification}</span>
-    </div>
-    <div style="display:flex;justify-content:space-between;">
-      <span>Confirmed:</span>
-      <span style="font-weight:bold;color:{'#22c55e' if confirmed=='ACCUMULATION' else '#ef4444' if confirmed=='DISTRIBUTION' else '#9ca3af'};">{confirmed}</span>
-    </div>
     <div style="display:flex;justify-content:space-between;">
       <span>RVol:</span>
       <span>{rvol:.2f}x {rvol_emoji}</span>
@@ -1243,28 +1167,26 @@ if snapshot:
     </div>
   </div>
   
-  <!-- Absorption Details -->
+  {f'<div style="margin-top:6px;padding:4px;background:#7f1d1d33;border-radius:4px;font-size:0.7em;color:#fca5a5;">⚠️ {reason}</div>' if reason else ''}
+  
+  <!-- Details -->
   <details style="margin-top:8px;">
     <summary style="color:#6b7280;cursor:pointer;font-size:0.75em;">📊 Absorption Details</summary>
     <div style="color:#6b7280;font-size:0.7em;margin-top:4px;background:#0f172a;padding:6px;border-radius:4px;">
-      <b>Metrics:</b><br>
-      Accu Absorp: {absorp.get('accu_absorption', 0):,.0f}<br>
-      Dist Absorp: {absorp.get('dist_absorption', 0):,.0f}<br>
-      Efficiency: {absorp.get('efficiency', 0):.8f}<br>
-      Inv Efficiency: {absorp.get('inverse_efficiency', 0):,.0f}<br>
+      <b>Absorption:</b><br>
+      Accu (buyers absorbing): {absorp.get('accu_absorption', 0):,.0f}<br>
+      Dist (sellers absorbing): {absorp.get('dist_absorption', 0):,.0f}<br>
+      Net Bias: {absorp.get('net_bias', 0):,.0f}<br>
       <br>
       <b>Volume:</b><br>
       Buy Vol: {absorp.get('buy_volume', 0):,}<br>
       Sell Vol: {absorp.get('sell_volume', 0):,}<br>
-      Imbalance: {absorp.get('volume_imbalance', 0):,}<br>
+      Delta: {absorp.get('volume_delta', 0):+,}<br>
       <br>
       <b>Price:</b><br>
-      Price Δ: ₹{absorp.get('price_change', 0):.2f}<br>
-      Range: ₹{absorp.get('price_range', 0):.2f}<br>
-      <br>
-      <b>Thresholds Used:</b><br>
-      Abs Thresh: {absorp.get('abs_threshold_used', 0):,.0f}<br>
-      Min Move: ₹{absorp.get('min_move_used', 0):.4f}
+      Change: ₹{absorp.get('price_change', 0):+.2f}<br>
+      Up Move: ₹{absorp.get('price_up', 0):.2f}<br>
+      Down Move: ₹{absorp.get('price_down', 0):.2f}
     </div>
   </details>
 </div>
