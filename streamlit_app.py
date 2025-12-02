@@ -13,207 +13,71 @@ INDIA_TZ = timezone("Asia/Kolkata")
 
 # ====== PAGE CONFIG ====== #
 st.set_page_config(
-    page_title="Institutional Sniper",
+    page_title="Institutional Sniper (Absorption Model)",
     page_icon="🎯",
     layout="wide",
 )
 
-# ====== CUSTOM CSS FOR COMPACT CARDS ====== #
-st.markdown("""
+st.markdown(
+    """
 <style>
-    /* Reduce overall padding */
-    .block-container {
-        padding-top: 1rem;
-        padding-bottom: 1rem;
-    }
-    
-    /* Compact metric styling */
-    [data-testid="stMetricValue"] {
-        font-size: 0.9rem !important;
-    }
-    
-    [data-testid="stMetricLabel"] {
-        font-size: 0.7rem !important;
-    }
-    
-    [data-testid="stMetricDelta"] {
-        font-size: 0.65rem !important;
-    }
-    
-    /* Smaller expander text */
-    .streamlit-expanderHeader {
-        font-size: 0.8rem !important;
-    }
-    
-    /* Compact card style */
-    .compact-card {
-        background-color: #1e1e1e;
-        border-radius: 8px;
-        padding: 10px;
-        margin-bottom: 10px;
-        border-left: 4px solid #444;
-    }
-    
-    .card-bullish {
-        border-left-color: #00c853 !important;
-    }
-    
-    .card-bearish {
-        border-left-color: #ff1744 !important;
-    }
-    
-    .card-warning {
-        border-left-color: #ffc107 !important;
-    }
-    
-    .card-header {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        margin-bottom: 8px;
-    }
-    
-    .symbol-name {
-        font-size: 1.1rem;
-        font-weight: bold;
-        color: #ffffff;
-    }
-    
-    .signal-badge {
-        padding: 3px 8px;
-        border-radius: 4px;
-        font-size: 0.7rem;
-        font-weight: bold;
-    }
-    
-    .badge-call {
-        background-color: #1b5e20;
-        color: #a5d6a7;
-    }
-    
-    .badge-put {
-        background-color: #b71c1c;
-        color: #ef9a9a;
-    }
-    
-    .badge-conflict {
-        background-color: #e65100;
-        color: #ffcc80;
-    }
-    
-    .badge-idle {
-        background-color: #37474f;
-        color: #b0bec5;
-    }
-    
-    .metrics-grid {
-        display: grid;
-        grid-template-columns: repeat(4, 1fr);
-        gap: 6px;
-        margin-bottom: 8px;
-    }
-    
-    .metric-box {
-        background-color: #2d2d2d;
-        padding: 6px;
-        border-radius: 4px;
-        text-align: center;
-    }
-    
-    .metric-label {
-        font-size: 0.6rem;
-        color: #888;
-        text-transform: uppercase;
-        margin-bottom: 2px;
-    }
-    
-    .metric-value {
-        font-size: 0.85rem;
-        font-weight: bold;
-        color: #fff;
-    }
-    
-    .metric-sub {
-        font-size: 0.55rem;
-        color: #666;
-    }
-    
-    .bullish {
-        color: #4caf50 !important;
-    }
-    
-    .bearish {
-        color: #f44336 !important;
-    }
-    
-    .neutral {
-        color: #9e9e9e !important;
-    }
-    
-    .oi-analysis {
-        background-color: #252525;
-        padding: 6px;
-        border-radius: 4px;
-        font-size: 0.65rem;
-        color: #aaa;
-        margin-top: 6px;
-    }
-    
-    .footer-info {
-        font-size: 0.55rem;
-        color: #555;
-        margin-top: 4px;
-    }
-    
-    /* Status bar styling */
-    .status-bar {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        background-color: #1a1a1a;
-        padding: 8px 12px;
-        border-radius: 6px;
-        margin-bottom: 15px;
-    }
-    
-    .status-item {
-        text-align: center;
-    }
-    
-    .status-label {
-        font-size: 0.6rem;
-        color: #666;
-    }
-    
-    .status-value {
-        font-size: 0.85rem;
-        font-weight: bold;
-    }
-    
-    .live {
-        color: #4caf50;
-    }
-    
-    .stopped {
-        color: #f44336;
-    }
+.card-container {
+    background-color: #111827;
+    border: 1px solid #374151;
+    border-radius: 8px;
+    padding: 15px;
+    margin-bottom: 12px;
+}
+.metric-box {
+    background: #1f2937;
+    border-radius: 4px;
+    padding: 8px;
+    margin: 4px 0;
+}
+.accum-glow {
+    box-shadow: 0 0 15px rgba(34, 197, 94, 0.4);
+    border: 1px solid #22c55e;
+}
+.dist-glow {
+    box-shadow: 0 0 15px rgba(239, 68, 68, 0.4);
+    border: 1px solid #ef4444;
+}
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
 # ====== CONFIG ====== #
 CONFIG = {
-    "ratio_threshold": 2.5,
-    "strong_ratio_threshold": 4.0,
-    "persistence_count": 2,
-    "strong_persistence": 1,
-    "imbalance_mult": 1.5,
-    "history_days": 10,
-    "oi_change_threshold": 0.05,
-    "pcr_bullish_threshold": 0.7,
-    "pcr_bearish_threshold": 1.3,
-    "atm_range_pct": 0.03,
+    # Base absorption thresholds (will be scaled per-symbol using avg_vol)
+    "absorption_threshold": 50000,
+    "strong_absorption": 100000,
+    
+    # Efficiency thresholds
+    "low_efficiency_threshold": 0.00005,
+    "high_efficiency_threshold": 0.0005,
+    
+    # Signal confirmation
+    "absorption_bars_needed": 2,
+    "score_threshold": 70,
+    
+    # Price movement minimum (base, will be made dynamic)
+    "min_price_move": 0.01,
+    
+    # Tick history
+    "default_max_ticks": 500,
+    
+    # Historical bars for average
+    "avg_bars": 750,
+    
+    # Buy/sell estimation weights
+    "tick_rule_weight": 0.7,
+    "book_delta_weight": 0.3,
+    
+    # Minimum ticks for valid classification
+    "min_ticks_for_signal": 5,
 }
-IDLE_DROP_COUNT = 2
+
 POLL_INTERVAL_SEC = 2
 
 
@@ -236,14 +100,6 @@ def now_ist():
     return datetime.now(INDIA_TZ)
 
 
-def get_expiry_date(expiry):
-    if expiry is None:
-        return None
-    if hasattr(expiry, 'date'):
-        return expiry.date()
-    return expiry
-
-
 def current_bar_id_5m():
     now = now_ist()
     minute_slot = (now.minute // 5) * 5
@@ -251,122 +107,329 @@ def current_bar_id_5m():
     return int(bar_start.timestamp()), bar_start
 
 
-# ====== OI ANALYSIS ====== #
-class OISnapshot:
-    def __init__(self):
-        self.timestamp = None
-        self.ce_oi_total = 0
-        self.pe_oi_total = 0
-        self.ce_oi_atm = 0
-        self.pe_oi_atm = 0
-        self.max_ce_oi_strike = 0
-        self.max_pe_oi_strike = 0
-        self.max_ce_oi = 0
-        self.max_pe_oi = 0
-        self.strike_data = {}
+def safe_quote_batch(kite, batch, manager_log_func, attempts=2, sleep_s=0.3):
+    """
+    Safely fetch quotes with retry logic.
+    Returns dict of quotes (may be partial if some fail).
+    """
+    for attempt in range(attempts):
+        try:
+            q = kite.quote(batch)
+            # Check completeness
+            if len(q) < len(batch):
+                manager_log_func(
+                    f"Quote batch incomplete: got {len(q)}/{len(batch)} symbols",
+                    "WARNING"
+                )
+            return q
+        except Exception as e:
+            if attempt < attempts - 1:
+                time.sleep(sleep_s)
+            else:
+                manager_log_func(f"Quote batch failed after {attempts} attempts: {e}", "WARNING")
+    return {}
 
 
-class OIAnalysis:
-    @staticmethod
-    def calculate_pcr(pe_oi, ce_oi):
-        if ce_oi == 0:
-            return 0.0
-        return round(pe_oi / ce_oi, 2)
+# ====== ABSORPTION ENGINE (Thread-Safe, Adaptive) ====== #
+class AbsorptionEngine:
+    """
+    Real institutional detection using:
+    1. ABSORPTION = Volume absorbed without price impact
+    2. EFFICIENCY = Price move per unit volume
+    3. IMBALANCE = Aggressive volume vs price direction
     
-    @staticmethod
-    def analyze_oi_change(prev, curr, ltp, vwap):
-        if prev is None or curr is None:
-            return "NEUTRAL", 0.3, "Waiting for OI data..."
-        
-        if prev.ce_oi_total == 0 and prev.pe_oi_total == 0:
-            return "NEUTRAL", 0.3, "Previous OI empty"
-        
-        if curr.ce_oi_total == 0 and curr.pe_oi_total == 0:
-            return "NEUTRAL", 0.3, "Current OI empty"
-        
-        parts = []
-        
-        prev_pcr = OIAnalysis.calculate_pcr(prev.pe_oi_total, prev.ce_oi_total)
-        curr_pcr = OIAnalysis.calculate_pcr(curr.pe_oi_total, curr.ce_oi_total)
-        pcr_change = curr_pcr - prev_pcr
-        
-        ce_oi_change = curr.ce_oi_total - prev.ce_oi_total
-        pe_oi_change = curr.pe_oi_total - prev.pe_oi_total
-        
-        ce_pct = (ce_oi_change / prev.ce_oi_total * 100) if prev.ce_oi_total > 0 else 0
-        pe_pct = (pe_oi_change / prev.pe_oi_total * 100) if prev.pe_oi_total > 0 else 0
-        
-        ce_atm_chg = curr.ce_oi_atm - prev.ce_oi_atm
-        pe_atm_chg = curr.pe_oi_atm - prev.pe_oi_atm
-        
-        sup_shift = curr.max_pe_oi_strike - prev.max_pe_oi_strike
-        res_shift = curr.max_ce_oi_strike - prev.max_ce_oi_strike
-        
-        bull = 0
-        bear = 0
-        
-        if pe_oi_change > 0 and ltp >= vwap:
-            bull += 2
-            parts.append(f"Put+{pe_pct:.1f}%")
-        
-        if ce_oi_change < 0 and ce_atm_chg < 0:
-            bull += 2
-            parts.append(f"CallCover{ce_pct:.1f}%")
-        
-        if curr_pcr < CONFIG["pcr_bullish_threshold"] and pcr_change > 0.05:
-            bull += 1
-            parts.append("PCR↑")
-        
-        if sup_shift > 0:
-            bull += 1
-            parts.append("Sup↑")
-        
-        if ltp > curr.max_pe_oi_strike:
-            bull += 1
-        
-        if ce_oi_change > 0 and ltp <= vwap:
-            bear += 2
-            parts.append(f"Call+{ce_pct:.1f}%")
-        
-        if pe_oi_change < 0 and pe_atm_chg < 0:
-            bear += 2
-            parts.append(f"PutUnwind{pe_pct:.1f}%")
-        
-        if curr_pcr > CONFIG["pcr_bearish_threshold"] and pcr_change < -0.05:
-            bear += 1
-            parts.append("PCR↓")
-        
-        if res_shift < 0:
-            bear += 1
-            parts.append("Res↓")
-        
-        if ltp < curr.max_ce_oi_strike:
-            bear += 1
-        
-        net = bull - bear
-        
-        if net >= 3:
-            sig = "STRONG_BULLISH"
-            conf = min(0.9, 0.5 + net * 0.1)
-        elif net >= 1:
-            sig = "BULLISH"
-            conf = min(0.7, 0.4 + net * 0.1)
-        elif net <= -3:
-            sig = "STRONG_BEARISH"
-            conf = min(0.9, 0.5 + abs(net) * 0.1)
-        elif net <= -1:
-            sig = "BEARISH"
-            conf = min(0.7, 0.4 + abs(net) * 0.1)
+    Thread-safe with adaptive parameters per symbol.
+    """
+    
+    def __init__(self):
+        self.tick_history = {}  # symbol -> deque of ticks
+        self.lock = threading.RLock()
+        self.default_max_ticks = CONFIG["default_max_ticks"]
+
+    def _get_max_ticks_for_symbol(self, avg_vol):
+        """Adaptive tick history size based on symbol liquidity."""
+        if not avg_vol or avg_vol < 1000:
+            return 200
+        elif avg_vol < 5000:
+            return 300
+        elif avg_vol < 10000:
+            return 400
         else:
-            sig = "NEUTRAL"
-            conf = 0.3
-            if not parts:
-                parts.append("No change")
+            return self.default_max_ticks
+
+    def record_tick(self, symbol, ltp, vol_delta, buy_delta, sell_delta, avg_vol=None):
+        """Record each tick for analysis (thread-safe)."""
+        with self.lock:
+            if symbol not in self.tick_history:
+                max_ticks = self._get_max_ticks_for_symbol(avg_vol or 0)
+                self.tick_history[symbol] = deque(maxlen=max_ticks)
+            
+            self.tick_history[symbol].append({
+                "ts": time.time(),
+                "ltp": ltp,
+                "vol_delta": vol_delta,
+                "buy_delta": buy_delta,
+                "sell_delta": sell_delta,
+            })
+
+    def reset_bar(self, symbol):
+        """Reset tick history at bar close (thread-safe)."""
+        with self.lock:
+            if symbol in self.tick_history:
+                self.tick_history[symbol].clear()
+
+    def get_ticks_snapshot(self, symbol):
+        """Get thread-safe copy of tick history."""
+        with self.lock:
+            return list(self.tick_history.get(symbol, []))
+
+    def get_tick_count(self, symbol):
+        """Get current tick count for a symbol."""
+        with self.lock:
+            return len(self.tick_history.get(symbol, []))
+
+    def calculate_absorption_metrics(self, symbol, current_ltp, avg_vol=None, 
+                                      abs_threshold=None, strong_abs=None):
+        """
+        Calculate absorption metrics from tick history.
         
-        return sig, conf, " | ".join(parts) if parts else "Analyzing..."
+        Args:
+            symbol: Stock symbol
+            current_ltp: Current LTP for dynamic calculations
+            avg_vol: Average volume for adaptive thresholds
+            abs_threshold: Per-symbol absorption threshold (if pre-computed)
+            strong_abs: Per-symbol strong absorption threshold
+        
+        Returns:
+            dict with absorption scores and classifications
+        """
+        ticks = self.get_ticks_snapshot(symbol)
+        
+        # Minimum ticks required for valid analysis
+        min_ticks = CONFIG["min_ticks_for_signal"]
+        if len(ticks) < min_ticks:
+            return self._empty_metrics(tick_count=len(ticks))
+
+        # ========== PRICE ANALYSIS ==========
+        first_price = ticks[0]["ltp"]
+        last_price = ticks[-1]["ltp"]
+        price_change = last_price - first_price
+        price_up = max(0, price_change)
+        price_down = abs(min(0, price_change))
+        
+        prices = [t["ltp"] for t in ticks]
+        price_high = max(prices)
+        price_low = min(prices)
+        price_range = price_high - price_low
+
+        # ========== VOLUME ANALYSIS ==========
+        total_volume = sum(t["vol_delta"] for t in ticks)
+        total_buy_vol = sum(t["buy_delta"] for t in ticks)
+        total_sell_vol = sum(t["sell_delta"] for t in ticks)
+
+        # ========== DYNAMIC MIN PRICE MOVE ==========
+        # Scale based on current price to handle both low and high-priced stocks
+        base_min = CONFIG["min_price_move"]
+        ltp_based_min = (current_ltp or 100.0) * 0.0002  # 0.02% of price
+        
+        # For high-volume stocks, use tighter threshold
+        if avg_vol and avg_vol > 50000:
+            ltp_based_min = (current_ltp or 100.0) * 0.0001  # 0.01%
+        
+        min_move = max(base_min, ltp_based_min)
+
+        # ========== ABSORPTION METRICS ==========
+        # Accumulation: High sell volume absorbed without price drop
+        # Distribution: High buy volume absorbed without price rise
+        
+        accu_absorption = 0
+        dist_absorption = 0
+        
+        if total_sell_vol > 0:
+            accu_absorption = total_sell_vol / max(price_down, min_move)
+        
+        if total_buy_vol > 0:
+            dist_absorption = total_buy_vol / max(price_up, min_move)
+
+        # ========== EFFICIENCY ==========
+        efficiency = 0
+        inverse_efficiency = 0
+        
+        if total_volume > 0:
+            efficiency = price_range / total_volume
+            if efficiency > 0:
+                inverse_efficiency = 1 / efficiency
+
+        volume_imbalance = total_buy_vol - total_sell_vol
+
+        # ========== ADAPTIVE THRESHOLDS ==========
+        # Use passed thresholds or compute from avg_vol
+        if abs_threshold is None:
+            if avg_vol and avg_vol > 0:
+                abs_threshold = max(500, avg_vol * 0.02)  # 2% of avg volume
+            else:
+                abs_threshold = CONFIG["absorption_threshold"]
+        
+        if strong_abs is None:
+            if avg_vol and avg_vol > 0:
+                strong_abs = max(abs_threshold * 2.5, avg_vol * 0.05)
+            else:
+                strong_abs = CONFIG["strong_absorption"]
+
+        # Adaptive efficiency threshold (scale with price)
+        low_eff_threshold = CONFIG["low_efficiency_threshold"]
+        if current_ltp and current_ltp > 0:
+            # Normalize: higher priced stocks have smaller relative moves
+            low_eff_threshold = CONFIG["low_efficiency_threshold"] * (100 / current_ltp)
+
+        # Adaptive volume threshold for bonus
+        vol_threshold = max(10000, avg_vol * 0.05) if avg_vol else 10000
+
+        # ========== SCORING ==========
+        accu_score = 0
+        dist_score = 0
+
+        # Accumulation scoring
+        if accu_absorption > abs_threshold:
+            # Base score from absorption ratio
+            accu_score += min(40, (accu_absorption / strong_abs) * 40)
+            
+            # Bonus: Price went UP despite heavy selling (strong absorption)
+            if price_change > 0 and total_sell_vol > total_buy_vol:
+                accu_score += 30
+            # Bonus: Price stable despite selling
+            elif price_change >= -min_move:
+                accu_score += 20
+            
+            # Bonus: Low efficiency (volume not moving price)
+            if efficiency < low_eff_threshold:
+                accu_score += 20
+            
+            # Bonus: Significant volume
+            if total_volume > vol_threshold:
+                accu_score += 10
+
+        # Distribution scoring
+        if dist_absorption > abs_threshold:
+            # Base score from absorption ratio
+            dist_score += min(40, (dist_absorption / strong_abs) * 40)
+            
+            # Bonus: Price went DOWN despite heavy buying (strong distribution)
+            if price_change < 0 and total_buy_vol > total_sell_vol:
+                dist_score += 30
+            # Bonus: Price stable despite buying
+            elif price_change <= min_move:
+                dist_score += 20
+            
+            # Bonus: Low efficiency
+            if efficiency < low_eff_threshold:
+                dist_score += 20
+            
+            # Bonus: Significant volume
+            if total_volume > vol_threshold:
+                dist_score += 10
+
+        # Cap scores at 100
+        accu_score = min(100, round(accu_score, 1))
+        dist_score = min(100, round(dist_score, 1))
+
+        # ========== CLASSIFICATION ==========
+        classification = "NEUTRAL"
+        threshold = CONFIG["score_threshold"]
+        
+        if accu_score >= threshold and accu_score > dist_score:
+            classification = "ACCUMULATION"
+        elif dist_score >= threshold and dist_score > accu_score:
+            classification = "DISTRIBUTION"
+        elif accu_score >= threshold * 0.7 and accu_score > dist_score:
+            classification = "POSSIBLE_ACCUM"
+        elif dist_score >= threshold * 0.7 and dist_score > accu_score:
+            classification = "POSSIBLE_DIST"
+
+        return {
+            "accu_absorption": round(accu_absorption, 2),
+            "dist_absorption": round(dist_absorption, 2),
+            "accu_score": accu_score,
+            "dist_score": dist_score,
+            "efficiency": efficiency,
+            "inverse_efficiency": round(inverse_efficiency, 2),
+            "price_change": round(price_change, 2),
+            "price_range": round(price_range, 2),
+            "total_volume": total_volume,
+            "buy_volume": total_buy_vol,
+            "sell_volume": total_sell_vol,
+            "volume_imbalance": volume_imbalance,
+            "classification": classification,
+            "tick_count": len(ticks),
+            # Include thresholds used for debugging
+            "abs_threshold_used": round(abs_threshold, 0),
+            "min_move_used": round(min_move, 4),
+        }
+
+    def _empty_metrics(self, tick_count=0):
+        return {
+            "accu_absorption": 0,
+            "dist_absorption": 0,
+            "accu_score": 0,
+            "dist_score": 0,
+            "efficiency": 0,
+            "inverse_efficiency": 0,
+            "price_change": 0,
+            "price_range": 0,
+            "total_volume": 0,
+            "buy_volume": 0,
+            "sell_volume": 0,
+            "volume_imbalance": 0,
+            "classification": "NEUTRAL",
+            "tick_count": tick_count,
+            "abs_threshold_used": 0,
+            "min_move_used": 0,
+        }
 
 
-# ====== MANAGER CLASS ====== #
+# ====== SIGNAL PERSISTENCE ====== #
+def apply_absorption_persistence(stt, current_classification, accu_score, dist_score):
+    """
+    Apply persistence logic based on absorption scores.
+    Requires consecutive confirmations for signal generation.
+    """
+    prev_class = stt.get("raw_classification", "NEUTRAL")
+    
+    # Track consecutive classifications
+    if current_classification == prev_class:
+        stt["class_persist"] = stt.get("class_persist", 0) + 1
+    else:
+        stt["class_persist"] = 1
+    
+    stt["raw_classification"] = current_classification
+    
+    confirmed = stt.get("confirmed_signal", "NEUTRAL")
+    needed = CONFIG["absorption_bars_needed"]
+    
+    # Strong signals (score > 85) need less confirmation
+    max_score = max(accu_score, dist_score)
+    if max_score >= 85:
+        needed = 1
+    elif max_score >= 75:
+        needed = max(1, needed - 1)
+    
+    if current_classification in ("ACCUMULATION", "DISTRIBUTION"):
+        if stt["class_persist"] >= needed:
+            confirmed = current_classification
+            stt["neutral_persist"] = 0
+    elif current_classification == "NEUTRAL":
+        stt["neutral_persist"] = stt.get("neutral_persist", 0) + 1
+        if stt["neutral_persist"] >= 3:
+            confirmed = "NEUTRAL"
+            stt["class_persist"] = 0
+    else:
+        stt["neutral_persist"] = 0
+    
+    stt["confirmed_signal"] = confirmed
+    return confirmed
+
+
+# ====== MANAGER ====== #
 class SniperManager:
     def __init__(self):
         self.lock = threading.RLock()
@@ -378,8 +441,8 @@ class SniperManager:
         self.kite = None
         self.last_beat = 0.0
         self.initialized = False
-        self.oi_snapshots = {}
-        self.bar_trackers = {}
+        self.avg_volumes = {}  # symbol -> {avg_vol, bar_count, abs_threshold, strong_abs, ...}
+        self.absorption_engine = AbsorptionEngine()
 
     def log(self, msg, level="INFO"):
         ts = now_ist().strftime("%H:%M:%S")
@@ -401,84 +464,47 @@ class SniperManager:
     def get_symbol_data(self, symbol):
         with self.lock:
             return self.data.get(symbol, {}).copy()
-    
-    def update_oi_snapshot(self, symbol, snapshot):
+
+    def set_avg_volume(self, symbol, avg_vol, bar_count):
+        """Store pre-calculated average volume and derived thresholds for a symbol."""
         with self.lock:
-            if symbol not in self.oi_snapshots:
-                self.oi_snapshots[symbol] = {'prev': None, 'curr': None}
-            self.oi_snapshots[symbol]['prev'] = self.oi_snapshots[symbol]['curr']
-            self.oi_snapshots[symbol]['curr'] = snapshot
-    
-    def get_oi_snapshots(self, symbol):
-        with self.lock:
-            if symbol in self.oi_snapshots:
-                return (self.oi_snapshots[symbol]['prev'], self.oi_snapshots[symbol]['curr'])
-            return None, None
-    
-    def init_bar_tracker(self, symbol, bar_id):
-        with self.lock:
-            self.bar_trackers[symbol] = {
-                'bar_id': bar_id,
-                'total_vol': 0,
-                'total_ob_change': 0,
-                'tick_count': 0,
-                'last_cum_vol': None,
-                'last_buy_q': None,
-                'last_sell_q': None,
+            # Compute adaptive thresholds
+            if avg_vol and avg_vol > 0:
+                abs_threshold = max(500, avg_vol * 0.02)  # 2% of avg volume
+                strong_abs = max(abs_threshold * 2.5, avg_vol * 0.05)
+            else:
+                abs_threshold = CONFIG["absorption_threshold"]
+                strong_abs = CONFIG["strong_absorption"]
+            
+            self.avg_volumes[symbol] = {
+                "avg_vol": avg_vol,
+                "bar_count": bar_count,
+                "abs_threshold": abs_threshold,
+                "strong_abs": strong_abs,
+                "calculated_at": now_ist().strftime("%H:%M:%S")
             }
-    
-    def update_bar_tracker(self, symbol, bar_id, cum_vol, buy_q, sell_q):
+
+    def get_avg_volume(self, symbol):
         with self.lock:
-            if symbol not in self.bar_trackers:
-                self.init_bar_tracker(symbol, bar_id)
-            
-            tracker = self.bar_trackers[symbol]
-            
-            if tracker['bar_id'] != bar_id:
-                prev_stats = {
-                    'total_vol': tracker['total_vol'],
-                    'total_ob_change': tracker['total_ob_change'],
-                    'tick_count': tracker['tick_count'],
-                }
-                self.bar_trackers[symbol] = {
-                    'bar_id': bar_id,
-                    'total_vol': 0,
-                    'total_ob_change': 0,
-                    'tick_count': 1,
-                    'last_cum_vol': cum_vol,
-                    'last_buy_q': buy_q,
-                    'last_sell_q': sell_q,
-                }
-                return prev_stats, True
-            
-            if tracker['last_cum_vol'] is not None:
-                d_vol = max(0, cum_vol - tracker['last_cum_vol'])
-                tracker['total_vol'] += d_vol
-            
-            if tracker['last_buy_q'] is not None and tracker['last_sell_q'] is not None:
-                d_ob = abs(buy_q - tracker['last_buy_q']) + abs(sell_q - tracker['last_sell_q'])
-                tracker['total_ob_change'] += d_ob
-            
-            tracker['last_cum_vol'] = cum_vol
-            tracker['last_buy_q'] = buy_q
-            tracker['last_sell_q'] = sell_q
-            tracker['tick_count'] += 1
-            
+            return self.avg_volumes.get(symbol, {}).get("avg_vol", 0.0)
+
+    def get_symbol_thresholds(self, symbol):
+        """Get per-symbol adaptive thresholds."""
+        with self.lock:
+            info = self.avg_volumes.get(symbol, {})
             return {
-                'total_vol': tracker['total_vol'],
-                'total_ob_change': tracker['total_ob_change'],
-                'tick_count': tracker['tick_count'],
-            }, False
+                "avg_vol": info.get("avg_vol", 0),
+                "abs_threshold": info.get("abs_threshold", CONFIG["absorption_threshold"]),
+                "strong_abs": info.get("strong_abs", CONFIG["strong_absorption"]),
+            }
 
 
-def get_fresh_manager():
+@st.cache_resource
+def get_manager():
     return SniperManager()
 
 
-if 'manager' not in st.session_state:
-    st.session_state.manager = get_fresh_manager()
-
-manager = st.session_state.manager
+manager = get_manager()
 
 
 # ====== KITE HELPERS ====== #
@@ -490,240 +516,193 @@ def get_instrument_token(kite, symbol):
             if inst["tradingsymbol"] == sym and inst["segment"] == "NSE":
                 return inst["instrument_token"]
     except Exception as e:
-        manager.log(f"Token error {symbol}: {e}", "ERROR")
+        manager.log(f"Instrument lookup error for {symbol}: {e}", "ERROR")
     return None
 
 
-def calc_rvol(kite, token, days=10):
+def calc_avg_volume_750(kite, token):
+    """Calculate average volume of last 750 completed 5-min bars (once at start)."""
     try:
         now = now_ist().replace(tzinfo=None)
-        from_date = now - timedelta(days=days + 5)
+        from_date = now - timedelta(days=15)
+        
         candles = kite.historical_data(token, from_date, now, "5minute")
         df = pd.DataFrame(candles)
-        if df.empty or len(df) < 2:
-            return 0.0, 0, 0.0
+        
+        if df.empty:
+            return 0.0, 0
 
         df["date"] = pd.to_datetime(df["date"])
         df = df.sort_values("date")
-
-        current_vol = int(df["volume"].iloc[-1])
-        hist = df["volume"].iloc[:-1]
-        if len(hist) > 750:
-            hist = hist.iloc[-750:]
-        avg_750 = float(hist.mean()) if len(hist) > 0 else 0.0
-        rvol = current_vol / avg_750 if avg_750 > 0 else 0.0
-        return round(rvol, 2), current_vol, round(avg_750, 2)
+        
+        completed_bars = df.iloc[:-1] if len(df) > 1 else df
+        
+        if len(completed_bars) > CONFIG["avg_bars"]:
+            completed_bars = completed_bars.tail(CONFIG["avg_bars"])
+        
+        bar_count = len(completed_bars)
+        
+        if bar_count == 0:
+            return 0.0, 0
+        
+        avg_vol = float(completed_bars["volume"].mean())
+        
+        return round(avg_vol, 2), bar_count
+        
     except Exception as e:
-        manager.log(f"RVol error: {e}", "ERROR")
-        return 0.0, 0, 0.0
+        manager.log(f"Avg volume calc error: {e}", "ERROR")
+        return 0.0, 0
 
 
-def scan_option_chain_oi(kite, symbol, spot_price):
+def calc_live_rvol(current_bar_volume, avg_750_volume):
+    """Calculate live RVol for current bar."""
+    if avg_750_volume <= 0:
+        return 0.0
+    return round(current_bar_volume / avg_750_volume, 2)
+
+
+def scan_opt_power(kite, symbol):
+    """Returns (net_million, ce_m, pe_m) using nearest expiry CE/PE volume."""
     try:
         all_opts = [
             i for i in kite.instruments("NFO")
             if i.get("segment") == "NFO-OPT" and i.get("name") == symbol
         ]
         if not all_opts:
-            return None
+            return 0.0, 0.0, 0.0
 
         today = now_ist().date()
-        
-        expiries = sorted({
-            get_expiry_date(i["expiry"])
-            for i in all_opts
-            if get_expiry_date(i["expiry"]) is not None and get_expiry_date(i["expiry"]) >= today
-        })
-        
+        expiries = sorted({i["expiry"].date() for i in all_opts if i["expiry"].date() >= today})
         if not expiries:
-            return None
+            return 0.0, 0.0, 0.0
 
         nearest = expiries[0]
-        scoped = [i for i in all_opts if get_expiry_date(i["expiry"]) == nearest]
+        scoped = [i for i in all_opts if i["expiry"].date() == nearest]
 
-        ce_opts = {i['strike']: i for i in scoped if i["instrument_type"] == "CE"}
-        pe_opts = {i['strike']: i for i in scoped if i["instrument_type"] == "PE"}
-        
-        all_strikes = sorted(set(ce_opts.keys()) | set(pe_opts.keys()))
-        
-        if not all_strikes:
-            return None
-        
-        relevant_strikes = [s for s in all_strikes if spot_price * 0.9 <= s <= spot_price * 1.1]
-        if not relevant_strikes:
-            relevant_strikes = all_strikes[:20]
-        
-        atm_low = spot_price * (1 - CONFIG["atm_range_pct"])
-        atm_high = spot_price * (1 + CONFIG["atm_range_pct"])
-        
-        ce_syms = [f"NFO:{ce_opts[s]['tradingsymbol']}" for s in relevant_strikes if s in ce_opts]
-        pe_syms = [f"NFO:{pe_opts[s]['tradingsymbol']}" for s in relevant_strikes if s in pe_opts]
-        
-        ce_quotes = {}
-        pe_quotes = {}
-        
-        for i in range(0, len(ce_syms), 40):
-            batch = ce_syms[i:i+40]
-            try:
-                q = kite.quote(batch)
-                ce_quotes.update(q)
-                time.sleep(0.1)
-            except:
-                pass
-        
-        for i in range(0, len(pe_syms), 40):
-            batch = pe_syms[i:i+40]
-            try:
-                q = kite.quote(batch)
-                pe_quotes.update(q)
-                time.sleep(0.1)
-            except:
-                pass
-        
-        snapshot = OISnapshot()
-        snapshot.timestamp = now_ist()
-        
-        max_ce_oi = 0
-        max_pe_oi = 0
-        
-        for strike in relevant_strikes:
-            ce_oi = 0
-            pe_oi = 0
-            
-            if strike in ce_opts:
-                ce_sym = f"NFO:{ce_opts[strike]['tradingsymbol']}"
-                if ce_sym in ce_quotes:
-                    ce_oi = safe_int(ce_quotes[ce_sym].get('oi', 0))
-            
-            if strike in pe_opts:
-                pe_sym = f"NFO:{pe_opts[strike]['tradingsymbol']}"
-                if pe_sym in pe_quotes:
-                    pe_oi = safe_int(pe_quotes[pe_sym].get('oi', 0))
-            
-            snapshot.strike_data[strike] = {'ce_oi': ce_oi, 'pe_oi': pe_oi}
-            snapshot.ce_oi_total += ce_oi
-            snapshot.pe_oi_total += pe_oi
-            
-            if atm_low <= strike <= atm_high:
-                snapshot.ce_oi_atm += ce_oi
-                snapshot.pe_oi_atm += pe_oi
-            
-            if ce_oi > max_ce_oi:
-                max_ce_oi = ce_oi
-                snapshot.max_ce_oi_strike = int(strike)
-                snapshot.max_ce_oi = ce_oi
-            
-            if pe_oi > max_pe_oi:
-                max_pe_oi = pe_oi
-                snapshot.max_pe_oi_strike = int(strike)
-                snapshot.max_pe_oi = pe_oi
-        
-        return snapshot
-        
+        ce_syms = [f"NFO:{i['tradingsymbol']}" for i in scoped if i["instrument_type"] == "CE"]
+        pe_syms = [f"NFO:{i['tradingsymbol']}" for i in scoped if i["instrument_type"] == "PE"]
+
+        ce_vol = 0
+        pe_vol = 0
+
+        # Process CE options in batches
+        if ce_syms:
+            for i in range(0, len(ce_syms), 50):
+                batch = ce_syms[i:i+50]
+                q_ce = safe_quote_batch(kite, batch, manager.log)
+                for v in q_ce.values():
+                    prem = safe_float(v.get("last_price", 0.0))
+                    if prem >= 20:
+                        ce_vol += safe_int(v.get("volume", 0))
+
+        # Process PE options in batches
+        if pe_syms:
+            for i in range(0, len(pe_syms), 50):
+                batch = pe_syms[i:i+50]
+                q_pe = safe_quote_batch(kite, batch, manager.log)
+                for v in q_pe.values():
+                    prem = safe_float(v.get("last_price", 0.0))
+                    if prem >= 20:
+                        pe_vol += safe_int(v.get("volume", 0))
+
+        ce_m = round(ce_vol / 1_000_000, 2)
+        pe_m = round(pe_vol / 1_000_000, 2)
+        net_m = round(ce_m - pe_m, 2)
+        return net_m, ce_m, pe_m
     except Exception as e:
-        manager.log(f"OI scan error {symbol}: {e}", "ERROR")
-        return None
+        manager.log(f"Option scan failed for {symbol}: {e}", "ERROR")
+        return 0.0, 0.0, 0.0
 
 
-# ====== FOOTPRINT LOGIC ====== #
-def classify_raw_signal(ratio, ltp, vwap, buy_q, sell_q):
-    raw = "IDLE"
-    reason = ""
+# ====== BUY/SELL VOLUME ESTIMATION ====== #
+def estimate_buy_sell_volume(vol_delta, ltp, prev_ltp, buy_q, sell_q, prev_buy_q, prev_sell_q):
+    """
+    Improved buy/sell volume estimation combining:
+    1. Tick rule (price direction)
+    2. Orderbook delta (bid/ask quantity changes)
     
-    if ratio > CONFIG["ratio_threshold"]:
-        strong = ratio > CONFIG["strong_ratio_threshold"]
-        sell_dom = sell_q > buy_q * CONFIG["imbalance_mult"]
-        buy_dom = buy_q > sell_q * CONFIG["imbalance_mult"]
-
-        if ltp >= vwap and (sell_dom or strong):
-            raw = "ACCUMULATION"
-            reason = "Price≥VWAP"
-        elif ltp <= vwap and (buy_dom or strong):
-            raw = "DISTRIBUTION"
-            reason = "Price≤VWAP"
-        else:
-            reason = f"R:{ratio:.1f}x"
+    Returns: (buy_vol_delta, sell_vol_delta)
+    """
+    if vol_delta <= 0:
+        return 0, 0
+    
+    # ========== TICK RULE ==========
+    if ltp > prev_ltp:
+        # Price up = aggressive buying
+        tick_buy = vol_delta
+        tick_sell = 0
+    elif ltp < prev_ltp:
+        # Price down = aggressive selling
+        tick_buy = 0
+        tick_sell = vol_delta
     else:
-        reason = f"Low R:{ratio:.1f}x"
-    
-    return raw, reason
-
-
-def apply_persistence(stt, raw_signal, ratio):
-    prev_raw = stt.get("raw_signal", "IDLE")
-
-    if raw_signal == prev_raw:
-        stt["persist"] = stt.get("persist", 0) + 1
-    else:
-        stt["persist"] = 1
-
-    stt["raw_signal"] = raw_signal
-
-    needed = CONFIG["persistence_count"]
-    if ratio > CONFIG["strong_ratio_threshold"]:
-        needed = CONFIG["strong_persistence"]
-
-    base = stt.get("base_signal", "IDLE")
-
-    if raw_signal in ("ACCUMULATION", "DISTRIBUTION") and stt["persist"] >= needed:
-        base = raw_signal
-        stt["idle_persist"] = 0
-    elif raw_signal == "IDLE":
-        stt["idle_persist"] = stt.get("idle_persist", 0) + 1
-        if stt["idle_persist"] >= IDLE_DROP_COUNT:
-            base = "IDLE"
-            stt["persist"] = 0
-    else:
-        stt["idle_persist"] = 0
-
-    stt["base_signal"] = base
-    return base
-
-
-def generate_trade_signal(base_signal, oi_signal):
-    trade_signal = "IDLE"
-    signal_strength = "WEAK"
-    
-    if base_signal == "ACCUMULATION":
-        if oi_signal in ("STRONG_BULLISH", "BULLISH"):
-            trade_signal = "BUY CALL"
-            signal_strength = "STRONG" if oi_signal == "STRONG_BULLISH" else "CONFIRMED"
-        elif oi_signal == "NEUTRAL":
-            trade_signal = "BUY CALL"
-            signal_strength = "UNCONFIRMED"
+        # Price unchanged - split based on orderbook imbalance
+        total_q = buy_q + sell_q
+        if total_q > 0:
+            tick_buy = int(vol_delta * (buy_q / total_q))
+            tick_sell = vol_delta - tick_buy
         else:
-            trade_signal = "CONFLICTING"
-            signal_strength = "AVOID"
+            tick_buy = vol_delta // 2
+            tick_sell = vol_delta - tick_buy
     
-    elif base_signal == "DISTRIBUTION":
-        if oi_signal in ("STRONG_BEARISH", "BEARISH"):
-            trade_signal = "BUY PUT"
-            signal_strength = "STRONG" if oi_signal == "STRONG_BEARISH" else "CONFIRMED"
-        elif oi_signal == "NEUTRAL":
-            trade_signal = "BUY PUT"
-            signal_strength = "UNCONFIRMED"
-        else:
-            trade_signal = "CONFLICTING"
-            signal_strength = "AVOID"
+    # ========== ORDERBOOK DELTA ==========
+    # Positive delta = quantity increased (possible spoofing/real orders)
+    # Negative delta = quantity consumed (real trades)
+    book_buy_delta = max(0, prev_buy_q - buy_q)   # Buy qty decreased = buys executed
+    book_sell_delta = max(0, prev_sell_q - sell_q)  # Sell qty decreased = sells executed
     
-    return trade_signal, signal_strength
+    # Normalize book deltas to vol_delta scale
+    book_total = book_buy_delta + book_sell_delta
+    if book_total > 0:
+        book_buy_normalized = int(vol_delta * (book_buy_delta / book_total))
+        book_sell_normalized = vol_delta - book_buy_normalized
+    else:
+        book_buy_normalized = 0
+        book_sell_normalized = 0
+    
+    # ========== COMBINE WITH WEIGHTS ==========
+    tick_weight = CONFIG["tick_rule_weight"]
+    book_weight = CONFIG["book_delta_weight"]
+    
+    buy_vol_delta = int(tick_buy * tick_weight + book_buy_normalized * book_weight)
+    sell_vol_delta = int(tick_sell * tick_weight + book_sell_normalized * book_weight)
+    
+    # Ensure total matches vol_delta
+    total_estimated = buy_vol_delta + sell_vol_delta
+    if total_estimated > 0 and total_estimated != vol_delta:
+        # Scale to match
+        scale = vol_delta / total_estimated
+        buy_vol_delta = int(buy_vol_delta * scale)
+        sell_vol_delta = vol_delta - buy_vol_delta
+    
+    return buy_vol_delta, sell_vol_delta
 
 
 # ====== WORKER THREAD ====== #
-def sniper_worker(kite, mgr):
-    mgr.is_running = True
-    mgr.log("Worker started", "INFO")
+def sniper_worker(kite):
+    manager.is_running = True
+    manager.log("Sniper worker started (Absorption Model v2)", "INFO")
 
-    last_oi_scan = 0.0
+    # Track cumulative volume from exchange
+    last_cum_vol = {}
+    bar_start_cum_vol = {}
+    
+    # Track for buy/sell estimation
+    last_ltp = {}
+    last_buy_q = {}
+    last_sell_q = {}
+    
+    last_opt_scan = 0.0
+
     curr_bar_id, curr_bar_start = current_bar_id_5m()
 
-    while not mgr.stop_event.is_set():
+    while not manager.stop_event.is_set():
         try:
             now_ts = time.time()
-            mgr.last_beat = now_ts
+            manager.last_beat = now_ts
 
-            with mgr.lock:
-                active_list = list(mgr.active_symbols)
+            with manager.lock:
+                active_list = list(manager.active_symbols)
 
             if not active_list:
                 time.sleep(1)
@@ -732,17 +711,17 @@ def sniper_worker(kite, mgr):
             new_bar_id, new_bar_start = current_bar_id_5m()
             bar_changed = new_bar_id != curr_bar_id
 
+            # Fetch quotes for all symbols
             keys = [f"NSE:{row['symbol']}" for row in active_list]
-            try:
-                quotes = kite.quote(keys)
-            except Exception as e:
-                mgr.log(f"Quote error: {e}", "WARNING")
+            quotes = safe_quote_batch(kite, keys, manager.log)
+            
+            if not quotes:
                 time.sleep(2)
                 continue
 
-            do_oi_scan = (now_ts - last_oi_scan) > 120
-            if do_oi_scan:
-                last_oi_scan = now_ts
+            do_opt_scan = (now_ts - last_opt_scan) > 60
+            if do_opt_scan:
+                last_opt_scan = now_ts
 
             for row in active_list:
                 sym = row["symbol"]
@@ -751,182 +730,217 @@ def sniper_worker(kite, mgr):
                 if not q:
                     continue
 
-                stt = mgr.get_symbol_data(sym)
+                stt = manager.get_symbol_data(sym)
+                thresholds = manager.get_symbol_thresholds(sym)
 
                 ltp = safe_float(q.get("last_price"))
-                vwap = safe_float(q.get("average_price"), ltp)
                 depth = q.get("depth", {})
 
                 buy_q = sum(safe_int(x.get("quantity")) for x in depth.get("buy", [])[:5])
                 sell_q = sum(safe_int(x.get("quantity")) for x in depth.get("sell", [])[:5])
+
                 cum_vol = safe_int(q.get("volume"))
 
-                bar_stats, is_new_bar = mgr.update_bar_tracker(sym, new_bar_id, cum_vol, buy_q, sell_q)
-                
-                if not stt:
-                    stt = {
-                        "ltp": ltp, "vwap": vwap, "buy_q": buy_q, "sell_q": sell_q,
-                        "bar_vol": 0, "bar_ob_change": 0, "ratio_bar": 0.0,
-                        "raw_signal": "IDLE", "raw_reason": "Init",
-                        "base_signal": "IDLE", "persist": 0, "idle_persist": 0,
-                        "oi_signal": "NEUTRAL", "oi_confidence": 0.3,
-                        "oi_analysis": "Waiting...", "pcr": 0.0,
-                        "support_strike": 0, "resistance_strike": 0,
-                        "ce_oi_total": 0, "pe_oi_total": 0,
-                        "rvol": 0.0, "rvol_avg": 0.0,
-                        "trade_signal": "IDLE", "signal_strength": "WEAK",
-                        "tick_count": 0,
-                    }
+                # ========== VOLUME DELTA ==========
+                prev_cum = last_cum_vol.get(sym, cum_vol)
+                vol_delta = max(0, cum_vol - prev_cum)
+                last_cum_vol[sym] = cum_vol
 
-                stt["bar_vol"] = bar_stats['total_vol']
-                stt["bar_ob_change"] = bar_stats['total_ob_change']
-                stt["tick_count"] = bar_stats['tick_count']
+                # ========== BUY/SELL ESTIMATION ==========
+                prev_ltp = last_ltp.get(sym, ltp)
+                prev_buy_q = last_buy_q.get(sym, buy_q)
+                prev_sell_q = last_sell_q.get(sym, sell_q)
                 
-                if bar_stats['total_ob_change'] > 0:
-                    stt["ratio_bar"] = round(bar_stats['total_vol'] / bar_stats['total_ob_change'], 2)
-                
-                if bar_changed and is_new_bar:
-                    bar_vol = bar_stats['total_vol']
-                    bar_ob = bar_stats['total_ob_change']
-                    ratio_bar = bar_vol / max(1, bar_ob) if bar_ob > 0 else 0.0
-                    
-                    raw, reason = classify_raw_signal(ratio_bar, ltp, vwap, buy_q, sell_q)
-                    base_signal = apply_persistence(stt, raw, ratio_bar)
-                    
-                    stt["ratio_bar"] = round(ratio_bar, 2)
-                    stt["raw_reason"] = reason
-                    
-                    mgr.log(f"{sym}: R={ratio_bar:.1f}x {raw}→{base_signal}", "INFO")
-                
-                if do_oi_scan:
-                    oi_snapshot = scan_option_chain_oi(kite, sym, ltp)
-                    
-                    if oi_snapshot:
-                        mgr.update_oi_snapshot(sym, oi_snapshot)
-                        prev_snap, curr_snap = mgr.get_oi_snapshots(sym)
-                        
-                        if prev_snap and curr_snap:
-                            oi_signal, oi_confidence, oi_analysis = OIAnalysis.analyze_oi_change(
-                                prev_snap, curr_snap, ltp, vwap
-                            )
-                            stt["oi_signal"] = oi_signal
-                            stt["oi_confidence"] = oi_confidence
-                            stt["oi_analysis"] = oi_analysis
-                        
-                        if curr_snap:
-                            stt["pcr"] = OIAnalysis.calculate_pcr(curr_snap.pe_oi_total, curr_snap.ce_oi_total)
-                            stt["support_strike"] = int(curr_snap.max_pe_oi_strike)
-                            stt["resistance_strike"] = int(curr_snap.max_ce_oi_strike)
-
-                trade_signal, signal_strength = generate_trade_signal(
-                    stt.get("base_signal", "IDLE"),
-                    stt.get("oi_signal", "NEUTRAL")
+                buy_vol_delta, sell_vol_delta = estimate_buy_sell_volume(
+                    vol_delta, ltp, prev_ltp, 
+                    buy_q, sell_q, prev_buy_q, prev_sell_q
                 )
                 
+                # Update tracking
+                last_ltp[sym] = ltp
+                last_buy_q[sym] = buy_q
+                last_sell_q[sym] = sell_q
+
+                # ========== RECORD TICK ==========
+                avg_750 = thresholds["avg_vol"]
+                if vol_delta > 0:
+                    manager.absorption_engine.record_tick(
+                        sym, ltp, vol_delta, buy_vol_delta, sell_vol_delta, avg_vol=avg_750
+                    )
+
+                # ========== BAR VOLUME TRACKING ==========
+                if sym not in bar_start_cum_vol:
+                    bar_start_cum_vol[sym] = cum_vol
+
+                if bar_changed:
+                    bar_start_cum_vol[sym] = last_cum_vol.get(sym, cum_vol)
+
+                current_bar_vol = max(0, cum_vol - bar_start_cum_vol.get(sym, cum_vol))
+
+                # ========== LIVE RVOL ==========
+                live_rvol = calc_live_rvol(current_bar_vol, avg_750)
+
+                # ========== ABSORPTION METRICS ==========
+                absorption_metrics = manager.absorption_engine.calculate_absorption_metrics(
+                    sym, ltp, 
+                    avg_vol=avg_750,
+                    abs_threshold=thresholds["abs_threshold"],
+                    strong_abs=thresholds["strong_abs"]
+                )
+
+                # ========== INITIALIZE STATE ==========
+                if not stt:
+                    stt = {
+                        "ltp": ltp,
+                        "buy_q": buy_q,
+                        "sell_q": sell_q,
+                        "bar_id": curr_bar_id,
+                        "bar_vol": current_bar_vol,
+                        "raw_classification": "NEUTRAL",
+                        "confirmed_signal": "NEUTRAL",
+                        "class_persist": 0,
+                        "neutral_persist": 0,
+                        "opt_power": 0.0,
+                        "opt_ce": 0.0,
+                        "opt_pe": 0.0,
+                        "rvol": live_rvol,
+                        "avg_750": avg_750,
+                        "trade_signal": "IDLE",
+                        "last_bar_vol": 0,
+                        "last_bar_rvol": 0.0,
+                        "absorption": absorption_metrics,
+                        "last_buy_q": buy_q,
+                        "last_sell_q": sell_q,
+                    }
+
+                # ========== BAR CLOSE LOGIC ==========
+                if bar_changed and stt.get("bar_id", curr_bar_id) == curr_bar_id:
+                    # Get final absorption metrics for the bar
+                    final_metrics = manager.absorption_engine.calculate_absorption_metrics(
+                        sym, ltp,
+                        avg_vol=avg_750,
+                        abs_threshold=thresholds["abs_threshold"],
+                        strong_abs=thresholds["strong_abs"]
+                    )
+                    
+                    # Check if we have enough ticks for valid signal
+                    tick_count = final_metrics["tick_count"]
+                    min_ticks = CONFIG["min_ticks_for_signal"]
+                    
+                    if tick_count >= min_ticks:
+                        # Apply persistence
+                        confirmed = apply_absorption_persistence(
+                            stt, 
+                            final_metrics["classification"],
+                            final_metrics["accu_score"],
+                            final_metrics["dist_score"]
+                        )
+                    else:
+                        confirmed = stt.get("confirmed_signal", "NEUTRAL")
+                        manager.log(
+                            f"{sym}: Low tick count ({tick_count}) at bar close, skipping classification",
+                            "WARNING"
+                        )
+
+                    final_bar_vol = stt.get("bar_vol", 0)
+                    final_rvol = calc_live_rvol(final_bar_vol, avg_750)
+
+                    stt["last_bar_vol"] = final_bar_vol
+                    stt["last_bar_rvol"] = final_rvol
+                    stt["absorption"] = final_metrics
+
+                    # Log bar close
+                    accu_s = final_metrics["accu_score"]
+                    dist_s = final_metrics["dist_score"]
+                    cls = final_metrics["classification"]
+                    
+                    emoji = ""
+                    if cls == "ACCUMULATION":
+                        emoji = "🟢"
+                    elif cls == "DISTRIBUTION":
+                        emoji = "🔴"
+                    elif "POSSIBLE" in cls:
+                        emoji = "🟡"
+                    
+                    rvol_flag = "🔥" if final_rvol >= 2.0 else ""
+                    
+                    manager.log(
+                        f"{emoji} {sym} BAR @ {curr_bar_start.strftime('%H:%M')} | "
+                        f"Vol={final_bar_vol:,} RVol={final_rvol}x{rvol_flag} | "
+                        f"Ticks={tick_count} | "
+                        f"Accu={accu_s:.0f} Dist={dist_s:.0f} → {cls} "
+                        f"[Confirmed: {confirmed}]",
+                        "INFO",
+                    )
+
+                    # Reset absorption engine for new bar
+                    manager.absorption_engine.reset_bar(sym)
+
+                    # Reset for new bar
+                    stt["bar_id"] = new_bar_id
+                    stt["bar_vol"] = current_bar_vol
+
+                else:
+                    stt["bar_id"] = curr_bar_id
+                    stt["bar_vol"] = current_bar_vol
+                    stt["absorption"] = absorption_metrics
+
+                # Update live values
+                stt["rvol"] = live_rvol
+                stt["avg_750"] = avg_750
+                stt["last_buy_q"] = buy_q
+                stt["last_sell_q"] = sell_q
+
+                # ========== OPTIONS SCAN ==========
+                if do_opt_scan:
+                    net, ce_m, pe_m = scan_opt_power(kite, sym)
+                    stt["opt_power"] = net
+                    stt["opt_ce"] = ce_m
+                    stt["opt_pe"] = pe_m
+
+                # ========== TRADE SIGNAL LOGIC ==========
+                ce_m = stt.get("opt_ce", 0.0)
+                pe_m = stt.get("opt_pe", 0.0)
+                call_bias = ce_m > pe_m * 1.2
+                put_bias = pe_m > ce_m * 1.2
+
+                confirmed_signal = stt.get("confirmed_signal", "NEUTRAL")
+                trade_signal = "IDLE"
+                
+                if confirmed_signal == "ACCUMULATION" and call_bias:
+                    trade_signal = "🟢 BUY CALL"
+                elif confirmed_signal == "DISTRIBUTION" and put_bias:
+                    trade_signal = "🔴 BUY PUT"
+                elif confirmed_signal == "ACCUMULATION":
+                    trade_signal = "ACCUM ⏳"
+                elif confirmed_signal == "DISTRIBUTION":
+                    trade_signal = "DIST ⏳"
+
                 stt["trade_signal"] = trade_signal
-                stt["signal_strength"] = signal_strength
                 stt["ltp"] = ltp
-                stt["vwap"] = vwap
                 stt["buy_q"] = buy_q
                 stt["sell_q"] = sell_q
 
-                mgr.set_symbol_data(sym, stt)
+                manager.set_symbol_data(sym, stt)
 
             if bar_changed:
                 curr_bar_id = new_bar_id
                 curr_bar_start = new_bar_start
-                mgr.log(f"NEW BAR: {new_bar_start.strftime('%H:%M')}", "INFO")
 
             time.sleep(POLL_INTERVAL_SEC)
 
         except Exception as e:
-            mgr.log(f"Error: {e}", "ERROR")
+            manager.log(f"Worker error: {e}", "ERROR")
+            import traceback
+            manager.log(traceback.format_exc(), "DEBUG")
             time.sleep(2)
 
-    mgr.is_running = False
-    mgr.log("Worker stopped", "INFO")
+    manager.is_running = False
+    manager.log("Sniper worker stopped", "INFO")
 
 
-# ====== RENDER COMPACT CARD ====== #
-def render_compact_card(sym, d):
-    trade_sig = d.get("trade_signal", "IDLE")
-    signal_strength = d.get("signal_strength", "WEAK")
-    base_sig = d.get("base_signal", "IDLE")
-    oi_sig = d.get("oi_signal", "NEUTRAL")
-    oi_conf = d.get("oi_confidence", 0.0)
-    oi_analysis = d.get("oi_analysis", "")
-    
-    ltp = d.get('ltp', 0)
-    vwap = d.get('vwap', 0)
-    pcr = d.get('pcr', 0)
-    ratio = d.get('ratio_bar', 0)
-    support = d.get('support_strike', 0)
-    resistance = d.get('resistance_strike', 0)
-    bar_vol = d.get('bar_vol', 0)
-    tick_count = d.get('tick_count', 0)
-    
-    # Determine card class
-    if trade_sig == "BUY CALL":
-        card_class = "card-bullish"
-        badge_class = "badge-call"
-    elif trade_sig == "BUY PUT":
-        card_class = "card-bearish"
-        badge_class = "badge-put"
-    elif trade_sig == "CONFLICTING":
-        card_class = "card-warning"
-        badge_class = "badge-conflict"
-    else:
-        card_class = ""
-        badge_class = "badge-idle"
-    
-    # Base signal color
-    base_class = "bullish" if base_sig == "ACCUMULATION" else "bearish" if base_sig == "DISTRIBUTION" else "neutral"
-    
-    # OI signal color
-    oi_class = "bullish" if "BULLISH" in oi_sig else "bearish" if "BEARISH" in oi_sig else "neutral"
-    
-    # Price indicator
-    price_ind = "▲" if ltp > vwap else "▼" if ltp < vwap else "●"
-    price_class = "bullish" if ltp > vwap else "bearish" if ltp < vwap else "neutral"
-    
-    card_html = f'''
-    <div class="compact-card {card_class}">
-        <div class="card-header">
-            <span class="symbol-name">{sym}</span>
-            <span class="signal-badge {badge_class}">{trade_sig} ({signal_strength})</span>
-        </div>
-        <div class="metrics-grid">
-            <div class="metric-box">
-                <div class="metric-label">LTP</div>
-                <div class="metric-value {price_class}">₹{ltp:.2f} {price_ind}</div>
-                <div class="metric-sub">VWAP: {vwap:.2f}</div>
-            </div>
-            <div class="metric-box">
-                <div class="metric-label">Footprint</div>
-                <div class="metric-value {base_class}">{base_sig}</div>
-                <div class="metric-sub">Ratio: {ratio:.2f}x</div>
-            </div>
-            <div class="metric-box">
-                <div class="metric-label">OI Signal</div>
-                <div class="metric-value {oi_class}">{oi_sig}</div>
-                <div class="metric-sub">Conf: {oi_conf:.0%} | PCR: {pcr:.2f}</div>
-            </div>
-            <div class="metric-box">
-                <div class="metric-label">Levels</div>
-                <div class="metric-value"><span class="bullish">S:{support}</span> <span class="bearish">R:{resistance}</span></div>
-                <div class="metric-sub">Vol: {bar_vol:,}</div>
-            </div>
-        </div>
-        <div class="oi-analysis">{oi_analysis}</div>
-        <div class="footer-info">Ticks: {tick_count} | RVol: {d.get('rvol', 0):.2f}x</div>
-    </div>
-    '''
-    
-    st.markdown(card_html, unsafe_allow_html=True)
-
-
-# ====== SIDEBAR ====== #
-st.sidebar.title("🔐 Kite Connect")
+# ====== SIDEBAR AUTH ====== #
+st.sidebar.title("🔐 Zerodha Kite Connect")
 
 if "api_key" not in st.session_state:
     st.session_state.api_key = ""
@@ -935,18 +949,24 @@ if "api_sec" not in st.session_state:
 if "req_token" not in st.session_state:
     st.session_state.req_token = ""
 
-api_key = st.sidebar.text_input("API Key", value=st.session_state.api_key, key="api_key_input")
-api_sec = st.sidebar.text_input("API Secret", value=st.session_state.api_sec, type="password", key="api_sec_input")
-req_token = st.sidebar.text_input("Request Token", value=st.session_state.req_token, key="req_token_input")
+api_key = st.sidebar.text_input("API Key", value=st.session_state.api_key)
+api_sec = st.sidebar.text_input("API Secret", value=st.session_state.api_sec, type="password")
+req_token = st.sidebar.text_input("Request Token", value=st.session_state.req_token)
 
 if api_key:
     try:
         temp_kite = KiteConnect(api_key=api_key)
-        st.sidebar.markdown(f"[🔗 Login]({temp_kite.login_url()})")
-    except:
-        pass
+        login_url = temp_kite.login_url()
+        st.sidebar.markdown("---")
+        st.sidebar.markdown("**Step 1: Get Request Token**")
+        st.sidebar.markdown(f"[Click here to login to Zerodha]({login_url})")
+        st.sidebar.markdown(
+            "After login, copy the `request_token` from the redirect URL and paste above."
+        )
+    except Exception as e:
+        st.sidebar.error(f"Login URL error: {e}")
 
-if st.sidebar.button("🚀 Connect", key="connect_btn"):
+if st.sidebar.button("🚀 Connect"):
     if api_key and api_sec and req_token:
         try:
             kite = KiteConnect(api_key=api_key)
@@ -956,20 +976,26 @@ if st.sidebar.button("🚀 Connect", key="connect_btn"):
             st.session_state.api_key = api_key
             st.session_state.api_sec = api_sec
             st.session_state.req_token = req_token
-            manager.log("Connected", "SUCCESS")
+            manager.log("Connected to Kite", "SUCCESS")
             st.sidebar.success("✅ Connected")
         except Exception as e:
-            st.sidebar.error(f"Failed: {e}")
+            st.sidebar.error(f"Auth failed: {e}")
+            manager.kite = None
+    else:
+        st.sidebar.warning("Please fill API key, secret & request token")
 
 st.sidebar.markdown("---")
 
-symbols_text = st.sidebar.text_area("Symbols", "RELIANCE, TCS, INFY, HDFCBANK, ICICIBANK", key="symbols_input")
+symbols_text = st.sidebar.text_area(
+    "Symbols (F&O stocks, comma separated)",
+    "M&M, PAYTM, GAIL, KEI, TVSMOTOR"
+)
 
-col1, col2 = st.sidebar.columns(2)
+btn1, btn2 = st.sidebar.columns(2)
 
-if col1.button("▶️ START", key="start_btn"):
+if btn1.button("▶ START"):
     if not manager.kite:
-        st.error("Connect first")
+        st.error("Login first")
     elif manager.is_running:
         st.warning("Already running")
     else:
@@ -979,153 +1005,283 @@ if col1.button("▶️ START", key="start_btn"):
         with manager.lock:
             manager.active_symbols = []
             manager.data = {}
-            manager.oi_snapshots = {}
-            manager.bar_trackers = {}
+            manager.avg_volumes = {}
+            manager.absorption_engine = AbsorptionEngine()
 
-        with st.spinner("Initializing..."):
-            for s in syms:
+        with st.spinner("Initializing symbols and calculating baselines..."):
+            progress_bar = st.progress(0)
+            
+            for idx, s in enumerate(syms):
                 tkn = get_instrument_token(manager.kite, s)
                 if not tkn:
+                    manager.log(f"No NSE instrument for {s}", "WARNING")
                     continue
 
-                rvol, _, rvol_avg = calc_rvol(manager.kite, tkn)
+                # Calculate 750-bar average and set adaptive thresholds
+                avg_vol, bar_count = calc_avg_volume_750(manager.kite, tkn)
+                manager.set_avg_volume(s, avg_vol, bar_count)
+                
+                thresholds = manager.get_symbol_thresholds(s)
+                
+                manager.log(
+                    f"{s}: Avg Vol={avg_vol:,.0f} ({bar_count} bars) | "
+                    f"AbsThresh={thresholds['abs_threshold']:,.0f} | "
+                    f"StrongAbs={thresholds['strong_abs']:,.0f}",
+                    "INFO"
+                )
+
                 valid.append({"symbol": s, "token": tkn})
 
+                # Initialize symbol data
                 try:
                     q = manager.kite.quote(f"NSE:{s}")[f"NSE:{s}"]
                     ltp = safe_float(q.get("last_price"))
-                    vwap = safe_float(q.get("average_price"), ltp)
-
-                    oi_snapshot = scan_option_chain_oi(manager.kite, s, ltp)
-                    
-                    pcr, support, resistance = 0.0, 0, 0
-                    if oi_snapshot:
-                        manager.update_oi_snapshot(s, oi_snapshot)
-                        pcr = OIAnalysis.calculate_pcr(oi_snapshot.pe_oi_total, oi_snapshot.ce_oi_total)
-                        support = int(oi_snapshot.max_pe_oi_strike)
-                        resistance = int(oi_snapshot.max_ce_oi_strike)
-
-                    curr_bar_id, _ = current_bar_id_5m()
-                    manager.init_bar_tracker(s, curr_bar_id)
+                    depth = q.get("depth", {})
+                    buy_q = sum(safe_int(x.get("quantity")) for x in depth.get("buy", [])[:5])
+                    sell_q = sum(safe_int(x.get("quantity")) for x in depth.get("sell", [])[:5])
 
                     stt = {
-                        "ltp": ltp, "vwap": vwap, "buy_q": 0, "sell_q": 0,
-                        "bar_vol": 0, "bar_ob_change": 0, "ratio_bar": 0.0,
-                        "raw_signal": "IDLE", "raw_reason": "Init",
-                        "base_signal": "IDLE", "persist": 0, "idle_persist": 0,
-                        "oi_signal": "NEUTRAL", "oi_confidence": 0.3,
-                        "oi_analysis": f"PCR={pcr:.2f}",
-                        "pcr": pcr, "support_strike": support, "resistance_strike": resistance,
-                        "rvol": rvol, "rvol_avg": rvol_avg,
-                        "trade_signal": "IDLE", "signal_strength": "WEAK",
-                        "tick_count": 0,
+                        "ltp": ltp,
+                        "buy_q": buy_q,
+                        "sell_q": sell_q,
+                        "bar_id": current_bar_id_5m()[0],
+                        "bar_vol": 0,
+                        "raw_classification": "NEUTRAL",
+                        "confirmed_signal": "NEUTRAL",
+                        "class_persist": 0,
+                        "neutral_persist": 0,
+                        "opt_power": 0.0,
+                        "opt_ce": 0.0,
+                        "opt_pe": 0.0,
+                        "rvol": 0.0,
+                        "avg_750": avg_vol,
+                        "trade_signal": "IDLE",
+                        "last_bar_vol": 0,
+                        "last_bar_rvol": 0.0,
+                        "absorption": manager.absorption_engine._empty_metrics(),
+                        "last_buy_q": buy_q,
+                        "last_sell_q": sell_q,
                     }
                     manager.set_symbol_data(s, stt)
                 except Exception as e:
-                    manager.log(f"Init {s}: {e}", "WARNING")
+                    manager.log(f"Init quote failed for {s}: {e}", "WARNING")
+                
+                progress_bar.progress((idx + 1) / len(syms))
 
-        if valid:
+            progress_bar.empty()
+
+        if not valid:
+            st.error("No valid instruments found.")
+        else:
             with manager.lock:
                 manager.active_symbols = valid
                 manager.stop_event.clear()
-            t = threading.Thread(target=sniper_worker, args=(manager.kite, manager), daemon=True)
+                manager.initialized = True
+            t = threading.Thread(target=sniper_worker, args=(manager.kite,), daemon=True)
             t.start()
-            st.success(f"Started {len(valid)} symbols")
+            manager.is_running = True
+            st.success(f"✅ Monitoring {len(valid)} stocks (Absorption Model v2)")
 
-if col2.button("⏹️ STOP", key="stop_btn"):
+if btn2.button("⏹ STOP"):
     manager.stop_event.set()
     manager.is_running = False
-    time.sleep(1)
+    manager.initialized = False
     st.rerun()
 
-if st.sidebar.button("🔄 Reset", key="reset_btn"):
-    st.session_state.manager = get_fresh_manager()
-    st.rerun()
+# ====== DASHBOARD ====== #
+st.title("🎯 Institutional Sniper – Absorption Model v2")
+st.caption("Detects hidden accumulation/distribution via absorption + efficiency + imbalance (adaptive thresholds)")
 
-st.sidebar.markdown("---")
-st.sidebar.caption(f"Status: {'🟢 Running' if manager.is_running else '🔴 Stopped'}")
-
-
-# ====== MAIN DASHBOARD ====== #
-st.title("🎯 Institutional Sniper")
-
-# Status bar
+# Status indicator
 last_beat = manager.last_beat
 delta = time.time() - last_beat
-is_live = delta < 5
+hb_color = "#22c55e" if delta < 5 else "#ef4444"
+hb_text = "LIVE" if delta < 5 else "STOPPED"
+beat_time = (
+    datetime.fromtimestamp(last_beat, INDIA_TZ).strftime("%H:%M:%S")
+    if last_beat > 0 else "Never"
+)
 
-curr_bar_id, curr_bar_start = current_bar_id_5m()
-bar_end = curr_bar_start + timedelta(minutes=5)
-time_to_close = max(0, (bar_end - now_ist()).total_seconds())
-beat_time = datetime.fromtimestamp(last_beat, INDIA_TZ).strftime("%H:%M:%S") if last_beat > 0 else "-"
-
-status_html = f'''
-<div class="status-bar">
-    <div class="status-item">
-        <div class="status-label">STATUS</div>
-        <div class="status-value {'live' if is_live else 'stopped'}">{'🟢 LIVE' if is_live else '🔴 STOPPED'}</div>
+st.markdown(
+    f"""
+<div class="card-container">
+  <div style="display:flex;justify-content:space-between;align-items:center;">
+    <div style="display:flex;align-items:center;gap:10px;">
+      <div style="width:18px;height:18px;border-radius:50%;background:{hb_color};"></div>
+      <div>
+        <div style="color:#9ca3af;font-size:0.8em;">Engine Status</div>
+        <div style="font-size:1.2em;color:white;font-weight:bold;">{hb_text}</div>
+      </div>
     </div>
-    <div class="status-item">
-        <div class="status-label">CURRENT BAR</div>
-        <div class="status-value">{curr_bar_start.strftime('%H:%M')} - {bar_end.strftime('%H:%M')}</div>
-    </div>
-    <div class="status-item">
-        <div class="status-label">CLOSES IN</div>
-        <div class="status-value" style="color: #ffc107;">{int(time_to_close)}s</div>
-    </div>
-    <div class="status-item">
-        <div class="status-label">LAST BEAT</div>
-        <div class="status-value">{beat_time}</div>
-    </div>
+    <div style="color:#9ca3af;font-size:0.8em;">Last beat: {beat_time}</div>
+  </div>
 </div>
-'''
-st.markdown(status_html, unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
-# Symbol cards
+# Get snapshot
 snapshot = manager.get_data_snapshot()
 
+# Sidebar debug info
+st.sidebar.markdown("---")
+st.sidebar.markdown(f"**Symbols:** {len(snapshot)}")
+st.sidebar.markdown(f"**Running:** {manager.is_running}")
+
+# Show thresholds
+if manager.avg_volumes:
+    with st.sidebar.expander("📊 Adaptive Thresholds"):
+        for sym, info in manager.avg_volumes.items():
+            st.markdown(
+                f"**{sym}**  \n"
+                f"Avg: {info['avg_vol']:,.0f}  \n"
+                f"AbsThresh: {info['abs_threshold']:,.0f}  \n"
+                f"StrongAbs: {info['strong_abs']:,.0f}"
+            )
+            st.markdown("---")
+
 if snapshot:
-    st.markdown(f"### 📈 Monitoring {len(snapshot)} Symbols")
+    st.subheader(f"📊 Monitoring {len(snapshot)} Symbols")
     
+    cols = st.columns(3)
+    
+    # Sort by max absorption score
     items = sorted(
         snapshot.items(),
-        key=lambda x: (
-            0 if x[1].get("signal_strength") == "STRONG" else
-            1 if x[1].get("trade_signal") in ("BUY CALL", "BUY PUT") else 2,
-            -x[1].get("oi_confidence", 0.0),
+        key=lambda x: max(
+            x[1].get("absorption", {}).get("accu_score", 0),
+            x[1].get("absorption", {}).get("dist_score", 0)
         ),
+        reverse=True
     )
-    
-    col_left, col_right = st.columns(2)
-    
+
     for i, (sym, d) in enumerate(items):
-        if i % 2 == 0:
-            with col_left:
-                render_compact_card(sym, d)
-        else:
-            with col_right:
-                render_compact_card(sym, d)
+        with cols[i % 3]:
+            trade_sig = d.get("trade_signal", "IDLE")
+            confirmed = d.get("confirmed_signal", "NEUTRAL")
+            
+            absorp = d.get("absorption", {})
+            accu_score = absorp.get("accu_score", 0)
+            dist_score = absorp.get("dist_score", 0)
+            classification = absorp.get("classification", "NEUTRAL")
+            tick_count = absorp.get("tick_count", 0)
+            
+            # Card styling
+            card_class = ""
+            if confirmed == "ACCUMULATION":
+                badge_style = "background:#064e3b;color:#6ee7b7;border:1px solid #059669;"
+                card_class = "accum-glow"
+            elif confirmed == "DISTRIBUTION":
+                badge_style = "background:#7f1d1d;color:#fca5a5;border:1px solid #dc2626;"
+                card_class = "dist-glow"
+            else:
+                badge_style = "background:#374151;color:#d1d5db;border:1px solid #4b5563;"
+
+            # Score bar colors
+            accu_bar_color = "#22c55e" if accu_score >= 70 else "#4ade80" if accu_score >= 50 else "#6b7280"
+            dist_bar_color = "#ef4444" if dist_score >= 70 else "#f87171" if dist_score >= 50 else "#6b7280"
+
+            # RVol styling
+            rvol = d.get('rvol', 0.0)
+            rvol_emoji = "🔥" if rvol >= 2.0 else "⚡" if rvol >= 1.5 else ""
+
+            # Tick count indicator
+            tick_status = "🟢" if tick_count >= 10 else "🟡" if tick_count >= 5 else "🔴"
+
+            card_html = f"""
+<div class="card-container {card_class}">
+  <div style="display:flex;justify-content:space-between;align-items:center;">
+    <span style="font-size:1.3em;font-weight:bold;color:white;">{sym}</span>
+    <span style="padding:4px 8px;border-radius:4px;font-weight:bold;font-size:0.8rem;{badge_style}">{trade_sig}</span>
+  </div>
+  
+  <div style="margin-top:10px;color:#9ca3af;font-size:0.85em;">
+    <b>LTP</b> ₹{d.get('ltp',0):.2f} | <b>Ticks</b> {tick_status} {tick_count}
+  </div>
+  
+  <!-- Absorption Scores -->
+  <div class="metric-box">
+    <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
+      <span style="color:#22c55e;">🟢 Accumulation</span>
+      <span style="color:#22c55e;font-weight:bold;">{accu_score:.0f}/100</span>
+    </div>
+    <div style="background:#374151;border-radius:4px;height:8px;overflow:hidden;">
+      <div style="background:{accu_bar_color};height:100%;width:{min(accu_score, 100)}%;transition:width 0.3s;"></div>
+    </div>
+  </div>
+  
+  <div class="metric-box">
+    <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
+      <span style="color:#ef4444;">🔴 Distribution</span>
+      <span style="color:#ef4444;font-weight:bold;">{dist_score:.0f}/100</span>
+    </div>
+    <div style="background:#374151;border-radius:4px;height:8px;overflow:hidden;">
+      <div style="background:{dist_bar_color};height:100%;width:{min(dist_score, 100)}%;transition:width 0.3s;"></div>
+    </div>
+  </div>
+  
+  <div style="margin-top:8px;color:#9ca3af;font-size:0.8em;">
+    <div style="display:flex;justify-content:space-between;">
+      <span>Classification:</span>
+      <span style="font-weight:bold;">{classification}</span>
+    </div>
+    <div style="display:flex;justify-content:space-between;">
+      <span>Confirmed:</span>
+      <span style="font-weight:bold;color:{'#22c55e' if confirmed=='ACCUMULATION' else '#ef4444' if confirmed=='DISTRIBUTION' else '#9ca3af'};">{confirmed}</span>
+    </div>
+    <div style="display:flex;justify-content:space-between;">
+      <span>RVol:</span>
+      <span>{rvol:.2f}x {rvol_emoji}</span>
+    </div>
+    <div style="display:flex;justify-content:space-between;">
+      <span>Bar Vol:</span>
+      <span>{d.get('bar_vol',0):,}</span>
+    </div>
+    <div style="display:flex;justify-content:space-between;">
+      <span>Options:</span>
+      <span>CE {d.get('opt_ce',0.0):.2f}M / PE {d.get('opt_pe',0.0):.2f}M</span>
+    </div>
+  </div>
+  
+  <!-- Absorption Details -->
+  <details style="margin-top:8px;">
+    <summary style="color:#6b7280;cursor:pointer;font-size:0.75em;">📊 Absorption Details</summary>
+    <div style="color:#6b7280;font-size:0.7em;margin-top:4px;background:#0f172a;padding:6px;border-radius:4px;">
+      <b>Metrics:</b><br>
+      Accu Absorp: {absorp.get('accu_absorption', 0):,.0f}<br>
+      Dist Absorp: {absorp.get('dist_absorption', 0):,.0f}<br>
+      Efficiency: {absorp.get('efficiency', 0):.8f}<br>
+      Inv Efficiency: {absorp.get('inverse_efficiency', 0):,.0f}<br>
+      <br>
+      <b>Volume:</b><br>
+      Buy Vol: {absorp.get('buy_volume', 0):,}<br>
+      Sell Vol: {absorp.get('sell_volume', 0):,}<br>
+      Imbalance: {absorp.get('volume_imbalance', 0):,}<br>
+      <br>
+      <b>Price:</b><br>
+      Price Δ: ₹{absorp.get('price_change', 0):.2f}<br>
+      Range: ₹{absorp.get('price_range', 0):.2f}<br>
+      <br>
+      <b>Thresholds Used:</b><br>
+      Abs Thresh: {absorp.get('abs_threshold_used', 0):,.0f}<br>
+      Min Move: ₹{absorp.get('min_move_used', 0):.4f}
+    </div>
+  </details>
+</div>
+"""
+            st.markdown(card_html, unsafe_allow_html=True)
 else:
-    st.info("👆 Enter symbols and click START")
+    st.info("👆 Enter symbols and click START to begin monitoring")
 
-st.markdown("---")
+st.write("---")
 
-# Guide
-with st.expander("📖 Guide", expanded=False):
-    st.markdown("""
-    **Signals:** BUY CALL (STRONG) = Accumulation + Bullish OI | BUY PUT (STRONG) = Distribution + Bearish OI | CONFLICTING = Avoid
-    
-    **OI Patterns:** Put+ = Support | CallCover = Short covering | Call+ = Resistance | PutUnwind = Longs exiting
-    
-    **PCR:** <0.7 Oversold | 0.7-1.3 Neutral | >1.3 Overbought
-    """)
+# Logs section
+logs_list = manager.get_logs_snapshot()
+st.subheader("📝 System Logs")
+log_text = "\n".join(logs_list) if logs_list else "No logs yet..."
+st.text_area("", log_text, height=220, disabled=True, key="logs_area")
 
-# Logs
-with st.expander("📝 Logs", expanded=False):
-    logs_list = manager.get_logs_snapshot()
-    st.text_area("Logs", "\n".join(logs_list[:50]) if logs_list else "No logs...", height=150, disabled=True, label_visibility="collapsed")
-
-# Auto-refresh
+# Auto-refresh when running
 if manager.is_running:
     time.sleep(3)
     st.rerun()
