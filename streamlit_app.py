@@ -17,10 +17,73 @@ INDIA_TZ = timezone("Asia/Kolkata")
 
 # ====== PAGE CONFIG ====== #
 st.set_page_config(
-    page_title="Institutional Sniper v2",
+    page_title="Institutional Sniper v3 (Pro)",
     page_icon="🎯",
     layout="wide",
+    initial_sidebar_state="expanded"
 )
+
+# ====== CUSTOM CSS ====== #
+st.markdown("""
+<style>
+    /* Main Background */
+    .stApp { background-color: #0e1117; font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; }
+    
+    /* Metric Cards */
+    div[data-testid="stMetric"] { background-color: #1e2130; padding: 15px; border-radius: 10px; border: 1px solid #2e3245; }
+    
+    /* Signal Card - BUY CALL (Green) */
+    .buy-card {
+        background: linear-gradient(145deg, #0f2e1b, #0a1f12);
+        border: 1px solid #00ff41;
+        border-radius: 12px;
+        padding: 20px;
+        box-shadow: 0 0 15px rgba(0, 255, 65, 0.2);
+        margin-bottom: 15px;
+        animation: pulse-green 2s infinite;
+    }
+    
+    /* Signal Card - BUY PUT (Red) */
+    .sell-card {
+        background: linear-gradient(145deg, #381010, #260a0a);
+        border: 1px solid #ff2b2b;
+        border-radius: 12px;
+        padding: 20px;
+        box-shadow: 0 0 15px rgba(255, 43, 43, 0.2);
+        margin-bottom: 15px;
+        animation: pulse-red 2s infinite;
+    }
+    
+    /* Signal Card - NEUTRAL (Grey) */
+    .neutral-card {
+        background-color: #161924;
+        border: 1px solid #30364d;
+        border-radius: 12px;
+        padding: 20px;
+        margin-bottom: 15px;
+        opacity: 0.7;
+    }
+    
+    /* Typography */
+    .signal-title { font-size: 24px; font-weight: 800; margin-bottom: 5px; }
+    .signal-sub { font-size: 14px; color: #b0b3c5; letter-spacing: 1px; }
+    .price-large { font-size: 32px; font-weight: 700; color: white; }
+    .stat-label { font-size: 12px; color: #808495; }
+    .stat-val { font-size: 16px; font-weight: 600; }
+    
+    /* Animations */
+    @keyframes pulse-green {
+        0% { box-shadow: 0 0 0 0 rgba(0, 255, 65, 0.4); }
+        70% { box-shadow: 0 0 0 10px rgba(0, 255, 65, 0); }
+        100% { box-shadow: 0 0 0 0 rgba(0, 255, 65, 0); }
+    }
+    @keyframes pulse-red {
+        0% { box-shadow: 0 0 0 0 rgba(255, 43, 43, 0.4); }
+        70% { box-shadow: 0 0 0 10px rgba(255, 43, 43, 0); }
+        100% { box-shadow: 0 0 0 0 rgba(255, 43, 43, 0); }
+    }
+</style>
+""", unsafe_allow_html=True)
 
 
 # ====== ENUMS & CONFIG ====== #
@@ -28,8 +91,8 @@ class SignalType(Enum):
     NEUTRAL = "NEUTRAL"
     ACCUMULATION = "ACCUMULATION"
     DISTRIBUTION = "DISTRIBUTION"
-    MOMENTUM_BUY = "MOMENTUM_BUY"
-    MOMENTUM_SELL = "MOMENTUM_SELL"
+    MOMENTUM_BUY = "BUY CALL"
+    MOMENTUM_SELL = "BUY PUT"
 
 
 @dataclass
@@ -38,20 +101,17 @@ class Config:
     bucket_seconds: int = 5
     rolling_window_seconds: int = 300
     bar_seconds: int = 300
-    rvol_threshold_accum: float = 2.0
-    rvol_threshold_momentum: float = 1.5
-    price_change_eps: float = 0.002
-    pcr_bullish_threshold: float = 0.9
-    pcr_bearish_threshold: float = 1.1
-    imbalance_momentum_threshold: float = 0.40
-    consecutive_bars_momentum: int = 2
-    weight_aggression: int = 3
-    weight_volume: int = 3
-    weight_pcr: int = 2
-    weight_price_structure: int = 2
-    weight_signal_type: int = 3
-    avg_volume_lookback_bars: int = 20
-    bars_to_keep: int = 12
+    
+    # --- STRATEGY THRESHOLDS (Trend-Ride) ---
+    rvol_threshold: float = 1.5
+    trend_confirmation_bars: int = 3
+    breakout_lookback_bars: int = 4
+    pcr_min_bullish: float = 0.7
+    pcr_max_bearish: float = 1.3
+    
+    # --- RVOL CONFIGURATION ---
+    rvol_lookback_bars: int = 750  # 750 x 5min = 62.5 hours ≈ 10 trading days
+    bars_to_keep: int = 20
 
 
 CONFIG = Config()
@@ -157,6 +217,68 @@ def current_bar_start(seconds=300):
     now = now_ist()
     minute_slot = (now.minute // (seconds // 60)) * (seconds // 60)
     return now.replace(minute=minute_slot, second=0, microsecond=0)
+
+
+# ====== ROLLING VOLUME TRACKER (NEW) ====== #
+class RollingVolumeTracker:
+    """
+    Maintains a rolling window of bar volumes for accurate RVol calculation.
+    Seeded with historical data and updated in real-time.
+    """
+    def __init__(self, lookback_bars: int = 750):
+        self.lookback_bars = lookback_bars
+        self.volume_history: deque = deque(maxlen=lookback_bars)
+        self.sum_volume: float = 0.0
+        self.is_seeded: bool = False
+        self.lock = threading.Lock()
+    
+    def seed_from_historical(self, volumes: List[int]):
+        """Initialize with historical volume data"""
+        with self.lock:
+            self.volume_history.clear()
+            self.sum_volume = 0.0
+            
+            for vol in volumes[-self.lookback_bars:]:
+                self.volume_history.append(vol)
+                self.sum_volume += vol
+            
+            self.is_seeded = len(self.volume_history) > 0
+    
+    def add_bar_volume(self, volume: int):
+        """Add a new completed bar's volume"""
+        with self.lock:
+            if len(self.volume_history) >= self.lookback_bars:
+                # Remove oldest volume from sum
+                oldest = self.volume_history[0]
+                self.sum_volume -= oldest
+            
+            self.volume_history.append(volume)
+            self.sum_volume += volume
+    
+    def get_avg_volume(self) -> float:
+        """Get current rolling average volume"""
+        with self.lock:
+            if len(self.volume_history) == 0:
+                return 0.0
+            return self.sum_volume / len(self.volume_history)
+    
+    def get_rvol(self, current_volume: int) -> float:
+        """Calculate RVol for current bar"""
+        avg = self.get_avg_volume()
+        if avg <= 0:
+            return 0.0
+        return current_volume / avg
+    
+    def get_stats(self) -> Dict:
+        """Get diagnostic stats"""
+        with self.lock:
+            return {
+                'bars_in_history': len(self.volume_history),
+                'total_lookback': self.lookback_bars,
+                'avg_volume': self.get_avg_volume(),
+                'is_seeded': self.is_seeded,
+                'fill_pct': (len(self.volume_history) / self.lookback_bars) * 100
+            }
 
 
 # ====== TICK CLASSIFIER ====== #
@@ -274,23 +396,23 @@ class BucketAggregator:
             return copy.copy(self.current_bucket) if self.current_bucket else None
 
 
-# ====== 5-MINUTE BAR AGGREGATOR ====== #
+# ====== 5-MINUTE BAR AGGREGATOR (UPDATED) ====== #
 class BarAggregator:
-    def __init__(self, bar_seconds: int = 300, max_bars: int = 12):
+    def __init__(self, bar_seconds: int = 300, max_bars: int = 50):
         self.bar_seconds = bar_seconds
         self.max_bars = max_bars
         self.bars: deque = deque(maxlen=max_bars)
         self.current_bar: Optional[Bar5m] = None
-        self.avg_volume: float = 0.0
+        self.volume_tracker: RollingVolumeTracker = RollingVolumeTracker(CONFIG.rvol_lookback_bars)
         self.lock = threading.Lock()
     
     def _get_bar_start(self, ts: datetime) -> datetime:
         minute_slot = (ts.minute // (self.bar_seconds // 60)) * (self.bar_seconds // 60)
         return ts.replace(minute=minute_slot, second=0, microsecond=0)
     
-    def set_avg_volume(self, avg_vol: float):
-        with self.lock:
-            self.avg_volume = avg_vol
+    def seed_volume_history(self, volumes: List[int]):
+        """Seed the volume tracker with historical data"""
+        self.volume_tracker.seed_from_historical(volumes)
     
     def append_bucket(self, bucket: Bucket5s) -> Optional[Bar5m]:
         with self.lock:
@@ -303,6 +425,8 @@ class BarAggregator:
                 if self.current_bar is not None:
                     self._finalize_bar(self.current_bar)
                     self.bars.append(self.current_bar)
+                    # Add completed bar's volume to rolling tracker
+                    self.volume_tracker.add_bar_volume(self.current_bar.total_volume)
                     completed = self.current_bar
                 
                 self.current_bar = Bar5m(
@@ -319,6 +443,7 @@ class BarAggregator:
             bar.close = bucket.close
             bar.tick_count += bucket.tick_count
             bar.cumulative_delta = bar.aggr_buy_total - bar.aggr_sell_total
+            bar.vwap = (bar.high + bar.low + bar.close) / 3
             
             return completed
     
@@ -326,8 +451,30 @@ class BarAggregator:
         total = bar.aggr_buy_total + bar.aggr_sell_total
         if total > 0:
             bar.agg_imbalance = (bar.aggr_buy_total - bar.aggr_sell_total) / total
-        if self.avg_volume > 0:
-            bar.rvol = bar.total_volume / self.avg_volume
+        
+        # Calculate RVol using rolling tracker
+        bar.rvol = self.volume_tracker.get_rvol(bar.total_volume)
+        
+        bar.price_range = bar.high - bar.low
+        if bar.open > 0:
+            bar.price_change_pct = (bar.close - bar.open) / bar.open
+    
+    def get_current_bar_with_rvol(self) -> Optional[Bar5m]:
+        """Get current bar with live RVol calculation"""
+        with self.lock:
+            if self.current_bar:
+                bar_copy = copy.copy(self.current_bar)
+                # Calculate live RVol for current forming bar
+                bar_copy.rvol = self.volume_tracker.get_rvol(bar_copy.total_volume)
+                self._finalize_bar_partial(bar_copy)
+                return bar_copy
+            return None
+    
+    def _finalize_bar_partial(self, bar: Bar5m):
+        """Finalize bar stats without adding to volume history"""
+        total = bar.aggr_buy_total + bar.aggr_sell_total
+        if total > 0:
+            bar.agg_imbalance = (bar.aggr_buy_total - bar.aggr_sell_total) / total
         bar.price_range = bar.high - bar.low
         if bar.open > 0:
             bar.price_change_pct = (bar.close - bar.open) / bar.open
@@ -337,12 +484,11 @@ class BarAggregator:
             return list(self.bars)[-n:]
     
     def get_current_bar(self) -> Optional[Bar5m]:
-        with self.lock:
-            if self.current_bar:
-                bar_copy = copy.copy(self.current_bar)
-                self._finalize_bar(bar_copy)
-                return bar_copy
-            return None
+        """Legacy method - use get_current_bar_with_rvol for accurate RVol"""
+        return self.get_current_bar_with_rvol()
+    
+    def get_volume_tracker_stats(self) -> Dict:
+        return self.volume_tracker.get_stats()
 
 
 # ====== PATTERN DETECTOR ====== #
@@ -350,117 +496,65 @@ class PatternDetector:
     def __init__(self, config: Config = CONFIG):
         self.config = config
     
-    def detect(self, bars: List[Bar5m], pcr: float, current_bar: Bar5m) -> SignalResult:
+    def detect(self, bars: List[Bar5m], pcr: float, current_bar: Bar5m, current_vwap: float) -> SignalResult:
         result = SignalResult(timestamp=now_ist())
         
-        if not current_bar:
+        if len(bars) < self.config.breakout_lookback_bars:
             return result
         
-        diagnostics = {}
+        lookback = self.config.breakout_lookback_bars
+        trend_bars = self.config.trend_confirmation_bars
         
-        ab = current_bar.aggr_buy_total
-        as_ = current_bar.aggr_sell_total
-        imbalance = current_bar.agg_imbalance
-        rvol = current_bar.rvol
-        price_change = current_bar.price_change_pct
-        delta = current_bar.cumulative_delta
+        # --- 1. TREND CONFIRMATION ---
+        last_n_bars = bars[-trend_bars:]
+        bullish_trend = all(b.close > current_vwap for b in last_n_bars)
+        bearish_trend = all(b.close < current_vwap for b in last_n_bars)
         
-        diagnostics['AB'] = ab
-        diagnostics['AS'] = as_
-        diagnostics['Imbalance'] = f"{imbalance:.2%}"
-        diagnostics['RVol'] = f"{rvol:.2f}x"
-        diagnostics['PriceChg'] = f"{price_change:.2%}"
-        diagnostics['Delta'] = delta
-        diagnostics['PCR'] = f"{pcr:.2f}"
+        # --- 2. BREAKOUT TRIGGER ---
+        consolidation_bars = bars[-lookback:]
+        recent_high = max(b.high for b in consolidation_bars)
+        recent_low = min(b.low for b in consolidation_bars)
         
-        # Accumulation conditions
-        is_selling_dominant = as_ > ab
-        is_price_flat_or_up = price_change >= -self.config.price_change_eps
-        is_high_rvol_accum = rvol >= self.config.rvol_threshold_accum
-        is_pcr_bullish = pcr < self.config.pcr_bullish_threshold
+        is_breaking_out_up = current_bar.close > recent_high
+        is_breaking_out_down = current_bar.close < recent_low
         
-        delta_rising = True
-        if len(bars) >= 1:
-            prev_delta = bars[-1].cumulative_delta if bars else 0
-            delta_rising = delta > prev_delta
+        # --- 3. VOLUME FUEL ---
+        is_volume_good = current_bar.rvol >= self.config.rvol_threshold
         
-        accum_score = sum([is_selling_dominant, is_price_flat_or_up, is_high_rvol_accum, is_pcr_bullish, delta_rising])
+        # --- 4. PCR SAFETY ---
+        is_pcr_bullish = pcr > self.config.pcr_min_bullish
+        is_pcr_bearish = pcr < self.config.pcr_max_bearish
         
-        # Distribution conditions
-        is_buying_dominant = ab > as_
-        is_price_flat_or_down = price_change <= self.config.price_change_eps
-        is_pcr_bearish = pcr > self.config.pcr_bearish_threshold
-        delta_falling = not delta_rising
-        
-        dist_score = sum([is_buying_dominant, is_price_flat_or_down, is_high_rvol_accum, is_pcr_bearish, delta_falling])
-        
-        # Momentum Buy conditions
-        is_high_positive_imbalance = imbalance >= self.config.imbalance_momentum_threshold
-        is_rvol_momentum = rvol >= self.config.rvol_threshold_momentum
-        recent_high = max(b.high for b in bars) if bars else current_bar.high
-        is_breakout_up = current_bar.close > recent_high
-        
-        consecutive_bullish = sum(1 for b in bars[-3:] if b.agg_imbalance >= self.config.imbalance_momentum_threshold)
-        
-        mom_buy_score = sum([
-            is_high_positive_imbalance or consecutive_bullish >= self.config.consecutive_bars_momentum,
-            is_rvol_momentum,
-            is_breakout_up
-        ])
-        
-        # Momentum Sell conditions
-        is_high_negative_imbalance = imbalance <= -self.config.imbalance_momentum_threshold
-        recent_low = min(b.low for b in bars) if bars else current_bar.low
-        is_breakout_down = current_bar.close < recent_low
-        
-        consecutive_bearish = sum(1 for b in bars[-3:] if b.agg_imbalance <= -self.config.imbalance_momentum_threshold)
-        
-        mom_sell_score = sum([
-            is_high_negative_imbalance or consecutive_bearish >= self.config.consecutive_bars_momentum,
-            is_rvol_momentum,
-            is_breakout_down
-        ])
-        
-        diagnostics['AccumCond'] = f"{accum_score}/5"
-        diagnostics['DistCond'] = f"{dist_score}/5"
-        diagnostics['MomBuyCond'] = f"{mom_buy_score}/3"
-        diagnostics['MomSellCond'] = f"{mom_sell_score}/3"
-        
-        # Determine signal
-        if mom_buy_score >= 2:
-            result.signal_type = SignalType.MOMENTUM_BUY
-            result.strength = "STRONG" if mom_buy_score == 3 else "MODERATE"
-        elif mom_sell_score >= 2:
-            result.signal_type = SignalType.MOMENTUM_SELL
-            result.strength = "STRONG" if mom_sell_score == 3 else "MODERATE"
-        elif accum_score >= 4:
-            result.signal_type = SignalType.ACCUMULATION
-            result.strength = "STRONG" if accum_score == 5 else "MODERATE"
-        elif dist_score >= 4:
-            result.signal_type = SignalType.DISTRIBUTION
-            result.strength = "STRONG" if dist_score == 5 else "MODERATE"
-        elif accum_score >= 3:
-            result.signal_type = SignalType.ACCUMULATION
-            result.strength = "WEAK"
-        elif dist_score >= 3:
-            result.signal_type = SignalType.DISTRIBUTION
-            result.strength = "WEAK"
-        else:
-            result.signal_type = SignalType.NEUTRAL
-            result.strength = "NONE"
-        
+        diagnostics = {
+            "Trend": "Bullish" if bullish_trend else "Bearish" if bearish_trend else "Choppy",
+            "RVol": f"{current_bar.rvol:.2f}x",
+            "PCR": f"{pcr:.2f}",
+            "Breakout Lvl": f"{recent_high if bullish_trend else recent_low}",
+            "Current": f"{current_bar.close}"
+        }
         result.diagnostics = diagnostics
         
-        # Entry/SL/TP
-        if result.signal_type in [SignalType.ACCUMULATION, SignalType.MOMENTUM_BUY]:
+        # ====== DECISION MATRIX ====== #
+        if bullish_trend and is_breaking_out_up and is_volume_good and is_pcr_bullish:
+            result.signal_type = SignalType.MOMENTUM_BUY
+            result.score = 13
+            result.strength = "CONFIRMED"
+            result.stop_loss = recent_low
+            result.target = current_bar.close + (current_bar.close - recent_low) * 2
             result.entry_suggestion = current_bar.close
-            result.stop_loss = current_bar.low - (current_bar.price_range * 0.5)
-            result.target = current_bar.close + (current_bar.price_range * 2)
-        elif result.signal_type in [SignalType.DISTRIBUTION, SignalType.MOMENTUM_SELL]:
+            
+        elif bearish_trend and is_breaking_out_down and is_volume_good and is_pcr_bearish:
+            result.signal_type = SignalType.MOMENTUM_SELL
+            result.score = 13
+            result.strength = "CONFIRMED"
+            result.stop_loss = recent_high
+            result.target = current_bar.close - (recent_high - current_bar.close) * 2
             result.entry_suggestion = current_bar.close
-            result.stop_loss = current_bar.high + (current_bar.price_range * 0.5)
-            result.target = current_bar.close - (current_bar.price_range * 2)
-        
+            
+        else:
+            result.signal_type = SignalType.NEUTRAL
+            result.strength = "WAITING"
+            
         return result
 
 
@@ -470,92 +564,6 @@ class Scorer:
         self.config = config
     
     def score(self, bar: Bar5m, signal_result: SignalResult, pcr: float) -> SignalResult:
-        breakdown = {}
-        total = 0
-        
-        # Aggression (0-3)
-        imb_abs = abs(bar.agg_imbalance)
-        if imb_abs >= 0.5:
-            aggr_score = 3
-        elif imb_abs >= 0.35:
-            aggr_score = 2
-        elif imb_abs >= 0.2:
-            aggr_score = 1
-        else:
-            aggr_score = 0
-        breakdown['Aggr'] = aggr_score
-        total += aggr_score
-        
-        # Volume (0-3)
-        if bar.rvol >= 3.0:
-            vol_score = 3
-        elif bar.rvol >= 2.0:
-            vol_score = 2
-        elif bar.rvol >= 1.5:
-            vol_score = 1
-        else:
-            vol_score = 0
-        breakdown['Vol'] = vol_score
-        total += vol_score
-        
-        # PCR (0-2)
-        if signal_result.signal_type in [SignalType.ACCUMULATION, SignalType.MOMENTUM_BUY]:
-            if pcr < 0.7:
-                pcr_score = 2
-            elif pcr < 0.9:
-                pcr_score = 1
-            else:
-                pcr_score = 0
-        elif signal_result.signal_type in [SignalType.DISTRIBUTION, SignalType.MOMENTUM_SELL]:
-            if pcr > 1.3:
-                pcr_score = 2
-            elif pcr > 1.1:
-                pcr_score = 1
-            else:
-                pcr_score = 0
-        else:
-            pcr_score = 0
-        breakdown['PCR'] = pcr_score
-        total += pcr_score
-        
-        # Price Structure (0-2)
-        price_struct_score = 0
-        if signal_result.signal_type == SignalType.MOMENTUM_BUY and bar.price_change_pct > 0.003:
-            price_struct_score = 2
-        elif signal_result.signal_type == SignalType.MOMENTUM_SELL and bar.price_change_pct < -0.003:
-            price_struct_score = 2
-        elif signal_result.signal_type == SignalType.ACCUMULATION and bar.price_change_pct >= 0:
-            price_struct_score = 1
-        elif signal_result.signal_type == SignalType.DISTRIBUTION and bar.price_change_pct <= 0:
-            price_struct_score = 1
-        breakdown['Price'] = price_struct_score
-        total += price_struct_score
-        
-        # Signal Type (0-3)
-        if signal_result.strength == "STRONG":
-            sig_score = 3
-        elif signal_result.strength == "MODERATE":
-            sig_score = 2
-        elif signal_result.strength == "WEAK":
-            sig_score = 1
-        else:
-            sig_score = 0
-        breakdown['Signal'] = sig_score
-        total += sig_score
-        
-        signal_result.score = total
-        signal_result.normalized_score = (total / 13) * 100
-        signal_result.score_breakdown = breakdown
-        
-        if total >= 10:
-            signal_result.strength = "STRONG"
-        elif total >= 7:
-            signal_result.strength = "CONFIRMED"
-        elif total >= 4:
-            signal_result.strength = "MODERATE"
-        else:
-            signal_result.strength = "WEAK"
-        
         return signal_result
 
 
@@ -609,20 +617,17 @@ class PCRFetcher:
             ce_oi_total = 0
             pe_oi_total = 0
             
-            for i in range(0, len(ce_syms), 40):
-                batch = ce_syms[i:i+40]
+            all_syms = ce_syms + pe_syms
+            for i in range(0, len(all_syms), 50):
+                batch = all_syms[i:i+50]
                 try:
                     quotes = kite.quote(batch)
-                    ce_oi_total += sum(safe_int(q.get('oi', 0)) for q in quotes.values())
-                    time.sleep(0.1)
-                except:
-                    pass
-            
-            for i in range(0, len(pe_syms), 40):
-                batch = pe_syms[i:i+40]
-                try:
-                    quotes = kite.quote(batch)
-                    pe_oi_total += sum(safe_int(q.get('oi', 0)) for q in quotes.values())
+                    for k, q in quotes.items():
+                        oi = safe_int(q.get('oi', 0))
+                        if "CE" in k:
+                            ce_oi_total += oi
+                        if "PE" in k:
+                            pe_oi_total += oi
                     time.sleep(0.1)
                 except:
                     pass
@@ -631,7 +636,7 @@ class PCRFetcher:
             
             with self.lock:
                 self.cache[symbol] = pcr
-                self.cache_expiry[symbol] = now_ist() + timedelta(minutes=1)
+                self.cache_expiry[symbol] = now_ist() + timedelta(minutes=3)
             
             return round(pcr, 2)
             
@@ -639,7 +644,7 @@ class PCRFetcher:
             return self.cache.get(symbol, 1.0)
 
 
-# ====== SYMBOL STATE ====== #
+# ====== SYMBOL STATE (UPDATED) ====== #
 @dataclass
 class SymbolState:
     symbol: str
@@ -655,10 +660,8 @@ class SymbolState:
     bar_aggregator: BarAggregator = field(default_factory=BarAggregator)
     
     pcr: float = 1.0
-    avg_volume: float = 0.0
     
     signal_result: SignalResult = field(default_factory=SignalResult)
-    
     last_update: datetime = None
 
 
@@ -696,6 +699,7 @@ class SniperManager:
             result = {}
             for sym, state in self.symbol_states.items():
                 current_bar = state.bar_aggregator.get_current_bar()
+                vol_stats = state.bar_aggregator.get_volume_tracker_stats()
                 result[sym] = {
                     'ltp': state.ltp,
                     'vwap': state.vwap,
@@ -707,6 +711,7 @@ class SniperManager:
                     'current_bar': current_bar,
                     'recent_bars': state.bar_aggregator.get_recent_bars(3),
                     'rolling_stats': state.bucket_aggregator.get_rolling_stats(),
+                    'volume_tracker_stats': vol_stats,
                     'last_update': state.last_update
                 }
             return result
@@ -731,7 +736,7 @@ if 'manager' not in st.session_state:
 manager = st.session_state.manager
 
 
-# ====== KITE HELPERS ====== #
+# ====== KITE HELPERS (UPDATED) ====== #
 def get_instrument_token(kite, symbol):
     try:
         instruments = kite.instruments("NSE")
@@ -744,24 +749,37 @@ def get_instrument_token(kite, symbol):
     return None
 
 
-def calc_avg_volume(kite, token, lookback_bars=20):
+def fetch_historical_volumes(kite, token, lookback_bars: int = 750) -> List[int]:
+    """
+    Fetch historical 5-minute bar volumes for seeding the RVol tracker.
+    750 bars = ~10 trading days of 5-min data
+    """
     try:
         now = now_ist().replace(tzinfo=None)
-        from_date = now - timedelta(days=5)
+        # Fetch extra days to account for market holidays
+        from_date = now - timedelta(days=15)
+        
         candles = kite.historical_data(token, from_date, now, "5minute")
         df = pd.DataFrame(candles)
-        if df.empty or len(df) < lookback_bars:
-            return 0.0
-        return float(df['volume'].tail(lookback_bars).mean())
+        
+        if df.empty:
+            manager.log(f"No historical data for token {token}", "WARNING")
+            return []
+        
+        volumes = df['volume'].tolist()
+        
+        # Return last N bars
+        return volumes[-lookback_bars:] if len(volumes) >= lookback_bars else volumes
+        
     except Exception as e:
-        manager.log(f"Avg volume error: {e}", "ERROR")
-        return 0.0
+        manager.log(f"Historical volume error: {e}", "ERROR")
+        return []
 
 
-# ====== WORKER THREAD ====== #
+# ====== WORKER THREAD (UPDATED) ====== #
 def sniper_worker(kite, mgr: SniperManager):
     mgr.is_running = True
-    mgr.log("Worker started - Strategy v2", "INFO")
+    mgr.log("Worker started - RVol using 750-bar rolling average", "INFO")
     
     last_pcr_update = 0
     last_bar_check = current_bar_start()
@@ -786,7 +804,7 @@ def sniper_worker(kite, mgr: SniperManager):
                 time.sleep(2)
                 continue
             
-            update_pcr = (now_ts - last_pcr_update) > 120
+            update_pcr = (now_ts - last_pcr_update) > 180
             if update_pcr:
                 last_pcr_update = now_ts
             
@@ -831,23 +849,21 @@ def sniper_worker(kite, mgr: SniperManager):
                         completed_bar = state.bar_aggregator.append_bucket(completed_bucket)
                         
                         if completed_bar:
-                            mgr.log(f"{sym} Bar: AB={completed_bar.aggr_buy_total:,} "
-                                   f"AS={completed_bar.aggr_sell_total:,} "
-                                   f"Imb={completed_bar.agg_imbalance:.2%}", "INFO")
+                            vol_stats = state.bar_aggregator.get_volume_tracker_stats()
+                            mgr.log(f"{sym}: Bar closed | Vol: {completed_bar.total_volume:,} | RVol: {completed_bar.rvol:.2f}x | Avg based on {vol_stats['bars_in_history']} bars", "DEBUG")
                 
                 if update_pcr:
                     state.pcr = mgr.pcr_fetcher.get_pcr(kite, sym, ltp)
                 
                 current_bar = state.bar_aggregator.get_current_bar()
-                recent_bars = state.bar_aggregator.get_recent_bars(3)
+                recent_bars = state.bar_aggregator.get_recent_bars(15)
                 
                 if current_bar:
-                    signal = mgr.pattern_detector.detect(recent_bars, state.pcr, current_bar)
-                    signal = mgr.scorer.score(current_bar, signal, state.pcr)
+                    signal = mgr.pattern_detector.detect(recent_bars, state.pcr, current_bar, vwap)
                     state.signal_result = signal
                     
-                    if signal.signal_type != SignalType.NEUTRAL and signal.score >= 6:
-                        mgr.log(f"🎯 {sym}: {signal.signal_type.value} Score={signal.score}/13", "SIGNAL")
+                    if signal.score == 13:
+                        mgr.log(f"🎯 {sym}: {signal.signal_type.value} @ {ltp} | RVol: {current_bar.rvol:.2f}x", "SIGNAL")
             
             new_bar_start = current_bar_start()
             if new_bar_start != last_bar_check:
@@ -864,339 +880,232 @@ def sniper_worker(kite, mgr: SniperManager):
     mgr.log("Worker stopped", "INFO")
 
 
-# ====== RENDER CARD USING NATIVE STREAMLIT ====== #
-def render_signal_card(sym: str, data: Dict):
+# ====== RENDER MODERN CARD (UPDATED) ====== #
+def render_modern_card(sym: str, data: Dict):
     signal = data.get('signal', SignalResult())
     current_bar = data.get('current_bar')
+    ltp = data.get('ltp', 0.0)
+    pcr = data.get('pcr', 1.0)
+    vol_stats = data.get('volume_tracker_stats', {})
     
     if not current_bar:
-        st.warning(f"{sym}: No bar data yet")
-        return
-    
-    sig_type = signal.signal_type
-    score = signal.score
-    strength = signal.strength
-    breakdown = signal.score_breakdown
-    diagnostics = signal.diagnostics
-    
-    ltp = data.get('ltp', 0)
-    vwap = data.get('vwap', 0)
-    pcr = data.get('pcr', 1.0)
-    
-    # Determine signal info
-    if sig_type == SignalType.ACCUMULATION:
-        sig_emoji = "🟢"
-        sig_label = "ACCUMULATION"
-    elif sig_type == SignalType.DISTRIBUTION:
-        sig_emoji = "🔴"
-        sig_label = "DISTRIBUTION"
-    elif sig_type == SignalType.MOMENTUM_BUY:
-        sig_emoji = "🚀"
-        sig_label = "MOMENTUM BUY"
-    elif sig_type == SignalType.MOMENTUM_SELL:
-        sig_emoji = "📉"
-        sig_label = "MOMENTUM SELL"
+        rvol = 0.0
     else:
-        sig_emoji = "⚪"
-        sig_label = "NEUTRAL"
+        rvol = current_bar.rvol
     
-    # Card container
-    with st.container(border=True):
-        # Header row
-        col1, col2, col3 = st.columns([2, 2, 1])
-        with col1:
-            st.subheader(f"{sig_emoji} {sym}")
-        with col2:
-            st.caption(f"**{sig_label}** • {strength}")
-        with col3:
-            if score >= 10:
-                st.success(f"**{score}/13**")
-            elif score >= 6:
-                st.warning(f"**{score}/13**")
-            else:
-                st.info(f"**{score}/13**")
-        
-        # Metrics row
-        m1, m2, m3, m4, m5 = st.columns(5)
-        
-        with m1:
-            price_delta = ltp - vwap
-            st.metric("LTP", f"₹{ltp:.2f}", f"{price_delta:+.2f} vs VWAP")
-        
-        with m2:
-            imb_pct = current_bar.agg_imbalance * 100
-            st.metric("Imbalance", f"{imb_pct:+.1f}%", f"AB:{current_bar.aggr_buy_total:,}")
-        
-        with m3:
-            st.metric("RVol", f"{current_bar.rvol:.2f}x", f"Vol:{current_bar.total_volume:,}")
-        
-        with m4:
-            st.metric("PCR", f"{pcr:.2f}", f"Δ:{current_bar.cumulative_delta:,}")
-        
-        with m5:
-            if signal.entry_suggestion > 0:
-                st.metric("Entry", f"₹{signal.entry_suggestion:.2f}", f"SL:{signal.stop_loss:.2f}")
-        
-        # Score breakdown
-        if breakdown:
-            st.caption("**Score Breakdown:** " + " | ".join([f"{k}:{v}" for k, v in breakdown.items()]))
-        
-        # Diagnostics expander
-        with st.expander("Diagnostics"):
-            if diagnostics:
-                diag_cols = st.columns(4)
-                items = list(diagnostics.items())
-                for i, (k, v) in enumerate(items):
-                    with diag_cols[i % 4]:
-                        st.caption(f"**{k}:** {v}")
+    bars_in_history = vol_stats.get('bars_in_history', 0)
+    fill_pct = vol_stats.get('fill_pct', 0)
+    
+    card_class = "neutral-card"
+    text_color = "#b0b3c5"
+    signal_text = "NEUTRAL"
+    
+    if signal.signal_type == SignalType.MOMENTUM_BUY:
+        card_class = "buy-card"
+        text_color = "#00ff41"
+        signal_text = "BUY CALL 🚀"
+    elif signal.signal_type == SignalType.MOMENTUM_SELL:
+        card_class = "sell-card"
+        text_color = "#ff2b2b"
+        signal_text = "BUY PUT 📉"
+    
+    html_content = f"""
+    <div class="{card_class}">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+            <div>
+                <div class="signal-title" style="color: {text_color};">{sym}</div>
+                <div class="signal-sub">{signal_text}</div>
+            </div>
+            <div class="price-large" style="color: white;">₹{ltp:.2f}</div>
+        </div>
+        <hr style="border-color: rgba(255,255,255,0.1); margin: 15px 0;">
+        <div style="display:flex; justify-content:space-between;">
+            <div>
+                <div class="stat-label">RVol</div>
+                <div class="stat-val" style="color: {'#00ff41' if rvol > 1.5 else '#fff'};">{rvol:.2f}x</div>
+            </div>
+            <div>
+                <div class="stat-label">PCR</div>
+                <div class="stat-val">{pcr:.2f}</div>
+            </div>
+            <div>
+                <div class="stat-label">Entry</div>
+                <div class="stat-val">{signal.entry_suggestion if signal.entry_suggestion > 0 else '-'}</div>
+            </div>
+            <div>
+                <div class="stat-label">Stop Loss</div>
+                <div class="stat-val">{signal.stop_loss if signal.stop_loss > 0 else '-'}</div>
+            </div>
+        </div>
+        <div style="margin-top: 10px; font-size: 11px; color: #666;">
+            Vol History: {bars_in_history}/750 bars ({fill_pct:.1f}% filled)
+        </div>
+    </div>
+    """
+    st.markdown(html_content, unsafe_allow_html=True)
 
 
 # ====== SIDEBAR ====== #
-st.sidebar.title("🔐 Kite Connect")
+st.sidebar.title("🔐 1. Authenticate")
 
-if "api_key" not in st.session_state:
-    st.session_state.api_key = ""
-if "api_sec" not in st.session_state:
-    st.session_state.api_sec = ""
-if "req_token" not in st.session_state:
-    st.session_state.req_token = ""
+login_mode = st.sidebar.radio("Login Method", ["Request Token", "Access Token (Direct)"])
 
-api_key = st.sidebar.text_input("API Key", value=st.session_state.api_key, key="api_key_input")
-api_sec = st.sidebar.text_input("API Secret", value=st.session_state.api_sec, type="password", key="api_sec_input")
-req_token = st.sidebar.text_input("Request Token", value=st.session_state.req_token, key="req_token_input")
+if "kite_connected" not in st.session_state:
+    st.session_state.kite_connected = False
 
-if api_key:
-    try:
-        temp_kite = KiteConnect(api_key=api_key)
-        st.sidebar.markdown(f"[🔗 Login to Zerodha]({temp_kite.login_url()})")
-    except:
-        pass
+if not st.session_state.kite_connected:
+    api_key = st.sidebar.text_input("API Key", value=st.session_state.get("api_key", ""))
+    
+    if login_mode == "Request Token":
+        api_sec = st.sidebar.text_input("API Secret", value=st.session_state.get("api_sec", ""), type="password")
+        if api_key and api_sec:
+            try:
+                temp_kite = KiteConnect(api_key=api_key)
+                url = temp_kite.login_url()
+                st.sidebar.markdown(f"""
+                <a href="{url}" target="_blank" style="
+                    display: block; text-align: center; background-color: #FF5722; color: white; padding: 10px;
+                    text-decoration: none; border-radius: 5px; font-weight: bold; margin-bottom: 10px;">
+                    👉 Click Here to Login & Get Token
+                </a>
+                """, unsafe_allow_html=True)
+            except:
+                pass
+        req_token = st.sidebar.text_input("Paste Request Token", value=st.session_state.get("req_token", ""))
+        
+        if st.sidebar.button("🔌 Connect with Request Token", type="primary"):
+            try:
+                kite = KiteConnect(api_key=api_key)
+                data = kite.generate_session(req_token, api_secret=api_sec)
+                kite.set_access_token(data["access_token"])
+                manager.kite = kite
+                st.session_state.api_key = api_key
+                st.session_state.api_sec = api_sec
+                st.session_state.req_token = req_token
+                st.session_state.kite_connected = True
+                st.rerun()
+            except Exception as e:
+                st.sidebar.error(f"Login Failed: {e}")
 
-if st.sidebar.button("🚀 Connect", key="connect_btn"):
-    if api_key and api_sec and req_token:
-        try:
-            kite = KiteConnect(api_key=api_key)
-            ses = kite.generate_session(req_token, api_secret=api_sec)
-            kite.set_access_token(ses["access_token"])
-            manager.kite = kite
-            st.session_state.api_key = api_key
-            st.session_state.api_sec = api_sec
-            st.session_state.req_token = req_token
-            manager.log("Connected", "SUCCESS")
-            st.sidebar.success("✅ Connected")
-        except Exception as e:
-            st.sidebar.error(f"Failed: {e}")
-
-st.sidebar.markdown("---")
-
-# Config expander
-with st.sidebar.expander("⚙️ Strategy Config"):
-    st.number_input("RVol Threshold (Accum)", value=CONFIG.rvol_threshold_accum, key="cfg_rvol_accum")
-    st.number_input("RVol Threshold (Momentum)", value=CONFIG.rvol_threshold_momentum, key="cfg_rvol_mom")
-    st.number_input("PCR Bullish (<)", value=CONFIG.pcr_bullish_threshold, key="cfg_pcr_bull")
-    st.number_input("PCR Bearish (>)", value=CONFIG.pcr_bearish_threshold, key="cfg_pcr_bear")
-    st.number_input("Imbalance Threshold", value=CONFIG.imbalance_momentum_threshold, key="cfg_imb")
-
-symbols_text = st.sidebar.text_area("Symbols (comma separated)", "RELIANCE, TCS, INFY, HDFCBANK, ICICIBANK", key="symbols_input")
-
-col1, col2 = st.sidebar.columns(2)
-
-if col1.button("▶️ START", key="start_btn"):
-    if not manager.kite:
-        st.error("Connect to Kite first")
-    elif manager.is_running:
-        st.warning("Already running")
     else:
-        syms = [s.strip().upper() for s in symbols_text.split(",") if s.strip()]
-        
-        with manager.lock:
-            manager.active_symbols = []
-            manager.symbol_states = {}
-        
-        with st.spinner("Initializing symbols..."):
-            valid = []
-            for s in syms:
-                tkn = get_instrument_token(manager.kite, s)
-                if not tkn:
-                    manager.log(f"Token not found: {s}", "WARNING")
-                    continue
+        acc_token = st.sidebar.text_input("Paste Access Token")
+        if st.sidebar.button("🔌 Connect with Access Token", type="primary"):
+            try:
+                kite = KiteConnect(api_key=api_key)
+                kite.set_access_token(acc_token)
+                manager.kite = kite
+                st.session_state.api_key = api_key
+                st.session_state.kite_connected = True
+                st.rerun()
+            except Exception as e:
+                st.sidebar.error(f"Connection Failed: {e}")
+
+else:
+    st.sidebar.success("✅ Authenticated")
+    st.sidebar.divider()
+    
+    st.sidebar.title("⚙️ 2. Strategy")
+    default_syms = "RELIANCE, HDFCBANK, INFY, ICICIBANK, TCS, SBIN, TATASTEEL"
+    sym_input = st.sidebar.text_area("Watchlist", default_syms, height=150)
+    
+    # RVol Configuration
+    st.sidebar.subheader("📊 RVol Settings")
+    st.sidebar.caption(f"Current: {CONFIG.rvol_lookback_bars} bars (~{CONFIG.rvol_lookback_bars * 5 / 60:.1f} hours)")
+    
+    if not manager.is_running:
+        if st.sidebar.button("🚀 START SNIPER", type="primary"):
+            with st.spinner("Initializing Strategy with 750-bar Volume History..."):
+                manager.active_symbols = []
+                valid = []
+                syms = [s.strip().upper() for s in sym_input.split(",") if s.strip()]
                 
-                avg_vol = calc_avg_volume(manager.kite, tkn, CONFIG.avg_volume_lookback_bars)
+                progress_bar = st.progress(0)
+                status_text = st.empty()
                 
-                state = SymbolState(symbol=s, token=tkn, avg_volume=avg_vol)
-                state.bar_aggregator.set_avg_volume(avg_vol)
+                for idx, s in enumerate(syms):
+                    status_text.text(f"Loading {s}... ({idx+1}/{len(syms)})")
+                    
+                    tkn = get_instrument_token(manager.kite, s)
+                    if tkn:
+                        # Fetch 750 bars of historical volume
+                        hist_volumes = fetch_historical_volumes(
+                            manager.kite, tkn, CONFIG.rvol_lookback_bars
+                        )
+                        
+                        state = SymbolState(symbol=s, token=tkn)
+                        
+                        # Seed volume tracker with historical data
+                        if hist_volumes:
+                            state.bar_aggregator.seed_volume_history(hist_volumes)
+                            manager.log(f"{s}: Seeded with {len(hist_volumes)} historical bars", "INFO")
+                        
+                        manager.symbol_states[s] = state
+                        valid.append({'symbol': s, 'token': tkn})
+                    
+                    progress_bar.progress((idx + 1) / len(syms))
                 
-                try:
-                    q = manager.kite.quote(f"NSE:{s}")[f"NSE:{s}"]
-                    state.ltp = safe_float(q.get('last_price'))
-                    state.vwap = safe_float(q.get('average_price'), state.ltp)
-                    state.volume = safe_int(q.get('volume'))
-                except:
-                    pass
+                status_text.empty()
+                progress_bar.empty()
                 
-                state.pcr = manager.pcr_fetcher.get_pcr(manager.kite, s, state.ltp)
-                
-                manager.symbol_states[s] = state
-                valid.append({"symbol": s, "token": tkn})
-                manager.log(f"Init {s}: AvgVol={avg_vol:.0f} PCR={state.pcr:.2f}", "INFO")
-        
-        if valid:
-            with manager.lock:
                 manager.active_symbols = valid
                 manager.stop_event.clear()
-            t = threading.Thread(target=sniper_worker, args=(manager.kite, manager), daemon=True)
-            t.start()
-            st.success(f"Started monitoring {len(valid)} symbols")
-
-if col2.button("⏹️ STOP", key="stop_btn"):
-    manager.stop_event.set()
-    manager.is_running = False
-    time.sleep(1)
-    st.rerun()
-
-if st.sidebar.button("🔄 Reset App", key="reset_btn"):
-    st.session_state.manager = get_fresh_manager()
-    st.rerun()
-
-st.sidebar.markdown("---")
-st.sidebar.caption(f"Status: {'🟢 Running' if manager.is_running else '🔴 Stopped'}")
+                threading.Thread(target=sniper_worker, args=(manager.kite, manager), daemon=True).start()
+                st.rerun()
+    else:
+        if st.sidebar.button("🛑 STOP SYSTEM"):
+            manager.stop_event.set()
+            time.sleep(1)
+            st.rerun()
+        
+        # Show volume stats in sidebar
+        st.sidebar.divider()
+        st.sidebar.subheader("📈 Volume Stats")
+        data = manager.get_all_states_snapshot()
+        for sym, d in data.items():
+            vol_stats = d.get('volume_tracker_stats', {})
+            bars = vol_stats.get('bars_in_history', 0)
+            avg = vol_stats.get('avg_volume', 0)
+            st.sidebar.caption(f"{sym}: {bars}/750 bars | Avg: {avg:,.0f}")
 
 
 # ====== MAIN DASHBOARD ====== #
-st.title("🎯 Institutional Sniper v2")
-st.caption("Tick Classification → 5s/5m Aggregation → Pattern Detection → Scoring")
+st.title("Institutional Sniper Pro")
+st.caption("Real-Time VWAP Trend + Breakout Detection | RVol: 750-bar Rolling Average")
 
-# Status row
-status_cols = st.columns(5)
-
-last_beat = manager.last_beat
-delta = time.time() - last_beat
-is_live = delta < 5
-
-bar_start = current_bar_start()
-bar_end = bar_start + timedelta(minutes=5)
-time_to_close = max(0, (bar_end - now_ist()).total_seconds())
-beat_time = datetime.fromtimestamp(last_beat, INDIA_TZ).strftime("%H:%M:%S") if last_beat > 0 else "-"
-
-ranked = manager.get_ranked_signals()
-active_signals = len([r for r in ranked if r[1].score >= 6])
-
-with status_cols[0]:
-    if is_live:
-        st.success("🟢 LIVE")
+if manager.is_running:
+    data = manager.get_all_states_snapshot()
+    
+    signals = [d for k, d in data.items() if d['signal'].score == 13]
+    others = [d for k, d in data.items() if d['signal'].score != 13]
+    
+    st.subheader(f"🔥 Active Signals ({len(signals)})")
+    if signals:
+        cols = st.columns(2)
+        for i, row in enumerate(signals):
+            with cols[i % 2]:
+                sym_name = [k for k, v in data.items() if v == row][0]
+                render_modern_card(sym_name, row)
     else:
-        st.error("🔴 STOPPED")
-
-with status_cols[1]:
-    st.info(f"📊 Bar: {bar_start.strftime('%H:%M')}-{bar_end.strftime('%H:%M')}")
-
-with status_cols[2]:
-    st.warning(f"⏱️ Closes: {int(time_to_close)}s")
-
-with status_cols[3]:
-    st.success(f"🎯 Signals: {active_signals}")
-
-with status_cols[4]:
-    st.caption(f"Beat: {beat_time}")
-
-st.markdown("---")
-
-# Get all states
-all_states = manager.get_all_states_snapshot()
-
-if all_states:
-    # Tabs
-    tab1, tab2, tab3 = st.tabs(["🎯 Ranked Signals", "📈 All Symbols", "📖 Guide"])
+        st.info("Scanning for Institutional Breakouts...")
+        
+    st.divider()
     
-    with tab1:
-        st.subheader("Top Signals (Score ≥ 6)")
-        
-        ranked_data = [
-            (sym, all_states[sym])
-            for sym, sig in ranked
-            if sym in all_states and sig.score >= 6
-        ]
-        
-        if ranked_data:
-            for sym, data in ranked_data:
-                render_signal_card(sym, data)
-        else:
-            st.info("🔍 No high-confidence signals detected. Waiting for patterns...")
+    st.subheader("👀 Watchlist")
+    if others:
+        cols = st.columns(3)
+        for i, row in enumerate(others):
+            with cols[i % 3]:
+                sym_name = [k for k, v in data.items() if v == row][0]
+                render_modern_card(sym_name, row)
     
-    with tab2:
-        st.subheader(f"All {len(all_states)} Symbols")
-        
-        sorted_states = sorted(
-            all_states.items(),
-            key=lambda x: x[1].get('signal', SignalResult()).score,
-            reverse=True
-        )
-        
-        col_left, col_right = st.columns(2)
-        
-        for i, (sym, data) in enumerate(sorted_states):
-            with col_left if i % 2 == 0 else col_right:
-                render_signal_card(sym, data)
+    # Debug expander
+    with st.expander("🔧 Debug Logs"):
+        logs = manager.get_logs_snapshot()
+        for log in logs[:50]:
+            st.text(log)
     
-    with tab3:
-        st.subheader("Strategy Guide")
-        
-        st.markdown("### Signal Types")
-        
-        signal_df = pd.DataFrame({
-            "Signal": ["ACCUMULATION", "DISTRIBUTION", "MOMENTUM BUY", "MOMENTUM SELL"],
-            "Description": [
-                "Smart money buying while appearing to sell",
-                "Smart money selling while appearing to buy",
-                "Strong directional buying pressure",
-                "Strong directional selling pressure"
-            ],
-            "Key Conditions": [
-                "AS > AB, Price flat/up, RVol ≥ 2.0, Delta rising, PCR < 0.9",
-                "AB > AS, Price flat, RVol ≥ 2.0, Delta falling, PCR > 1.1",
-                "Imbalance ≥ 40%, RVol ≥ 1.5, Breakout above recent high",
-                "Imbalance ≤ -40%, RVol ≥ 1.5, Breakdown below recent low"
-            ]
-        })
-        st.dataframe(signal_df, use_container_width=True, hide_index=True)
-        
-        st.markdown("### Scoring (0-13 points)")
-        
-        scoring_df = pd.DataFrame({
-            "Component": ["Aggression", "Volume", "PCR", "Price Structure", "Signal Type"],
-            "Max Score": [3, 3, 2, 2, 3],
-            "Criteria": [
-                "Imbalance magnitude (≥50%=3, ≥35%=2, ≥20%=1)",
-                "RVol (≥3x=3, ≥2x=2, ≥1.5x=1)",
-                "Options confirmation matching signal direction",
-                "Price breakout/trend alignment",
-                "Pattern strength (STRONG=3, MODERATE=2, WEAK=1)"
-            ]
-        })
-        st.dataframe(scoring_df, use_container_width=True, hide_index=True)
-        
-        st.markdown("### Tick Classification")
-        st.markdown("""
-        - **Aggressive Buy**: Trade executed at or above Ask price
-        - **Aggressive Sell**: Trade executed at or below Bid price
-        - **Neutral**: Trade inside spread (split proportionally)
-        """)
+    time.sleep(1)
+    st.rerun()
 
 else:
-    st.info("👆 Enter symbols in the sidebar and click START to begin monitoring")
-
-st.markdown("---")
-
-# Logs
-with st.expander("📝 System Logs", expanded=False):
-    logs_list = manager.get_logs_snapshot()
-    if logs_list:
-        log_text = "\n".join(logs_list[:100])
-        st.code(log_text, language=None)
-    else:
-        st.caption("No logs yet...")
-
-# Auto-refresh
-if manager.is_running:
-    time.sleep(2)
-    st.rerun()
+    st.info("👈 Please Login in Sidebar to Start System")
