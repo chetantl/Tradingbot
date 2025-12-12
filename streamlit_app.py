@@ -5,19 +5,17 @@ import time
 from datetime import datetime, timedelta
 from collections import deque
 import pandas as pd
-import numpy as np
-import copy
 from pytz import timezone
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
-from enum import Enum
 
-# ====== TIMEZONE (INDIA) ====== #
+# ====== TIMEZONE ====== #
 INDIA_TZ = timezone("Asia/Kolkata")
+
+def now_ist():
+    return datetime.now(INDIA_TZ)
 
 # ====== PAGE CONFIG ====== #
 st.set_page_config(
-    page_title="Institutional Sniper v3 (Pro)",
+    page_title="Institutional Sniper",
     page_icon="🎯",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -26,167 +24,110 @@ st.set_page_config(
 # ====== CUSTOM CSS ====== #
 st.markdown("""
 <style>
-    /* Main Background */
-    .stApp { background-color: #0e1117; font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; }
-    
-    /* Metric Cards */
-    div[data-testid="stMetric"] { background-color: #1e2130; padding: 15px; border-radius: 10px; border: 1px solid #2e3245; }
-    
-    /* Signal Card - BUY CALL (Green) */
-    .buy-card {
-        background: linear-gradient(145deg, #0f2e1b, #0a1f12);
-        border: 1px solid #00ff41;
-        border-radius: 12px;
-        padding: 20px;
-        box-shadow: 0 0 15px rgba(0, 255, 65, 0.2);
-        margin-bottom: 15px;
-        animation: pulse-green 2s infinite;
+    .stApp {
+        background: linear-gradient(135deg, #0f0f23 0%, #1a1a2e 50%, #16213e 100%);
     }
     
-    /* Signal Card - BUY PUT (Red) */
-    .sell-card {
-        background: linear-gradient(145deg, #381010, #260a0a);
-        border: 1px solid #ff2b2b;
-        border-radius: 12px;
-        padding: 20px;
-        box-shadow: 0 0 15px rgba(255, 43, 43, 0.2);
-        margin-bottom: 15px;
-        animation: pulse-red 2s infinite;
+    [data-testid="stSidebar"] {
+        background: linear-gradient(180deg, #1a1a2e 0%, #0f0f23 100%);
+        border-right: 1px solid #333;
     }
     
-    /* Signal Card - NEUTRAL (Grey) */
-    .neutral-card {
-        background-color: #161924;
-        border: 1px solid #30364d;
-        border-radius: 12px;
-        padding: 20px;
-        margin-bottom: 15px;
-        opacity: 0.7;
+    [data-testid="stMetricValue"] {
+        font-size: 1.1rem;
     }
     
-    /* Typography */
-    .signal-title { font-size: 24px; font-weight: 800; margin-bottom: 5px; }
-    .signal-sub { font-size: 14px; color: #b0b3c5; letter-spacing: 1px; }
-    .price-large { font-size: 32px; font-weight: 700; color: white; }
-    .stat-label { font-size: 12px; color: #808495; }
-    .stat-val { font-size: 16px; font-weight: 600; }
+    .stDataFrame {
+        background: #1e1e3f;
+    }
     
-    /* Animations */
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    
+    /* Animation keyframes */
     @keyframes pulse-green {
-        0% { box-shadow: 0 0 0 0 rgba(0, 255, 65, 0.4); }
-        70% { box-shadow: 0 0 0 10px rgba(0, 255, 65, 0); }
-        100% { box-shadow: 0 0 0 0 rgba(0, 255, 65, 0); }
+        0%, 100% { box-shadow: 0 0 20px rgba(46, 204, 113, 0.4); }
+        50% { box-shadow: 0 0 40px rgba(46, 204, 113, 0.8); }
     }
+    
     @keyframes pulse-red {
-        0% { box-shadow: 0 0 0 0 rgba(255, 43, 43, 0.4); }
-        70% { box-shadow: 0 0 0 10px rgba(255, 43, 43, 0); }
-        100% { box-shadow: 0 0 0 0 rgba(255, 43, 43, 0); }
+        0%, 100% { box-shadow: 0 0 20px rgba(231, 76, 60, 0.4); }
+        50% { box-shadow: 0 0 40px rgba(231, 76, 60, 0.8); }
     }
+    
+    @keyframes blink {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.3; }
+    }
+    
+    .pulse-green { animation: pulse-green 2s infinite; }
+    .pulse-red { animation: pulse-red 2s infinite; }
+    .blink { animation: blink 1s infinite; }
 </style>
 """, unsafe_allow_html=True)
 
+# ====== CONFIGURATION ====== #
+CONFIG = {
+    'bucket_seconds': 5,
+    'bar_seconds': 300,
+    'rvol_threshold': 1.5,
+    'trend_confirmation_bars': 3,
+    'breakout_lookback_bars': 4,
+    'pcr_min_bullish': 0.7,
+    'pcr_max_bearish': 1.3,
+    'rvol_lookback_bars': 750
+}
 
-# ====== ENUMS & CONFIG ====== #
-class SignalType(Enum):
-    NEUTRAL = "NEUTRAL"
-    ACCUMULATION = "ACCUMULATION"
-    DISTRIBUTION = "DISTRIBUTION"
-    MOMENTUM_BUY = "BUY CALL"
-    MOMENTUM_SELL = "BUY PUT"
+# ====== SHARED DATA STORE ====== #
+@st.cache_resource
+def get_shared_store():
+    return {
+        'data': {},
+        'logs': deque(maxlen=100),
+        'is_running': False,
+        'worker_alive': False,
+        'update_count': 0,
+        'error_count': 0,
+        'stop_flag': False,
+        'lock': threading.Lock(),
+        'symbols': [],
+        'kite': None
+    }
 
+STORE = get_shared_store()
 
-@dataclass
-class Config:
-    spread_split_enabled: bool = True
-    bucket_seconds: int = 5
-    rolling_window_seconds: int = 300
-    bar_seconds: int = 300
-    
-    # --- STRATEGY THRESHOLDS (Trend-Ride) ---
-    rvol_threshold: float = 1.5
-    trend_confirmation_bars: int = 3
-    breakout_lookback_bars: int = 4
-    pcr_min_bullish: float = 0.7
-    pcr_max_bearish: float = 1.3
-    
-    # --- RVOL CONFIGURATION ---
-    rvol_lookback_bars: int = 750  # 750 x 5min = 62.5 hours ≈ 10 trading days
-    bars_to_keep: int = 20
+def store_set_data(symbol: str, data: dict):
+    with STORE['lock']:
+        STORE['data'][symbol] = data
+        STORE['update_count'] += 1
 
+def store_get_all_data() -> dict:
+    with STORE['lock']:
+        return dict(STORE['data'])
 
-CONFIG = Config()
+def store_log(msg: str):
+    with STORE['lock']:
+        ts = now_ist().strftime("%H:%M:%S")
+        STORE['logs'].appendleft(f"[{ts}] {msg}")
 
+def store_get_logs() -> list:
+    with STORE['lock']:
+        return list(STORE['logs'])
 
-# ====== DATA STRUCTURES ====== #
-@dataclass
-class ClassifiedTick:
-    timestamp: datetime
-    ltp: float
-    bid: float
-    ask: float
-    volume: int
-    aggr_buy: int = 0
-    aggr_sell: int = 0
-    neutral: int = 0
+def store_reset():
+    with STORE['lock']:
+        STORE['data'] = {}
+        STORE['logs'].clear()
+        STORE['error_count'] = 0
+        STORE['update_count'] = 0
+        STORE['stop_flag'] = False
 
-
-@dataclass
-class Bucket5s:
-    start_time: datetime
-    end_time: datetime
-    aggr_buy: int = 0
-    aggr_sell: int = 0
-    total_volume: int = 0
-    vwap: float = 0.0
-    open: float = 0.0
-    high: float = 0.0
-    low: float = 0.0
-    close: float = 0.0
-    tick_count: int = 0
-    cumulative_value: float = 0.0
-
-
-@dataclass
-class Bar5m:
-    start_time: datetime
-    end_time: datetime
-    aggr_buy_total: int = 0
-    aggr_sell_total: int = 0
-    agg_imbalance: float = 0.0
-    total_volume: int = 0
-    rvol: float = 0.0
-    vwap: float = 0.0
-    open: float = 0.0
-    high: float = 0.0
-    low: float = 0.0
-    close: float = 0.0
-    tick_count: int = 0
-    price_range: float = 0.0
-    cumulative_delta: int = 0
-    price_change_pct: float = 0.0
-
-
-@dataclass
-class SignalResult:
-    signal_type: SignalType = SignalType.NEUTRAL
-    score: int = 0
-    normalized_score: float = 0.0
-    strength: str = "WEAK"
-    diagnostics: Dict = field(default_factory=dict)
-    score_breakdown: Dict = field(default_factory=dict)
-    entry_suggestion: float = 0.0
-    stop_loss: float = 0.0
-    target: float = 0.0
-    timestamp: datetime = None
-
-
-# ====== HELPERS ====== #
+# ====== HELPER FUNCTIONS ====== #
 def safe_float(val, default=0.0):
     try:
         return float(val) if val is not None else default
     except:
         return default
-
 
 def safe_int(val, default=0):
     try:
@@ -194,549 +135,6 @@ def safe_int(val, default=0):
     except:
         return default
 
-
-def now_ist():
-    return datetime.now(INDIA_TZ)
-
-
-def get_expiry_date(expiry):
-    if expiry is None:
-        return None
-    if hasattr(expiry, 'date'):
-        return expiry.date()
-    return expiry
-
-
-def current_bucket_start(seconds=5):
-    now = now_ist()
-    bucket_num = now.second // seconds
-    return now.replace(second=bucket_num * seconds, microsecond=0)
-
-
-def current_bar_start(seconds=300):
-    now = now_ist()
-    minute_slot = (now.minute // (seconds // 60)) * (seconds // 60)
-    return now.replace(minute=minute_slot, second=0, microsecond=0)
-
-
-# ====== ROLLING VOLUME TRACKER (NEW) ====== #
-class RollingVolumeTracker:
-    """
-    Maintains a rolling window of bar volumes for accurate RVol calculation.
-    Seeded with historical data and updated in real-time.
-    """
-    def __init__(self, lookback_bars: int = 750):
-        self.lookback_bars = lookback_bars
-        self.volume_history: deque = deque(maxlen=lookback_bars)
-        self.sum_volume: float = 0.0
-        self.is_seeded: bool = False
-        self.lock = threading.Lock()
-    
-    def seed_from_historical(self, volumes: List[int]):
-        """Initialize with historical volume data"""
-        with self.lock:
-            self.volume_history.clear()
-            self.sum_volume = 0.0
-            
-            for vol in volumes[-self.lookback_bars:]:
-                self.volume_history.append(vol)
-                self.sum_volume += vol
-            
-            self.is_seeded = len(self.volume_history) > 0
-    
-    def add_bar_volume(self, volume: int):
-        """Add a new completed bar's volume"""
-        with self.lock:
-            if len(self.volume_history) >= self.lookback_bars:
-                # Remove oldest volume from sum
-                oldest = self.volume_history[0]
-                self.sum_volume -= oldest
-            
-            self.volume_history.append(volume)
-            self.sum_volume += volume
-    
-    def get_avg_volume(self) -> float:
-        """Get current rolling average volume"""
-        with self.lock:
-            if len(self.volume_history) == 0:
-                return 0.0
-            return self.sum_volume / len(self.volume_history)
-    
-    def get_rvol(self, current_volume: int) -> float:
-        """Calculate RVol for current bar"""
-        avg = self.get_avg_volume()
-        if avg <= 0:
-            return 0.0
-        return current_volume / avg
-    
-    def get_stats(self) -> Dict:
-        """Get diagnostic stats"""
-        with self.lock:
-            return {
-                'bars_in_history': len(self.volume_history),
-                'total_lookback': self.lookback_bars,
-                'avg_volume': self.get_avg_volume(),
-                'is_seeded': self.is_seeded,
-                'fill_pct': (len(self.volume_history) / self.lookback_bars) * 100
-            }
-
-
-# ====== TICK CLASSIFIER ====== #
-class TickClassifier:
-    def __init__(self):
-        self.prev_ltp = {}
-    
-    def classify_tick(self, symbol: str, ltp: float, bid: float, ask: float, 
-                      volume: int, timestamp: datetime) -> ClassifiedTick:
-        result = ClassifiedTick(
-            timestamp=timestamp, ltp=ltp, bid=bid, ask=ask, volume=volume
-        )
-        
-        if volume <= 0:
-            result.neutral = 0
-            return result
-        
-        if bid > 0 and ask > 0 and ask >= bid:
-            spread = ask - bid
-            if ltp >= ask:
-                result.aggr_buy = volume
-            elif ltp <= bid:
-                result.aggr_sell = volume
-            elif spread > 0:
-                buy_ratio = (ltp - bid) / spread
-                result.aggr_buy = int(volume * buy_ratio)
-                result.aggr_sell = int(volume * (1 - buy_ratio))
-                result.neutral = volume - result.aggr_buy - result.aggr_sell
-            else:
-                result.aggr_buy = volume // 2
-                result.aggr_sell = volume - result.aggr_buy
-        else:
-            prev = self.prev_ltp.get(symbol, ltp)
-            if ltp > prev:
-                result.aggr_buy = volume
-            elif ltp < prev:
-                result.aggr_sell = volume
-            else:
-                result.neutral = volume
-        
-        self.prev_ltp[symbol] = ltp
-        return result
-
-
-# ====== 5-SECOND BUCKET AGGREGATOR ====== #
-class BucketAggregator:
-    def __init__(self, bucket_seconds: int = 5, max_buckets: int = 60):
-        self.bucket_seconds = bucket_seconds
-        self.max_buckets = max_buckets
-        self.buckets: deque = deque(maxlen=max_buckets)
-        self.current_bucket: Optional[Bucket5s] = None
-        self.lock = threading.Lock()
-    
-    def _get_bucket_start(self, ts: datetime) -> datetime:
-        bucket_num = ts.second // self.bucket_seconds
-        return ts.replace(second=bucket_num * self.bucket_seconds, microsecond=0)
-    
-    def append_tick(self, tick: ClassifiedTick) -> Optional[Bucket5s]:
-        with self.lock:
-            bucket_start = self._get_bucket_start(tick.timestamp)
-            bucket_end = bucket_start + timedelta(seconds=self.bucket_seconds)
-            
-            completed = None
-            
-            if self.current_bucket is None or bucket_start != self.current_bucket.start_time:
-                if self.current_bucket is not None:
-                    if self.current_bucket.tick_count > 0 and self.current_bucket.total_volume > 0:
-                        self.current_bucket.vwap = self.current_bucket.cumulative_value / self.current_bucket.total_volume
-                    self.buckets.append(self.current_bucket)
-                    completed = self.current_bucket
-                
-                self.current_bucket = Bucket5s(
-                    start_time=bucket_start, end_time=bucket_end,
-                    open=tick.ltp, high=tick.ltp, low=tick.ltp, close=tick.ltp
-                )
-            
-            b = self.current_bucket
-            b.aggr_buy += tick.aggr_buy
-            b.aggr_sell += tick.aggr_sell
-            b.total_volume += tick.volume
-            b.cumulative_value += tick.ltp * tick.volume
-            b.high = max(b.high, tick.ltp)
-            b.low = min(b.low, tick.ltp)
-            b.close = tick.ltp
-            b.tick_count += 1
-            
-            return completed
-    
-    def get_rolling_stats(self, window_seconds: int = 300) -> Dict:
-        with self.lock:
-            num_buckets = window_seconds // self.bucket_seconds
-            recent = list(self.buckets)[-num_buckets:] if self.buckets else []
-            
-            if not recent:
-                return {}
-            
-            total_ab = sum(b.aggr_buy for b in recent)
-            total_as = sum(b.aggr_sell for b in recent)
-            total_vol = sum(b.total_volume for b in recent)
-            
-            return {
-                'aggr_buy': total_ab,
-                'aggr_sell': total_as,
-                'total_volume': total_vol,
-                'imbalance': (total_ab - total_as) / total_vol if total_vol > 0 else 0,
-                'high': max(b.high for b in recent),
-                'low': min(b.low for b in recent),
-                'open': recent[0].open,
-                'close': recent[-1].close,
-                'bucket_count': len(recent)
-            }
-    
-    def get_current_bucket(self) -> Optional[Bucket5s]:
-        with self.lock:
-            return copy.copy(self.current_bucket) if self.current_bucket else None
-
-
-# ====== 5-MINUTE BAR AGGREGATOR (UPDATED) ====== #
-class BarAggregator:
-    def __init__(self, bar_seconds: int = 300, max_bars: int = 50):
-        self.bar_seconds = bar_seconds
-        self.max_bars = max_bars
-        self.bars: deque = deque(maxlen=max_bars)
-        self.current_bar: Optional[Bar5m] = None
-        self.volume_tracker: RollingVolumeTracker = RollingVolumeTracker(CONFIG.rvol_lookback_bars)
-        self.lock = threading.Lock()
-    
-    def _get_bar_start(self, ts: datetime) -> datetime:
-        minute_slot = (ts.minute // (self.bar_seconds // 60)) * (self.bar_seconds // 60)
-        return ts.replace(minute=minute_slot, second=0, microsecond=0)
-    
-    def seed_volume_history(self, volumes: List[int]):
-        """Seed the volume tracker with historical data"""
-        self.volume_tracker.seed_from_historical(volumes)
-    
-    def append_bucket(self, bucket: Bucket5s) -> Optional[Bar5m]:
-        with self.lock:
-            bar_start = self._get_bar_start(bucket.start_time)
-            bar_end = bar_start + timedelta(seconds=self.bar_seconds)
-            
-            completed = None
-            
-            if self.current_bar is None or bar_start != self.current_bar.start_time:
-                if self.current_bar is not None:
-                    self._finalize_bar(self.current_bar)
-                    self.bars.append(self.current_bar)
-                    # Add completed bar's volume to rolling tracker
-                    self.volume_tracker.add_bar_volume(self.current_bar.total_volume)
-                    completed = self.current_bar
-                
-                self.current_bar = Bar5m(
-                    start_time=bar_start, end_time=bar_end,
-                    open=bucket.open, high=bucket.high, low=bucket.low, close=bucket.close
-                )
-            
-            bar = self.current_bar
-            bar.aggr_buy_total += bucket.aggr_buy
-            bar.aggr_sell_total += bucket.aggr_sell
-            bar.total_volume += bucket.total_volume
-            bar.high = max(bar.high, bucket.high)
-            bar.low = min(bar.low, bucket.low)
-            bar.close = bucket.close
-            bar.tick_count += bucket.tick_count
-            bar.cumulative_delta = bar.aggr_buy_total - bar.aggr_sell_total
-            bar.vwap = (bar.high + bar.low + bar.close) / 3
-            
-            return completed
-    
-    def _finalize_bar(self, bar: Bar5m):
-        total = bar.aggr_buy_total + bar.aggr_sell_total
-        if total > 0:
-            bar.agg_imbalance = (bar.aggr_buy_total - bar.aggr_sell_total) / total
-        
-        # Calculate RVol using rolling tracker
-        bar.rvol = self.volume_tracker.get_rvol(bar.total_volume)
-        
-        bar.price_range = bar.high - bar.low
-        if bar.open > 0:
-            bar.price_change_pct = (bar.close - bar.open) / bar.open
-    
-    def get_current_bar_with_rvol(self) -> Optional[Bar5m]:
-        """Get current bar with live RVol calculation"""
-        with self.lock:
-            if self.current_bar:
-                bar_copy = copy.copy(self.current_bar)
-                # Calculate live RVol for current forming bar
-                bar_copy.rvol = self.volume_tracker.get_rvol(bar_copy.total_volume)
-                self._finalize_bar_partial(bar_copy)
-                return bar_copy
-            return None
-    
-    def _finalize_bar_partial(self, bar: Bar5m):
-        """Finalize bar stats without adding to volume history"""
-        total = bar.aggr_buy_total + bar.aggr_sell_total
-        if total > 0:
-            bar.agg_imbalance = (bar.aggr_buy_total - bar.aggr_sell_total) / total
-        bar.price_range = bar.high - bar.low
-        if bar.open > 0:
-            bar.price_change_pct = (bar.close - bar.open) / bar.open
-    
-    def get_recent_bars(self, n: int = 3) -> List[Bar5m]:
-        with self.lock:
-            return list(self.bars)[-n:]
-    
-    def get_current_bar(self) -> Optional[Bar5m]:
-        """Legacy method - use get_current_bar_with_rvol for accurate RVol"""
-        return self.get_current_bar_with_rvol()
-    
-    def get_volume_tracker_stats(self) -> Dict:
-        return self.volume_tracker.get_stats()
-
-
-# ====== PATTERN DETECTOR ====== #
-class PatternDetector:
-    def __init__(self, config: Config = CONFIG):
-        self.config = config
-    
-    def detect(self, bars: List[Bar5m], pcr: float, current_bar: Bar5m, current_vwap: float) -> SignalResult:
-        result = SignalResult(timestamp=now_ist())
-        
-        if len(bars) < self.config.breakout_lookback_bars:
-            return result
-        
-        lookback = self.config.breakout_lookback_bars
-        trend_bars = self.config.trend_confirmation_bars
-        
-        # --- 1. TREND CONFIRMATION ---
-        last_n_bars = bars[-trend_bars:]
-        bullish_trend = all(b.close > current_vwap for b in last_n_bars)
-        bearish_trend = all(b.close < current_vwap for b in last_n_bars)
-        
-        # --- 2. BREAKOUT TRIGGER ---
-        consolidation_bars = bars[-lookback:]
-        recent_high = max(b.high for b in consolidation_bars)
-        recent_low = min(b.low for b in consolidation_bars)
-        
-        is_breaking_out_up = current_bar.close > recent_high
-        is_breaking_out_down = current_bar.close < recent_low
-        
-        # --- 3. VOLUME FUEL ---
-        is_volume_good = current_bar.rvol >= self.config.rvol_threshold
-        
-        # --- 4. PCR SAFETY ---
-        is_pcr_bullish = pcr > self.config.pcr_min_bullish
-        is_pcr_bearish = pcr < self.config.pcr_max_bearish
-        
-        diagnostics = {
-            "Trend": "Bullish" if bullish_trend else "Bearish" if bearish_trend else "Choppy",
-            "RVol": f"{current_bar.rvol:.2f}x",
-            "PCR": f"{pcr:.2f}",
-            "Breakout Lvl": f"{recent_high if bullish_trend else recent_low}",
-            "Current": f"{current_bar.close}"
-        }
-        result.diagnostics = diagnostics
-        
-        # ====== DECISION MATRIX ====== #
-        if bullish_trend and is_breaking_out_up and is_volume_good and is_pcr_bullish:
-            result.signal_type = SignalType.MOMENTUM_BUY
-            result.score = 13
-            result.strength = "CONFIRMED"
-            result.stop_loss = recent_low
-            result.target = current_bar.close + (current_bar.close - recent_low) * 2
-            result.entry_suggestion = current_bar.close
-            
-        elif bearish_trend and is_breaking_out_down and is_volume_good and is_pcr_bearish:
-            result.signal_type = SignalType.MOMENTUM_SELL
-            result.score = 13
-            result.strength = "CONFIRMED"
-            result.stop_loss = recent_high
-            result.target = current_bar.close - (recent_high - current_bar.close) * 2
-            result.entry_suggestion = current_bar.close
-            
-        else:
-            result.signal_type = SignalType.NEUTRAL
-            result.strength = "WAITING"
-            
-        return result
-
-
-# ====== SCORER ====== #
-class Scorer:
-    def __init__(self, config: Config = CONFIG):
-        self.config = config
-    
-    def score(self, bar: Bar5m, signal_result: SignalResult, pcr: float) -> SignalResult:
-        return signal_result
-
-
-# ====== PCR FETCHER ====== #
-class PCRFetcher:
-    def __init__(self):
-        self.cache = {}
-        self.cache_expiry = {}
-        self.lock = threading.Lock()
-    
-    def get_pcr(self, kite, symbol: str, spot_price: float) -> float:
-        with self.lock:
-            if symbol in self.cache:
-                if now_ist() < self.cache_expiry.get(symbol, now_ist()):
-                    return self.cache[symbol]
-        
-        try:
-            all_opts = [
-                i for i in kite.instruments("NFO")
-                if i.get("segment") == "NFO-OPT" and i.get("name") == symbol
-            ]
-            
-            if not all_opts:
-                return 1.0
-            
-            today = now_ist().date()
-            expiries = sorted({
-                get_expiry_date(i["expiry"])
-                for i in all_opts
-                if get_expiry_date(i["expiry"]) is not None and get_expiry_date(i["expiry"]) >= today
-            })
-            
-            if not expiries:
-                return 1.0
-            
-            nearest = expiries[0]
-            scoped = [i for i in all_opts if get_expiry_date(i["expiry"]) == nearest]
-            
-            ce_opts = {i['strike']: i for i in scoped if i["instrument_type"] == "CE"}
-            pe_opts = {i['strike']: i for i in scoped if i["instrument_type"] == "PE"}
-            
-            relevant_strikes = [s for s in set(ce_opts.keys()) | set(pe_opts.keys())
-                              if spot_price * 0.9 <= s <= spot_price * 1.1]
-            
-            if not relevant_strikes:
-                return 1.0
-            
-            ce_syms = [f"NFO:{ce_opts[s]['tradingsymbol']}" for s in relevant_strikes if s in ce_opts]
-            pe_syms = [f"NFO:{pe_opts[s]['tradingsymbol']}" for s in relevant_strikes if s in pe_opts]
-            
-            ce_oi_total = 0
-            pe_oi_total = 0
-            
-            all_syms = ce_syms + pe_syms
-            for i in range(0, len(all_syms), 50):
-                batch = all_syms[i:i+50]
-                try:
-                    quotes = kite.quote(batch)
-                    for k, q in quotes.items():
-                        oi = safe_int(q.get('oi', 0))
-                        if "CE" in k:
-                            ce_oi_total += oi
-                        if "PE" in k:
-                            pe_oi_total += oi
-                    time.sleep(0.1)
-                except:
-                    pass
-            
-            pcr = pe_oi_total / ce_oi_total if ce_oi_total > 0 else 1.0
-            
-            with self.lock:
-                self.cache[symbol] = pcr
-                self.cache_expiry[symbol] = now_ist() + timedelta(minutes=3)
-            
-            return round(pcr, 2)
-            
-        except:
-            return self.cache.get(symbol, 1.0)
-
-
-# ====== SYMBOL STATE (UPDATED) ====== #
-@dataclass
-class SymbolState:
-    symbol: str
-    token: int
-    ltp: float = 0.0
-    vwap: float = 0.0
-    bid: float = 0.0
-    ask: float = 0.0
-    volume: int = 0
-    
-    tick_classifier: TickClassifier = field(default_factory=TickClassifier)
-    bucket_aggregator: BucketAggregator = field(default_factory=BucketAggregator)
-    bar_aggregator: BarAggregator = field(default_factory=BarAggregator)
-    
-    pcr: float = 1.0
-    
-    signal_result: SignalResult = field(default_factory=SignalResult)
-    last_update: datetime = None
-
-
-# ====== MANAGER ====== #
-class SniperManager:
-    def __init__(self):
-        self.lock = threading.RLock()
-        self.logs = deque(maxlen=300)
-        self.symbol_states: Dict[str, SymbolState] = {}
-        self.active_symbols = []
-        self.is_running = False
-        self.stop_event = threading.Event()
-        self.kite = None
-        self.last_beat = 0.0
-        
-        self.pattern_detector = PatternDetector()
-        self.scorer = Scorer()
-        self.pcr_fetcher = PCRFetcher()
-
-    def log(self, msg, level="INFO"):
-        ts = now_ist().strftime("%H:%M:%S")
-        with self.lock:
-            self.logs.appendleft(f"[{ts}] {level}: {msg}")
-
-    def get_logs_snapshot(self):
-        with self.lock:
-            return list(self.logs)
-    
-    def get_symbol_state(self, symbol: str) -> Optional[SymbolState]:
-        with self.lock:
-            return self.symbol_states.get(symbol)
-    
-    def get_all_states_snapshot(self) -> Dict[str, Dict]:
-        with self.lock:
-            result = {}
-            for sym, state in self.symbol_states.items():
-                current_bar = state.bar_aggregator.get_current_bar()
-                vol_stats = state.bar_aggregator.get_volume_tracker_stats()
-                result[sym] = {
-                    'ltp': state.ltp,
-                    'vwap': state.vwap,
-                    'bid': state.bid,
-                    'ask': state.ask,
-                    'volume': state.volume,
-                    'pcr': state.pcr,
-                    'signal': state.signal_result,
-                    'current_bar': current_bar,
-                    'recent_bars': state.bar_aggregator.get_recent_bars(3),
-                    'rolling_stats': state.bucket_aggregator.get_rolling_stats(),
-                    'volume_tracker_stats': vol_stats,
-                    'last_update': state.last_update
-                }
-            return result
-    
-    def get_ranked_signals(self) -> List[Tuple[str, SignalResult]]:
-        with self.lock:
-            signals = [
-                (sym, state.signal_result)
-                for sym, state in self.symbol_states.items()
-                if state.signal_result.signal_type != SignalType.NEUTRAL
-            ]
-            return sorted(signals, key=lambda x: x[1].score, reverse=True)
-
-
-def get_fresh_manager():
-    return SniperManager()
-
-
-if 'manager' not in st.session_state:
-    st.session_state.manager = get_fresh_manager()
-
-manager = st.session_state.manager
-
-
-# ====== KITE HELPERS (UPDATED) ====== #
 def get_instrument_token(kite, symbol):
     try:
         instruments = kite.instruments("NSE")
@@ -745,367 +143,903 @@ def get_instrument_token(kite, symbol):
             if inst["tradingsymbol"] == sym and inst["segment"] == "NSE":
                 return inst["instrument_token"]
     except Exception as e:
-        manager.log(f"Token error {symbol}: {e}", "ERROR")
+        store_log(f"Token error {symbol}: {e}")
     return None
 
+def get_expiry_date(expiry):
+    if expiry is None:
+        return None
+    if hasattr(expiry, 'date'):
+        return expiry.date()
+    return expiry
 
-def fetch_historical_volumes(kite, token, lookback_bars: int = 750) -> List[int]:
-    """
-    Fetch historical 5-minute bar volumes for seeding the RVol tracker.
-    750 bars = ~10 trading days of 5-min data
-    """
+def fetch_historical_volumes(kite, token, lookback_bars=750):
     try:
         now = now_ist().replace(tzinfo=None)
-        # Fetch extra days to account for market holidays
         from_date = now - timedelta(days=15)
-        
         candles = kite.historical_data(token, from_date, now, "5minute")
         df = pd.DataFrame(candles)
-        
         if df.empty:
-            manager.log(f"No historical data for token {token}", "WARNING")
             return []
-        
         volumes = df['volume'].tolist()
-        
-        # Return last N bars
-        return volumes[-lookback_bars:] if len(volumes) >= lookback_bars else volumes
-        
+        return volumes[-lookback_bars:]
     except Exception as e:
-        manager.log(f"Historical volume error: {e}", "ERROR")
+        store_log(f"Historical error: {e}")
         return []
 
+def get_pcr(kite, symbol, spot_price):
+    try:
+        all_opts = [i for i in kite.instruments("NFO") 
+                    if i.get("segment") == "NFO-OPT" and i.get("name") == symbol]
+        
+        if not all_opts:
+            return 1.0
+        
+        today = now_ist().date()
+        expiries = sorted({
+            get_expiry_date(i["expiry"]) for i in all_opts 
+            if get_expiry_date(i["expiry"]) and get_expiry_date(i["expiry"]) >= today
+        })
+        
+        if not expiries:
+            return 1.0
+        
+        nearest = expiries[0]
+        scoped = [i for i in all_opts if get_expiry_date(i["expiry"]) == nearest]
+        
+        ce_opts = {i['strike']: i for i in scoped if i["instrument_type"] == "CE"}
+        pe_opts = {i['strike']: i for i in scoped if i["instrument_type"] == "PE"}
+        
+        relevant = [s for s in set(ce_opts.keys()) | set(pe_opts.keys())
+                   if spot_price * 0.95 <= s <= spot_price * 1.05]
+        
+        if not relevant:
+            return 1.0
+        
+        ce_syms = [f"NFO:{ce_opts[s]['tradingsymbol']}" for s in relevant if s in ce_opts]
+        pe_syms = [f"NFO:{pe_opts[s]['tradingsymbol']}" for s in relevant if s in pe_opts]
+        
+        ce_oi, pe_oi = 0, 0
+        
+        for i in range(0, len(ce_syms), 30):
+            batch = ce_syms[i:i+30]
+            try:
+                quotes = kite.quote(batch)
+                for q in quotes.values():
+                    ce_oi += safe_int(q.get('oi'))
+            except:
+                pass
+        
+        for i in range(0, len(pe_syms), 30):
+            batch = pe_syms[i:i+30]
+            try:
+                quotes = kite.quote(batch)
+                for q in quotes.values():
+                    pe_oi += safe_int(q.get('oi'))
+            except:
+                pass
+        
+        return round(pe_oi / ce_oi, 2) if ce_oi > 0 else 1.0
+        
+    except Exception as e:
+        store_log(f"PCR error: {e}")
+        return 1.0
 
-# ====== WORKER THREAD (UPDATED) ====== #
-def sniper_worker(kite, mgr: SniperManager):
-    mgr.is_running = True
-    mgr.log("Worker started - RVol using 750-bar rolling average", "INFO")
+# ====== VOLUME TRACKER ====== #
+class VolumeTracker:
+    def __init__(self, maxlen=750):
+        self.history = deque(maxlen=maxlen)
+        self.sum_vol = 0.0
     
-    last_pcr_update = 0
-    last_bar_check = current_bar_start()
+    def seed(self, volumes):
+        self.history.clear()
+        self.sum_vol = 0.0
+        for v in volumes:
+            self.history.append(v)
+            self.sum_vol += v
     
-    while not mgr.stop_event.is_set():
+    def add(self, volume):
+        if len(self.history) >= self.history.maxlen:
+            self.sum_vol -= self.history[0]
+        self.history.append(volume)
+        self.sum_vol += volume
+    
+    def get_avg(self):
+        return self.sum_vol / len(self.history) if self.history else 1.0
+    
+    def get_rvol(self, current):
+        avg = self.get_avg()
+        return current / avg if avg > 0 else 1.0
+    
+    def get_count(self):
+        return len(self.history)
+
+# ====== BAR DATA ====== #
+class BarData:
+    def __init__(self):
+        self.reset(0, None)
+    
+    def reset(self, price, ts):
+        self.open = price
+        self.high = price
+        self.low = price
+        self.close = price
+        self.volume = 0
+        self.aggr_buy = 0
+        self.aggr_sell = 0
+        self.start_time = ts
+    
+    def update(self, price, volume, is_buy):
+        self.high = max(self.high, price)
+        self.low = min(self.low, price) if self.low > 0 else price
+        self.close = price
+        self.volume += volume
+        if is_buy:
+            self.aggr_buy += volume
+        else:
+            self.aggr_sell += volume
+    
+    def get_imbalance(self):
+        total = self.aggr_buy + self.aggr_sell
+        return (self.aggr_buy - self.aggr_sell) / total if total > 0 else 0.0
+
+# ====== SYMBOL TRACKER ====== #
+class SymbolTracker:
+    def __init__(self, symbol, token):
+        self.symbol = symbol
+        self.token = token
+        self.volume_tracker = VolumeTracker(750)
+        self.current_bar = BarData()
+        self.completed_bars = deque(maxlen=50)
+        self.prev_volume = 0
+        self.prev_ltp = 0.0
+        self.pcr = 1.0
+        self.last_bar_minute = -1
+        self.initialized = False
+    
+    def get_bar_minute(self, ts):
+        return (ts.minute // 5) * 5
+    
+    def process_quote(self, ltp, volume, vwap, bid, ask, ts):
+        if not self.initialized:
+            self.prev_volume = volume
+            self.prev_ltp = ltp
+            self.initialized = True
+            self.current_bar.reset(ltp, ts)
+            self.last_bar_minute = self.get_bar_minute(ts)
+            return
+        
+        vol_delta = max(0, volume - self.prev_volume)
+        self.prev_volume = volume
+        
+        current_bar_min = self.get_bar_minute(ts)
+        if current_bar_min != self.last_bar_minute:
+            if self.current_bar.volume > 0:
+                self.completed_bars.append({
+                    'open': self.current_bar.open,
+                    'high': self.current_bar.high,
+                    'low': self.current_bar.low,
+                    'close': self.current_bar.close,
+                    'volume': self.current_bar.volume,
+                    'imbalance': self.current_bar.get_imbalance()
+                })
+                self.volume_tracker.add(self.current_bar.volume)
+            
+            self.current_bar.reset(ltp, ts)
+            self.last_bar_minute = current_bar_min
+        
+        if vol_delta > 0:
+            is_buy = ltp >= (bid + ask) / 2 if bid > 0 and ask > 0 else ltp > self.prev_ltp
+            self.current_bar.update(ltp, vol_delta, is_buy)
+        
+        self.prev_ltp = ltp
+    
+    def get_rvol(self):
+        return self.volume_tracker.get_rvol(self.current_bar.volume)
+    
+    def get_signal(self, vwap):
+        bars = list(self.completed_bars)
+        if len(bars) < CONFIG['breakout_lookback_bars']:
+            return "NEUTRAL", 0, {}, 0, 0, 0
+        
+        lookback = CONFIG['breakout_lookback_bars']
+        trend_bars_count = CONFIG['trend_confirmation_bars']
+        
+        recent = bars[-lookback:]
+        trend_bars = bars[-trend_bars_count:]
+        
+        recent_high = max(b['high'] for b in recent)
+        recent_low = min(b['low'] for b in recent)
+        
+        current_close = self.current_bar.close
+        rvol = self.get_rvol()
+        
+        bullish_trend = all(b['close'] > vwap for b in trend_bars)
+        bearish_trend = all(b['close'] < vwap for b in trend_bars)
+        
+        breaking_up = current_close > recent_high
+        breaking_down = current_close < recent_low
+        
+        volume_good = rvol >= CONFIG['rvol_threshold']
+        pcr_bullish = self.pcr > CONFIG['pcr_min_bullish']
+        pcr_bearish = self.pcr < CONFIG['pcr_max_bearish']
+        
+        diagnostics = {
+            'Trend': 'Bullish' if bullish_trend else 'Bearish' if bearish_trend else 'Choppy',
+            'RVol': f"{rvol:.2f}x",
+            'PCR': f"{self.pcr:.2f}",
+            'Range': f"{recent_low:.1f} - {recent_high:.1f}",
+            'Breakout': 'Up' if breaking_up else 'Down' if breaking_down else 'None'
+        }
+        
+        if bullish_trend and breaking_up and volume_good and pcr_bullish:
+            entry = current_close
+            sl = recent_low
+            target = current_close + (current_close - recent_low) * 2
+            return "BUY CALL", 13, diagnostics, entry, sl, target
+        
+        elif bearish_trend and breaking_down and volume_good and pcr_bearish:
+            entry = current_close
+            sl = recent_high
+            target = current_close - (recent_high - current_close) * 2
+            return "BUY PUT", 13, diagnostics, entry, sl, target
+        
+        return "NEUTRAL", 0, diagnostics, 0, 0, 0
+
+# ====== WORKER THREAD ====== #
+def worker_thread(kite, symbols):
+    store_log("🚀 Worker thread started")
+    STORE['worker_alive'] = True
+    STORE['is_running'] = True
+    
+    trackers = {}
+    pcr_cache = {}
+    last_pcr_time = 0
+    
+    for item in symbols:
+        sym = item['symbol']
+        token = item['token']
+        
+        store_log(f"Initializing {sym}...")
+        tracker = SymbolTracker(sym, token)
+        
+        hist = fetch_historical_volumes(kite, token)
+        if hist:
+            tracker.volume_tracker.seed(hist)
+            store_log(f"✅ {sym}: Loaded {len(hist)} bars")
+        else:
+            store_log(f"⚠️ {sym}: No historical data")
+        
+        trackers[sym] = tracker
+    
+    store_log(f"✅ All {len(trackers)} symbols ready!")
+    
+    while not STORE['stop_flag'] and STORE['is_running']:
         try:
-            now_ts = time.time()
-            mgr.last_beat = now_ts
+            keys = [f"NSE:{item['symbol']}" for item in symbols]
             
-            with mgr.lock:
-                active_list = list(mgr.active_symbols)
-            
-            if not active_list:
-                time.sleep(1)
-                continue
-            
-            keys = [f"NSE:{row['symbol']}" for row in active_list]
             try:
                 quotes = kite.quote(keys)
             except Exception as e:
-                mgr.log(f"Quote error: {e}", "WARNING")
+                store_log(f"❌ Quote error: {e}")
+                STORE['error_count'] += 1
                 time.sleep(2)
                 continue
             
-            update_pcr = (now_ts - last_pcr_update) > 180
+            now_ts = time.time()
+            update_pcr = (now_ts - last_pcr_time) > 180
             if update_pcr:
-                last_pcr_update = now_ts
+                last_pcr_time = now_ts
+                store_log("📊 Updating PCR...")
             
-            for row in active_list:
-                sym = row['symbol']
+            for item in symbols:
+                sym = item['symbol']
                 key = f"NSE:{sym}"
+                
                 q = quotes.get(key)
                 if not q:
                     continue
                 
-                state = mgr.get_symbol_state(sym)
-                if not state:
+                tracker = trackers.get(sym)
+                if not tracker:
                     continue
                 
                 ltp = safe_float(q.get('last_price'))
+                volume = safe_int(q.get('volume'))
+                vwap = safe_float(q.get('average_price'), ltp)
+                
                 depth = q.get('depth', {})
                 buy_depth = depth.get('buy', [{}])
                 sell_depth = depth.get('sell', [{}])
                 
-                bid = safe_float(buy_depth[0].get('price')) if buy_depth else 0
-                ask = safe_float(sell_depth[0].get('price')) if sell_depth else 0
-                volume = safe_int(q.get('volume'))
-                vwap = safe_float(q.get('average_price'), ltp)
+                bid = safe_float(buy_depth[0].get('price')) if buy_depth else ltp
+                ask = safe_float(sell_depth[0].get('price')) if sell_depth else ltp
                 
-                vol_delta = max(0, volume - state.volume) if state.volume > 0 else 0
-                
-                state.ltp = ltp
-                state.vwap = vwap
-                state.bid = bid
-                state.ask = ask
-                state.volume = volume
-                state.last_update = now_ist()
-                
-                if vol_delta > 0:
-                    tick = state.tick_classifier.classify_tick(
-                        sym, ltp, bid, ask, vol_delta, now_ist()
-                    )
-                    
-                    completed_bucket = state.bucket_aggregator.append_tick(tick)
-                    
-                    if completed_bucket:
-                        completed_bar = state.bar_aggregator.append_bucket(completed_bucket)
-                        
-                        if completed_bar:
-                            vol_stats = state.bar_aggregator.get_volume_tracker_stats()
-                            mgr.log(f"{sym}: Bar closed | Vol: {completed_bar.total_volume:,} | RVol: {completed_bar.rvol:.2f}x | Avg based on {vol_stats['bars_in_history']} bars", "DEBUG")
+                ts = now_ist()
+                tracker.process_quote(ltp, volume, vwap, bid, ask, ts)
                 
                 if update_pcr:
-                    state.pcr = mgr.pcr_fetcher.get_pcr(kite, sym, ltp)
+                    tracker.pcr = get_pcr(kite, sym, ltp)
+                    pcr_cache[sym] = tracker.pcr
+                elif sym in pcr_cache:
+                    tracker.pcr = pcr_cache[sym]
                 
-                current_bar = state.bar_aggregator.get_current_bar()
-                recent_bars = state.bar_aggregator.get_recent_bars(15)
+                signal_type, score, diagnostics, entry, sl, target = tracker.get_signal(vwap)
+                rvol = tracker.get_rvol()
                 
-                if current_bar:
-                    signal = mgr.pattern_detector.detect(recent_bars, state.pcr, current_bar, vwap)
-                    state.signal_result = signal
-                    
-                    if signal.score == 13:
-                        mgr.log(f"🎯 {sym}: {signal.signal_type.value} @ {ltp} | RVol: {current_bar.rvol:.2f}x", "SIGNAL")
-            
-            new_bar_start = current_bar_start()
-            if new_bar_start != last_bar_check:
-                last_bar_check = new_bar_start
-                mgr.log(f"=== NEW BAR: {new_bar_start.strftime('%H:%M')} ===", "INFO")
+                store_set_data(sym, {
+                    'symbol': sym,
+                    'ltp': ltp,
+                    'vwap': vwap,
+                    'bid': bid,
+                    'ask': ask,
+                    'volume': volume,
+                    'rvol': round(rvol, 2),
+                    'pcr': tracker.pcr,
+                    'signal_type': signal_type,
+                    'score': score,
+                    'diagnostics': diagnostics,
+                    'entry': entry,
+                    'sl': sl,
+                    'target': target,
+                    'bars': tracker.volume_tracker.get_count(),
+                    'completed_bars': len(tracker.completed_bars),
+                    'current_bar_vol': tracker.current_bar.volume,
+                    'imbalance': round(tracker.current_bar.get_imbalance(), 2),
+                    'initialized': tracker.initialized,
+                    'updated': ts.strftime("%H:%M:%S")
+                })
+                
+                if score == 13:
+                    store_log(f"🎯 SIGNAL: {sym} {signal_type} @ ₹{ltp:.2f}")
             
             time.sleep(1)
             
         except Exception as e:
-            mgr.log(f"Error: {e}", "ERROR")
+            store_log(f"❌ Worker error: {e}")
+            STORE['error_count'] += 1
             time.sleep(2)
     
-    mgr.is_running = False
-    mgr.log("Worker stopped", "INFO")
+    STORE['worker_alive'] = False
+    STORE['is_running'] = False
+    store_log("🛑 Worker stopped")
 
-
-# ====== RENDER MODERN CARD (UPDATED) ====== #
-def render_modern_card(sym: str, data: Dict):
-    signal = data.get('signal', SignalResult())
-    current_bar = data.get('current_bar')
-    ltp = data.get('ltp', 0.0)
-    pcr = data.get('pcr', 1.0)
-    vol_stats = data.get('volume_tracker_stats', {})
+# ====== CARD RENDERING WITH STREAMLIT COMPONENTS ====== #
+def render_signal_card_streamlit(d: dict, is_active: bool = False):
+    """Render card using native Streamlit components"""
+    signal_type = d.get('signal_type', 'NEUTRAL')
     
-    if not current_bar:
-        rvol = 0.0
+    # Determine colors and styles
+    if signal_type == "BUY CALL":
+        border_color = "#2ecc71"
+        bg_color = "rgba(46, 204, 113, 0.1)"
+        icon = "🟢"
+        badge_bg = "linear-gradient(90deg, #27ae60, #2ecc71)"
+    elif signal_type == "BUY PUT":
+        border_color = "#e74c3c"
+        bg_color = "rgba(231, 76, 60, 0.1)"
+        icon = "🔴"
+        badge_bg = "linear-gradient(90deg, #c0392b, #e74c3c)"
     else:
-        rvol = current_bar.rvol
+        border_color = "#555"
+        bg_color = "rgba(255, 255, 255, 0.05)"
+        icon = "⚪"
+        badge_bg = "#555"
     
-    bars_in_history = vol_stats.get('bars_in_history', 0)
-    fill_pct = vol_stats.get('fill_pct', 0)
-    
-    card_class = "neutral-card"
-    text_color = "#b0b3c5"
-    signal_text = "NEUTRAL"
-    
-    if signal.signal_type == SignalType.MOMENTUM_BUY:
-        card_class = "buy-card"
-        text_color = "#00ff41"
-        signal_text = "BUY CALL 🚀"
-    elif signal.signal_type == SignalType.MOMENTUM_SELL:
-        card_class = "sell-card"
-        text_color = "#ff2b2b"
-        signal_text = "BUY PUT 📉"
-    
-    html_content = f"""
-    <div class="{card_class}">
-        <div style="display:flex; justify-content:space-between; align-items:center;">
-            <div>
-                <div class="signal-title" style="color: {text_color};">{sym}</div>
-                <div class="signal-sub">{signal_text}</div>
-            </div>
-            <div class="price-large" style="color: white;">₹{ltp:.2f}</div>
-        </div>
-        <hr style="border-color: rgba(255,255,255,0.1); margin: 15px 0;">
-        <div style="display:flex; justify-content:space-between;">
-            <div>
-                <div class="stat-label">RVol</div>
-                <div class="stat-val" style="color: {'#00ff41' if rvol > 1.5 else '#fff'};">{rvol:.2f}x</div>
-            </div>
-            <div>
-                <div class="stat-label">PCR</div>
-                <div class="stat-val">{pcr:.2f}</div>
-            </div>
-            <div>
-                <div class="stat-label">Entry</div>
-                <div class="stat-val">{signal.entry_suggestion if signal.entry_suggestion > 0 else '-'}</div>
-            </div>
-            <div>
-                <div class="stat-label">Stop Loss</div>
-                <div class="stat-val">{signal.stop_loss if signal.stop_loss > 0 else '-'}</div>
+    # Card container
+    st.markdown(f"""
+        <div style="
+            background: linear-gradient(145deg, #1e1e3f, #2a2a4a);
+            border: 2px solid {border_color};
+            border-radius: 16px;
+            padding: 20px;
+            margin: 10px 0;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.3);
+        ">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                <span style="font-size: 1.5rem; font-weight: 700; color: #fff;">{icon} {d['symbol']}</span>
+                <span style="
+                    background: {badge_bg};
+                    padding: 6px 16px;
+                    border-radius: 20px;
+                    font-weight: 600;
+                    font-size: 0.85rem;
+                    color: white;
+                ">{signal_type}</span>
             </div>
         </div>
-        <div style="margin-top: 10px; font-size: 11px; color: #666;">
-            Vol History: {bars_in_history}/750 bars ({fill_pct:.1f}% filled)
-        </div>
-    </div>
-    """
-    st.markdown(html_content, unsafe_allow_html=True)
-
-
-# ====== SIDEBAR ====== #
-st.sidebar.title("🔐 1. Authenticate")
-
-login_mode = st.sidebar.radio("Login Method", ["Request Token", "Access Token (Direct)"])
-
-if "kite_connected" not in st.session_state:
-    st.session_state.kite_connected = False
-
-if not st.session_state.kite_connected:
-    api_key = st.sidebar.text_input("API Key", value=st.session_state.get("api_key", ""))
+    """, unsafe_allow_html=True)
     
-    if login_mode == "Request Token":
-        api_sec = st.sidebar.text_input("API Secret", value=st.session_state.get("api_sec", ""), type="password")
-        if api_key and api_sec:
+    # Metrics using Streamlit columns
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("💰 LTP", f"₹{d['ltp']:.2f}")
+    with col2:
+        rvol_delta = "normal" if d['rvol'] < 1.5 else "off"
+        st.metric("📊 RVol", f"{d['rvol']}x", delta=f"{'High' if d['rvol'] >= 1.5 else 'Normal'}")
+    with col3:
+        st.metric("📈 PCR", f"{d['pcr']:.2f}")
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("📍 VWAP", f"₹{d['vwap']:.2f}")
+    with col2:
+        st.metric("📦 Volume", f"{d['volume']:,}")
+    with col3:
+        imb = d.get('imbalance', 0)
+        st.metric("⚖️ Imbalance", f"{imb:+.2f}")
+    
+    # Entry/SL/Target for active signals
+    if is_active and d.get('entry', 0) > 0:
+        st.markdown("---")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.markdown(f"""
+                <div style="background: rgba(52, 152, 219, 0.2); border: 1px solid #3498db; border-radius: 10px; padding: 15px; text-align: center;">
+                    <div style="font-size: 0.75rem; color: #3498db; text-transform: uppercase;">📍 Entry</div>
+                    <div style="font-size: 1.3rem; font-weight: 700; color: #fff;">₹{d['entry']:.2f}</div>
+                </div>
+            """, unsafe_allow_html=True)
+        with col2:
+            st.markdown(f"""
+                <div style="background: rgba(231, 76, 60, 0.2); border: 1px solid #e74c3c; border-radius: 10px; padding: 15px; text-align: center;">
+                    <div style="font-size: 0.75rem; color: #e74c3c; text-transform: uppercase;">🛑 Stop Loss</div>
+                    <div style="font-size: 1.3rem; font-weight: 700; color: #fff;">₹{d['sl']:.2f}</div>
+                </div>
+            """, unsafe_allow_html=True)
+        with col3:
+            st.markdown(f"""
+                <div style="background: rgba(46, 204, 113, 0.2); border: 1px solid #2ecc71; border-radius: 10px; padding: 15px; text-align: center;">
+                    <div style="font-size: 0.75rem; color: #2ecc71; text-transform: uppercase;">🎯 Target</div>
+                    <div style="font-size: 1.3rem; font-weight: 700; color: #fff;">₹{d['target']:.2f}</div>
+                </div>
+            """, unsafe_allow_html=True)
+    
+    # Diagnostics
+    diag = d.get('diagnostics', {})
+    if diag:
+        diag_str = " | ".join([f"**{k}:** {v}" for k, v in diag.items()])
+        st.caption(f"📊 {diag_str}")
+    
+    st.caption(f"🕐 Updated: {d['updated']} | Bars: {d['bars']}/750 | Completed: {d['completed_bars']}")
+
+def render_watchlist_card_streamlit(d: dict):
+    """Render compact watchlist card using Streamlit components"""
+    signal_type = d.get('signal_type', 'NEUTRAL')
+    
+    if signal_type == "BUY CALL":
+        border_color = "#2ecc71"
+        icon = "🟢"
+    elif signal_type == "BUY PUT":
+        border_color = "#e74c3c"
+        icon = "🔴"
+    else:
+        border_color = "#444"
+        icon = "⚪"
+    
+    rvol_color = "#2ecc71" if d['rvol'] >= 1.5 else "#fff"
+    imb = d.get('imbalance', 0)
+    imb_color = "#2ecc71" if imb > 0 else "#e74c3c" if imb < 0 else "#fff"
+    
+    # Card with inline styles
+    st.markdown(f"""
+        <div style="
+            background: linear-gradient(145deg, #1e1e3f, #2a2a4a);
+            border: 1px solid {border_color};
+            border-radius: 12px;
+            padding: 15px;
+            margin: 8px 0;
+        ">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+                <span style="font-size: 1.2rem; font-weight: 700; color: #fff;">{d['symbol']}</span>
+                <span style="font-size: 0.8rem; color: #888;">{icon} {signal_type}</span>
+            </div>
+            
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+                <div style="background: rgba(0,0,0,0.3); padding: 10px; border-radius: 8px; text-align: center;">
+                    <div style="font-size: 0.65rem; color: #888; text-transform: uppercase;">LTP</div>
+                    <div style="font-size: 1.1rem; font-weight: 600; color: #fff;">₹{d['ltp']:.2f}</div>
+                </div>
+                <div style="background: rgba(0,0,0,0.3); padding: 10px; border-radius: 8px; text-align: center;">
+                    <div style="font-size: 0.65rem; color: #888; text-transform: uppercase;">RVol</div>
+                    <div style="font-size: 1.1rem; font-weight: 600; color: {rvol_color};">{d['rvol']}x</div>
+                </div>
+                <div style="background: rgba(0,0,0,0.3); padding: 10px; border-radius: 8px; text-align: center;">
+                    <div style="font-size: 0.65rem; color: #888; text-transform: uppercase;">PCR</div>
+                    <div style="font-size: 1.1rem; font-weight: 600; color: #fff;">{d['pcr']:.2f}</div>
+                </div>
+                <div style="background: rgba(0,0,0,0.3); padding: 10px; border-radius: 8px; text-align: center;">
+                    <div style="font-size: 0.65rem; color: #888; text-transform: uppercase;">VWAP</div>
+                    <div style="font-size: 1.1rem; font-weight: 600; color: #fff;">₹{d['vwap']:.2f}</div>
+                </div>
+            </div>
+            
+            <div style="margin-top: 10px; font-size: 0.75rem; color: #666;">
+                Vol: {d['volume']:,} | Imb: <span style="color: {imb_color};">{imb:+.2f}</span> | {d['updated']}
+            </div>
+        </div>
+    """, unsafe_allow_html=True)
+
+# ====== SESSION STATE ====== #
+if 'connected' not in st.session_state:
+    st.session_state.connected = False
+
+# ============================================
+# SIDEBAR
+# ============================================
+with st.sidebar:
+    st.markdown("""
+        <div style="text-align: center; padding: 15px 0;">
+            <div style="font-size: 2rem;">🎯</div>
+            <h2 style="margin: 5px 0; color: #fff;">Sniper</h2>
+            <p style="color: #888; font-size: 0.8rem; margin: 0;">Institutional Flow Detector</p>
+        </div>
+    """, unsafe_allow_html=True)
+    
+    st.divider()
+    
+    if not st.session_state.connected:
+        st.subheader("🔐 Kite Login")
+        
+        api_key = st.text_input("API Key", key="api_key")
+        api_secret = st.text_input("API Secret", type="password", key="api_secret")
+        
+        if api_key and api_secret:
             try:
                 temp_kite = KiteConnect(api_key=api_key)
-                url = temp_kite.login_url()
-                st.sidebar.markdown(f"""
-                <a href="{url}" target="_blank" style="
-                    display: block; text-align: center; background-color: #FF5722; color: white; padding: 10px;
-                    text-decoration: none; border-radius: 5px; font-weight: bold; margin-bottom: 10px;">
-                    👉 Click Here to Login & Get Token
-                </a>
-                """, unsafe_allow_html=True)
-            except:
-                pass
-        req_token = st.sidebar.text_input("Paste Request Token", value=st.session_state.get("req_token", ""))
+                login_url = temp_kite.login_url()
+                st.markdown(f"[👉 Click to login to Kite]({login_url})")
+            except Exception as e:
+                st.error(f"Error: {e}")
         
-        if st.sidebar.button("🔌 Connect with Request Token", type="primary"):
-            try:
-                kite = KiteConnect(api_key=api_key)
-                data = kite.generate_session(req_token, api_secret=api_sec)
-                kite.set_access_token(data["access_token"])
-                manager.kite = kite
-                st.session_state.api_key = api_key
-                st.session_state.api_sec = api_sec
-                st.session_state.req_token = req_token
-                st.session_state.kite_connected = True
-                st.rerun()
-            except Exception as e:
-                st.sidebar.error(f"Login Failed: {e}")
-
+        request_token = st.text_input("Request Token", key="req_token")
+        
+        if st.button("🔌 Connect", type="primary", use_container_width=True):
+            if api_key and api_secret and request_token:
+                try:
+                    with st.spinner("Connecting..."):
+                        kite = KiteConnect(api_key=api_key)
+                        session_data = kite.generate_session(request_token, api_secret=api_secret)
+                        kite.set_access_token(session_data["access_token"])
+                        STORE['kite'] = kite
+                        st.session_state.connected = True
+                        store_log("✅ Connected to Kite API")
+                    st.success("✅ Connected!")
+                    time.sleep(1)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Connection failed: {e}")
+            else:
+                st.warning("Please fill all fields")
+    
     else:
-        acc_token = st.sidebar.text_input("Paste Access Token")
-        if st.sidebar.button("🔌 Connect with Access Token", type="primary"):
-            try:
-                kite = KiteConnect(api_key=api_key)
-                kite.set_access_token(acc_token)
-                manager.kite = kite
-                st.session_state.api_key = api_key
-                st.session_state.kite_connected = True
-                st.rerun()
-            except Exception as e:
-                st.sidebar.error(f"Connection Failed: {e}")
-
-else:
-    st.sidebar.success("✅ Authenticated")
-    st.sidebar.divider()
-    
-    st.sidebar.title("⚙️ 2. Strategy")
-    default_syms = "RELIANCE, HDFCBANK, INFY, ICICIBANK, TCS, SBIN, TATASTEEL"
-    sym_input = st.sidebar.text_area("Watchlist", default_syms, height=150)
-    
-    # RVol Configuration
-    st.sidebar.subheader("📊 RVol Settings")
-    st.sidebar.caption(f"Current: {CONFIG.rvol_lookback_bars} bars (~{CONFIG.rvol_lookback_bars * 5 / 60:.1f} hours)")
-    
-    if not manager.is_running:
-        if st.sidebar.button("🚀 START SNIPER", type="primary"):
-            with st.spinner("Initializing Strategy with 750-bar Volume History..."):
-                manager.active_symbols = []
-                valid = []
-                syms = [s.strip().upper() for s in sym_input.split(",") if s.strip()]
+        st.success("✅ Connected to Kite")
+        
+        st.divider()
+        
+        st.subheader("📊 Symbols")
+        symbols_input = st.text_area(
+            "Enter symbols (comma separated)",
+            value="RELIANCE, HDFCBANK, INFY, TCS, SBIN",
+            height=80,
+            key="symbols_input"
+        )
+        
+        st.divider()
+        st.subheader("⚡ Controls")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            start_disabled = STORE['is_running']
+            if st.button("🚀 START", type="primary", use_container_width=True, disabled=start_disabled):
+                store_reset()
+                
+                syms = [s.strip().upper() for s in symbols_input.split(",") if s.strip()]
+                valid_symbols = []
                 
                 progress_bar = st.progress(0)
                 status_text = st.empty()
                 
-                for idx, s in enumerate(syms):
-                    status_text.text(f"Loading {s}... ({idx+1}/{len(syms)})")
-                    
-                    tkn = get_instrument_token(manager.kite, s)
-                    if tkn:
-                        # Fetch 750 bars of historical volume
-                        hist_volumes = fetch_historical_volumes(
-                            manager.kite, tkn, CONFIG.rvol_lookback_bars
-                        )
-                        
-                        state = SymbolState(symbol=s, token=tkn)
-                        
-                        # Seed volume tracker with historical data
-                        if hist_volumes:
-                            state.bar_aggregator.seed_volume_history(hist_volumes)
-                            manager.log(f"{s}: Seeded with {len(hist_volumes)} historical bars", "INFO")
-                        
-                        manager.symbol_states[s] = state
-                        valid.append({'symbol': s, 'token': tkn})
-                    
-                    progress_bar.progress((idx + 1) / len(syms))
+                for i, sym in enumerate(syms):
+                    status_text.text(f"Loading {sym}...")
+                    token = get_instrument_token(STORE['kite'], sym)
+                    if token:
+                        valid_symbols.append({'symbol': sym, 'token': token})
+                        store_log(f"✓ Found {sym}")
+                    else:
+                        store_log(f"✗ Not found: {sym}")
+                    progress_bar.progress((i + 1) / len(syms))
                 
-                status_text.empty()
                 progress_bar.empty()
+                status_text.empty()
                 
-                manager.active_symbols = valid
-                manager.stop_event.clear()
-                threading.Thread(target=sniper_worker, args=(manager.kite, manager), daemon=True).start()
+                if valid_symbols:
+                    STORE['symbols'] = valid_symbols
+                    STORE['is_running'] = True
+                    STORE['stop_flag'] = False
+                    
+                    t = threading.Thread(
+                        target=worker_thread,
+                        args=(STORE['kite'], valid_symbols),
+                        daemon=True
+                    )
+                    t.start()
+                    
+                    st.success(f"Started {len(valid_symbols)} symbols!")
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    st.error("No valid symbols found!")
+        
+        with col2:
+            stop_disabled = not STORE['is_running']
+            if st.button("🛑 STOP", type="secondary", use_container_width=True, disabled=stop_disabled):
+                STORE['stop_flag'] = True
+                STORE['is_running'] = False
+                store_log("🛑 Stopping...")
+                time.sleep(1)
                 st.rerun()
-    else:
-        if st.sidebar.button("🛑 STOP SYSTEM"):
-            manager.stop_event.set()
-            time.sleep(1)
+        
+        st.divider()
+        st.subheader("📈 Status")
+        
+        c1, c2 = st.columns(2)
+        with c1:
+            if STORE['is_running']:
+                st.success("🟢 Running")
+            else:
+                st.error("🔴 Stopped")
+        with c2:
+            if STORE['worker_alive']:
+                st.success("⚡ Active")
+            else:
+                st.warning("💤 Idle")
+        
+        m1, m2, m3 = st.columns(3)
+        with m1:
+            st.metric("Updates", STORE['update_count'])
+        with m2:
+            st.metric("Errors", STORE['error_count'])
+        with m3:
+            st.metric("Symbols", len(store_get_all_data()))
+        
+        st.divider()
+        
+        if st.button("🔄 Refresh", use_container_width=True):
             st.rerun()
         
-        # Show volume stats in sidebar
-        st.sidebar.divider()
-        st.sidebar.subheader("📈 Volume Stats")
-        data = manager.get_all_states_snapshot()
-        for sym, d in data.items():
-            vol_stats = d.get('volume_tracker_stats', {})
-            bars = vol_stats.get('bars_in_history', 0)
-            avg = vol_stats.get('avg_volume', 0)
-            st.sidebar.caption(f"{sym}: {bars}/750 bars | Avg: {avg:,.0f}")
+        if st.button("🔌 Disconnect", use_container_width=True):
+            STORE['stop_flag'] = True
+            STORE['is_running'] = False
+            st.session_state.connected = False
+            STORE['kite'] = None
+            st.rerun()
 
+# ============================================
+# MAIN DASHBOARD
+# ============================================
 
-# ====== MAIN DASHBOARD ====== #
-st.title("Institutional Sniper Pro")
-st.caption("Real-Time VWAP Trend + Breakout Detection | RVol: 750-bar Rolling Average")
+# Header
+st.markdown("""
+    <div style="text-align: center; padding: 20px 0;">
+        <h1 style="
+            font-size: 2.5rem;
+            font-weight: 800;
+            background: linear-gradient(90deg, #f39c12, #e74c3c, #9b59b6);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin: 0;
+        ">🎯 Institutional Sniper</h1>
+        <p style="color: #888; margin: 5px 0 0 0;">Real-time VWAP Trend + Breakout Detection with RVol Analysis</p>
+    </div>
+""", unsafe_allow_html=True)
 
-if manager.is_running:
-    data = manager.get_all_states_snapshot()
-    
-    signals = [d for k, d in data.items() if d['signal'].score == 13]
-    others = [d for k, d in data.items() if d['signal'].score != 13]
-    
-    st.subheader(f"🔥 Active Signals ({len(signals)})")
-    if signals:
-        cols = st.columns(2)
-        for i, row in enumerate(signals):
-            with cols[i % 2]:
-                sym_name = [k for k, v in data.items() if v == row][0]
-                render_modern_card(sym_name, row)
+# Status Bar
+st.markdown("""
+    <div style="
+        background: rgba(0,0,0,0.3);
+        border-radius: 12px;
+        padding: 15px;
+        margin: 10px 0 20px 0;
+        border: 1px solid #333;
+    ">
+""", unsafe_allow_html=True)
+
+col1, col2, col3, col4, col5 = st.columns(5)
+
+with col1:
+    if STORE['is_running']:
+        st.markdown("""
+            <div style="display: flex; align-items: center; gap: 8px;">
+                <span style="width: 10px; height: 10px; background: #2ecc71; border-radius: 50%; animation: blink 1s infinite;"></span>
+                <span style="color: #2ecc71; font-weight: 600;">LIVE</span>
+            </div>
+        """, unsafe_allow_html=True)
     else:
-        st.info("Scanning for Institutional Breakouts...")
+        st.markdown('<span style="color: #e74c3c; font-weight: 600;">🔴 OFFLINE</span>', unsafe_allow_html=True)
+
+with col2:
+    st.metric("Symbols", len(store_get_all_data()))
+with col3:
+    st.metric("Updates", STORE['update_count'])
+with col4:
+    st.metric("Errors", STORE['error_count'])
+with col5:
+    st.metric("Time", now_ist().strftime("%H:%M:%S"))
+
+st.markdown('</div>', unsafe_allow_html=True)
+
+st.divider()
+
+# Main Content
+if STORE['is_running']:
+    all_data = store_get_all_data()
+    
+    if not all_data:
+        st.markdown("""
+            <div style="
+                text-align: center;
+                padding: 60px;
+                background: linear-gradient(145deg, #1e1e3f, #2a2a4a);
+                border-radius: 16px;
+                border: 1px solid #333;
+            ">
+                <div style="font-size: 3rem; margin-bottom: 20px;">⏳</div>
+                <h2 style="color: #fff; margin-bottom: 10px;">Loading Data...</h2>
+                <p style="color: #888;">Please wait 5-10 seconds for first update</p>
+            </div>
+        """, unsafe_allow_html=True)
         
-    st.divider()
+        with st.expander("🔧 Debug Info"):
+            st.write(f"Worker Alive: {STORE['worker_alive']}")
+            st.write(f"Is Running: {STORE['is_running']}")
+            st.write(f"Symbols Count: {len(STORE['symbols'])}")
+            st.write(f"Update Count: {STORE['update_count']}")
+            st.write("**Recent Logs:**")
+            for log in store_get_logs()[:10]:
+                st.code(log)
     
-    st.subheader("👀 Watchlist")
-    if others:
-        cols = st.columns(3)
-        for i, row in enumerate(others):
-            with cols[i % 3]:
-                sym_name = [k for k, v in data.items() if v == row][0]
-                render_modern_card(sym_name, row)
-    
-    # Debug expander
-    with st.expander("🔧 Debug Logs"):
-        logs = manager.get_logs_snapshot()
-        for log in logs[:50]:
-            st.text(log)
-    
-    time.sleep(1)
-    st.rerun()
+    else:
+        # Separate signals
+        active_signals = {k: v for k, v in all_data.items() if v.get('score', 0) == 13}
+        watchlist = {k: v for k, v in all_data.items() if v.get('score', 0) != 13}
+        
+        # ===== ACTIVE SIGNALS =====
+        st.subheader(f"🔥 Active Signals ({len(active_signals)})")
+        
+        if active_signals:
+            for sym, d in active_signals.items():
+                with st.container():
+                    render_signal_card_streamlit(d, is_active=True)
+                    st.divider()
+        else:
+            st.markdown("""
+                <div style="
+                    text-align: center;
+                    padding: 40px;
+                    background: linear-gradient(145deg, #1e1e3f, #2a2a4a);
+                    border-radius: 16px;
+                    border: 1px solid #333;
+                ">
+                    <div style="font-size: 2.5rem; margin-bottom: 15px;">📡</div>
+                    <h3 style="color: #fff; margin-bottom: 10px;">Scanning for Signals...</h3>
+                    <p style="color: #888; font-size: 0.9rem;">Signals appear when: RVol ≥ 1.5x + VWAP Trend + Breakout + PCR</p>
+                </div>
+            """, unsafe_allow_html=True)
+        
+        st.markdown("<br>", unsafe_allow_html=True)
+        
+        # ===== WATCHLIST =====
+        st.subheader(f"👀 Watchlist ({len(watchlist)})")
+        
+        if watchlist:
+            cols = st.columns(3)
+            for idx, (sym, d) in enumerate(watchlist.items()):
+                with cols[idx % 3]:
+                    render_watchlist_card_streamlit(d)
+        else:
+            st.info("No symbols in watchlist")
+        
+        st.markdown("<br>", unsafe_allow_html=True)
+        
+        # ===== DATA TABLE =====
+        st.subheader("📋 Data Table")
+        
+        df = pd.DataFrame(list(all_data.values()))
+        display_cols = ['symbol', 'ltp', 'signal_type', 'rvol', 'pcr', 'vwap', 'volume', 'imbalance', 'updated']
+        available = [c for c in display_cols if c in df.columns]
+        
+        st.dataframe(
+            df[available],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                'symbol': 'Symbol',
+                'ltp': st.column_config.NumberColumn('LTP', format="₹%.2f"),
+                'signal_type': 'Signal',
+                'rvol': st.column_config.NumberColumn('RVol', format="%.2fx"),
+                'pcr': st.column_config.NumberColumn('PCR', format="%.2f"),
+                'vwap': st.column_config.NumberColumn('VWAP', format="₹%.2f"),
+                'volume': st.column_config.NumberColumn('Volume', format="%d"),
+                'imbalance': st.column_config.NumberColumn('Imbalance', format="%.2f"),
+                'updated': 'Updated'
+            }
+        )
+
+elif st.session_state.connected:
+    st.markdown("""
+        <div style="
+            text-align: center;
+            padding: 80px 40px;
+            background: linear-gradient(145deg, #1e1e3f, #2a2a4a);
+            border-radius: 20px;
+            border: 1px solid #333;
+        ">
+            <div style="font-size: 4rem; margin-bottom: 20px;">👈</div>
+            <h2 style="color: #fff; margin-bottom: 15px;">Ready to Start</h2>
+            <p style="color: #888; font-size: 1.1rem;">Click <b>START</b> in the sidebar to begin monitoring</p>
+        </div>
+    """, unsafe_allow_html=True)
 
 else:
-    st.info("👈 Please Login in Sidebar to Start System")
+    st.markdown("""
+        <div style="
+            text-align: center;
+            padding: 80px 40px;
+            background: linear-gradient(145deg, #1e1e3f, #2a2a4a);
+            border-radius: 20px;
+            border: 1px solid #333;
+        ">
+            <div style="font-size: 4rem; margin-bottom: 20px;">🔐</div>
+            <h2 style="color: #fff; margin-bottom: 15px;">Connect to Kite API</h2>
+            <p style="color: #888; font-size: 1.1rem;">Enter your credentials in the sidebar to get started</p>
+        </div>
+    """, unsafe_allow_html=True)
+    
+    st.divider()
+    
+    st.subheader("📖 How to Use")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("""
+        **Step 1: Get API Credentials**
+        - Go to [Kite Developer Console](https://developers.kite.trade/)
+        - Create an app and get your API Key and Secret
+        
+        **Step 2: Login**
+        1. Enter API Key and Secret in sidebar
+        2. Click the login link
+        3. Authorize the app
+        4. Copy request_token from URL
+        5. Click Connect
+        """)
+    
+    with col2:
+        st.markdown("""
+        **Step 3: Start Monitoring**
+        1. Enter symbols (comma separated)
+        2. Click START
+        3. Watch for signals!
+        
+        **Signal Conditions:**
+        - 🟢 **BUY CALL:** RVol ≥ 1.5x + Above VWAP + Breaking High + PCR > 0.7
+        - 🔴 **BUY PUT:** RVol ≥ 1.5x + Below VWAP + Breaking Low + PCR < 1.3
+        """)
+
+# ===== LOGS =====
+st.divider()
+with st.expander("📋 System Logs", expanded=False):
+    logs = store_get_logs()
+    if logs:
+        for log in logs[:30]:
+            st.code(log, language=None)
+    else:
+        st.info("No logs yet")
+
+# ===== AUTO REFRESH =====
+if STORE['is_running']:
+    time.sleep(2)
+    st.rerun()
